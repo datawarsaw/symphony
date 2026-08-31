@@ -4,6 +4,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.RepositoryRouter
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -438,6 +439,52 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute Issue.routable?(issue, [" "])
     refute Issue.routable?(issue, ["symphony", "security"])
     refute Issue.routable?(%{issue | dispatchable: false}, ["symphony"])
+  end
+
+  test "repository routing resolves one configured target and exports it to workspace hooks" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-repository-routing-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      routing: %{
+        target_label_prefix: "repo:",
+        default_branch: "trunk",
+        targets: %{
+          "wup" => %{source_path: "/sources/wup", remote: "datawarsaw/wup"},
+          "symphony-runtime" => %{source_path: "/sources/symphony"}
+        }
+      },
+      hook_after_create: "printf '%s|%s|%s|%s' \"$SYMPHONY_REPOSITORY_TARGET\" \"$SYMPHONY_REPOSITORY_SOURCE_PATH\" \"$SYMPHONY_REPOSITORY_DEFAULT_BRANCH\" \"$SYMPHONY_REPOSITORY_REMOTE\" > route.txt"
+    )
+
+    issue = %Issue{id: "issue-1", identifier: "MIC-129", labels: ["repo:symphony-runtime"]}
+
+    assert {:ok, route} = RepositoryRouter.resolve(issue, Config.settings!().routing)
+    assert route.target == "symphony-runtime"
+    assert route.source_path == "/sources/symphony"
+    assert route.default_branch == "trunk"
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    assert File.read!(Path.join(workspace, "route.txt")) == "symphony-runtime|/sources/symphony|trunk|"
+  end
+
+  test "repository routing fails closed for missing, unknown, and ambiguous targets" do
+    routing = %Schema.Routing{
+      targets: %{
+        "wup" => %{"source_path" => "/sources/wup"},
+        "symphony-runtime" => %{"source_path" => "/sources/symphony"}
+      }
+    }
+
+    assert {:error, :missing_repository_target} =
+             RepositoryRouter.resolve(%Issue{labels: ["symphony-pilot"]}, routing)
+
+    assert {:error, {:unsupported_repository_target, "unknown"}} =
+             RepositoryRouter.resolve(%Issue{labels: ["repo:unknown"]}, routing)
+
+    assert {:error, {:ambiguous_repository_target, ["wup", "symphony-runtime"]}} =
+             RepositoryRouter.resolve(%Issue{labels: ["repo:wup", "repo:symphony-runtime"]}, routing)
   end
 
   test "linear client normalizes blockers from inverse relations" do
@@ -1011,7 +1058,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
     assert config.tracker.required_labels == []
-    assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    expected_workspace_root = Path.join(System.tmp_dir!(), "symphony_workspaces")
+
+    normalized_config_workspace_root =
+      config.workspace.root |> Path.expand() |> String.replace("\\", "/")
+
+    normalized_expected_workspace_root =
+      expected_workspace_root |> Path.expand() |> String.replace("\\", "/")
+
+    assert normalized_config_workspace_root == normalized_expected_workspace_root
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
     assert config.codex.command == "codex app-server"

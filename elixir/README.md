@@ -169,6 +169,14 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- `routing.targets` enables deterministic multi-repository dispatch. Once enabled, every issue
+  needs exactly one label with `routing.target_label_prefix` (default `repo:`), such as
+  `repo:wup`. The selected target must be in the configured allowlist; missing, unknown, or
+  multiple target labels are not dispatched. Route details are exported to workspace hooks as
+  `SYMPHONY_REPOSITORY_TARGET`, `SYMPHONY_REPOSITORY_SOURCE_PATH`, and
+  `SYMPHONY_REPOSITORY_DEFAULT_BRANCH` (and `SYMPHONY_REPOSITORY_REMOTE` when configured).
+  This lets the hook verify the expected source and create the issue worktree without repository
+  discovery or a cross-repository clone.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
@@ -192,6 +200,25 @@ hooks:
     git clone --depth 1 "$SOURCE_REPO_URL" .
 codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
+```
+
+For a multi-repository workflow, configure explicit local sources and use the exported route
+variables in `after_create`:
+
+```yaml
+routing:
+  target_label_prefix: "repo:"
+  default_branch: "main"
+  targets:
+    wup:
+      source_path: "C:/AI/wup"
+      remote: "https://github.com/datawarsaw/wup.git"
+    symphony-runtime:
+      source_path: "C:/Users/micha/symphony"
+hooks:
+  after_create: |
+    git -C "$SYMPHONY_REPOSITORY_SOURCE_PATH" fetch --prune origin
+    git -C "$SYMPHONY_REPOSITORY_SOURCE_PATH" worktree add -b "symphony/$SYMPHONY_ISSUE_IDENTIFIER" "$PWD" "origin/$SYMPHONY_REPOSITORY_DEFAULT_BRANCH"
 ```
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.

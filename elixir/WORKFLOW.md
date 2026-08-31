@@ -19,9 +19,40 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
+routing:
+  # Every dispatched issue must have one `repo:<target>` label. Targets are an explicit
+  # allowlist: no repository is inferred from issue text or discovered dynamically.
+  target_label_prefix: "repo:"
+  default_branch: "main"
+  targets:
+    wup:
+      source_path: "C:/AI/wup"
+      remote: "https://github.com/datawarsaw/wup.git"
+    agent-platform-code-skills:
+      source_path: "C:/AI/code-skills"
+    agent-platform-workstation-ops:
+      source_path: "C:/AI/workstation-ops-mcp"
+    symphony-runtime:
+      source_path: "C:/Users/micha/symphony"
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/openai/symphony .
+    set -eu
+    : "${SYMPHONY_REPOSITORY_TARGET:?missing repository target}"
+    : "${SYMPHONY_REPOSITORY_SOURCE_PATH:?missing repository source path}"
+    : "${SYMPHONY_REPOSITORY_DEFAULT_BRANCH:?missing repository default branch}"
+    source_path="$SYMPHONY_REPOSITORY_SOURCE_PATH"
+    default_branch="$SYMPHONY_REPOSITORY_DEFAULT_BRANCH"
+    task_branch="symphony/$SYMPHONY_ISSUE_IDENTIFIER"
+    test -d "$source_path/.git"
+    test -z "$(git -C "$source_path" status --porcelain)"
+    if [ -n "${SYMPHONY_REPOSITORY_REMOTE:-}" ]; then
+      test "$(git -C "$source_path" remote get-url origin)" = "$SYMPHONY_REPOSITORY_REMOTE"
+    fi
+    git -C "$source_path" fetch --prune origin
+    git -C "$source_path" show-ref --verify --quiet "refs/remotes/origin/$default_branch"
+    ! git -C "$source_path" show-ref --verify --quiet "refs/heads/$task_branch"
+    git -C "$source_path" worktree add --no-checkout -b "$task_branch" "$PWD" "refs/remotes/origin/$default_branch"
+    git -C "$PWD" checkout "$task_branch"
     if command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi

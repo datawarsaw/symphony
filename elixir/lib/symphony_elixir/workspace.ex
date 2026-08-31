@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, PathSafety, RepositoryRouter, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -18,7 +18,9 @@ defmodule SymphonyElixir.Workspace do
     try do
       safe_id = workspace_key(issue_or_identifier)
 
-      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
+      with {:ok, route} <- resolve_repository_route(issue_or_identifier),
+           issue_context = Map.put(issue_context, :repository_route, route),
+           {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
         case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
@@ -219,7 +221,13 @@ defmodule SymphonyElixir.Workspace do
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}
   def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
-    issue_context = issue_context(issue_or_identifier)
+    with {:ok, route} <- resolve_repository_route(issue_or_identifier) do
+      issue_context = issue_or_identifier |> issue_context() |> Map.put(:repository_route, route)
+      run_before_run_hook_for_context(workspace, issue_context, worker_host)
+    end
+  end
+
+  defp run_before_run_hook_for_context(workspace, issue_context, worker_host) do
     hooks = Config.settings!().hooks
 
     case hooks.before_run do
@@ -233,7 +241,12 @@ defmodule SymphonyElixir.Workspace do
 
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok
   def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
-    issue_context = issue_context(issue_or_identifier)
+    issue_context =
+      case resolve_repository_route(issue_or_identifier) do
+        {:ok, route} -> issue_or_identifier |> issue_context() |> Map.put(:repository_route, route)
+        {:error, _reason} -> issue_context(issue_or_identifier)
+      end
+
     hooks = Config.settings!().hooks
 
     case hooks.after_run do
@@ -401,7 +414,11 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command],
+          cd: workspace,
+          env: repository_route_environment(issue_context),
+          stderr_to_stdout: true
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -422,7 +439,15 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    script =
+      [
+        repository_route_shell_assignments(issue_context),
+        "cd #{shell_escape(workspace)} && #{command}"
+      ]
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -591,5 +616,37 @@ defmodule SymphonyElixir.Workspace do
 
   defp issue_log_context(%{issue_id: issue_id, issue_identifier: issue_identifier}) do
     "issue_id=#{issue_id || "n/a"} issue_identifier=#{issue_identifier || "issue"}"
+  end
+
+  defp resolve_repository_route(%SymphonyElixir.Tracker.Issue{} = issue) do
+    RepositoryRouter.resolve(issue, Config.settings!().routing)
+  end
+
+  defp resolve_repository_route(_issue), do: {:ok, nil}
+
+  defp repository_route_environment(%{
+         repository_route: %RepositoryRouter.Route{} = route,
+         issue_identifier: issue_identifier
+       }) do
+    [
+      {"SYMPHONY_ISSUE_IDENTIFIER", issue_identifier},
+      {"SYMPHONY_REPOSITORY_TARGET", route.target},
+      {"SYMPHONY_REPOSITORY_SOURCE_PATH", route.source_path},
+      {"SYMPHONY_REPOSITORY_DEFAULT_BRANCH", route.default_branch}
+    ] ++ optional_route_environment(route.remote)
+  end
+
+  defp repository_route_environment(%{issue_identifier: issue_identifier}) when is_binary(issue_identifier),
+    do: [{"SYMPHONY_ISSUE_IDENTIFIER", issue_identifier}]
+
+  defp repository_route_environment(_issue_context), do: []
+
+  defp optional_route_environment(nil), do: []
+  defp optional_route_environment(remote), do: [{"SYMPHONY_REPOSITORY_REMOTE", remote}]
+
+  defp repository_route_shell_assignments(issue_context) do
+    issue_context
+    |> repository_route_environment()
+    |> Enum.map_join("\n", fn {name, value} -> "export #{name}=#{shell_escape(value)}" end)
   end
 end
