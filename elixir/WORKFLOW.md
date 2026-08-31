@@ -44,7 +44,9 @@ hooks:
     default_branch="$SYMPHONY_REPOSITORY_DEFAULT_BRANCH"
     task_branch="symphony/$SYMPHONY_ISSUE_IDENTIFIER"
     test -d "$source_path/.git"
-    test -z "$(git -C "$source_path" status --porcelain)"
+    git -C "$source_path" diff --quiet
+    git -C "$source_path" diff --cached --quiet
+    test -z "$(git -C "$source_path" ls-files --unmerged)"
     if [ -n "${SYMPHONY_REPOSITORY_REMOTE:-}" ]; then
       test "$(git -C "$source_path" remote get-url origin)" = "$SYMPHONY_REPOSITORY_REMOTE"
     fi
