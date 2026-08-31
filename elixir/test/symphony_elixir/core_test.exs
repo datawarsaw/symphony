@@ -128,6 +128,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.has_key?(Map.get(routing, "targets", %{}), "symphony-runtime")
     assert Map.get(hooks, "after_create") =~ "git -C \"$source_path\" worktree add --no-checkout"
     assert Map.get(hooks, "after_create") =~ "git -C \"$source_path\" fetch --prune origin"
+    assert Map.get(hooks, "after_create") =~ "refs/remotes/origin/$task_branch"
     assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
     assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
     assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"

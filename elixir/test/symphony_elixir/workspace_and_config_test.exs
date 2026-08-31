@@ -469,6 +469,100 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert File.read!(Path.join(workspace, "route.txt")) == "symphony-runtime|/sources/symphony|trunk|"
   end
 
+  test "repository routing fails closed when the remote task branch already exists" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-remote-task-branch-collision-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      remote_repo = Path.join(test_root, "remote.git") |> String.replace("\\\\", "/")
+      source_repo = Path.join(test_root, "source") |> String.replace("\\\\", "/")
+      publisher_repo = Path.join(test_root, "publisher") |> String.replace("\\\\", "/")
+      workspace_root = Path.join(test_root, "workspaces")
+      task_branch = "symphony/MIC-REMOTE-COLLISION"
+
+      assert {_, 0} = System.cmd("git", ["init", "--bare", remote_repo])
+      assert {_, 0} = System.cmd("git", ["init", "-b", "main", source_repo])
+      assert {_, 0} = System.cmd("git", ["-C", source_repo, "config", "user.name", "Test User"])
+
+      assert {_, 0} =
+               System.cmd("git", ["-C", source_repo, "config", "user.email", "test@example.com"])
+
+      File.write!(Path.join(source_repo, "README.md"), "initial\n")
+      assert {_, 0} = System.cmd("git", ["-C", source_repo, "add", "README.md"])
+      assert {_, 0} = System.cmd("git", ["-C", source_repo, "commit", "-m", "initial"])
+      assert {_, 0} = System.cmd("git", ["-C", source_repo, "remote", "add", "origin", remote_repo])
+      assert {_, 0} = System.cmd("git", ["-C", source_repo, "push", "-u", "origin", "main"])
+
+      assert {_, 0} = System.cmd("git", ["clone", remote_repo, publisher_repo])
+
+      assert {_, 0} =
+               System.cmd("git", ["-C", publisher_repo, "config", "user.name", "Test User"])
+
+      assert {_, 0} =
+               System.cmd("git", ["-C", publisher_repo, "config", "user.email", "test@example.com"])
+
+      assert {_, 0} = System.cmd("git", ["-C", publisher_repo, "checkout", "-b", task_branch])
+      File.write!(Path.join(publisher_repo, "branch-marker.txt"), "remote task branch\n")
+      assert {_, 0} = System.cmd("git", ["-C", publisher_repo, "add", "branch-marker.txt"])
+
+      assert {_, 0} =
+               System.cmd("git", ["-C", publisher_repo, "commit", "-m", "remote task branch"])
+
+      assert {_, 0} = System.cmd("git", ["-C", publisher_repo, "push", "origin", task_branch])
+
+      production_workflow = Path.expand("../../WORKFLOW.md", __DIR__)
+      assert {:ok, %{config: config}} = Workflow.load(production_workflow)
+      hook_after_create = get_in(config, ["hooks", "after_create"])
+      assert is_binary(hook_after_create)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        routing: %{
+          target_label_prefix: "repo:",
+          default_branch: "main",
+          targets: %{"symphony-runtime" => %{source_path: source_repo, remote: remote_repo}}
+        },
+        hook_after_create: hook_after_create
+      )
+
+      issue = %Issue{
+        id: "remote-branch-collision",
+        identifier: "MIC-REMOTE-COLLISION",
+        labels: ["repo:symphony-runtime"]
+      }
+
+      assert {:error, {:workspace_hook_failed, "after_create", 1, _output}} =
+               Workspace.create_for_issue(issue)
+
+      assert {_, 0} =
+               System.cmd("git", [
+                 "-C",
+                 source_repo,
+                 "show-ref",
+                 "--verify",
+                 "--quiet",
+                 "refs/remotes/origin/#{task_branch}"
+               ])
+
+      assert {_, 1} =
+               System.cmd("git", [
+                 "-C",
+                 source_repo,
+                 "show-ref",
+                 "--verify",
+                 "--quiet",
+                 "refs/heads/#{task_branch}"
+               ])
+
+      refute File.exists?(Path.join(workspace_root, Workspace.workspace_key(issue)))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "repository routing fails closed for missing, unknown, and ambiguous targets" do
     routing = %Schema.Routing{
       targets: %{

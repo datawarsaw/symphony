@@ -50,7 +50,12 @@ hooks:
     fi
     git -C "$source_path" fetch --prune origin
     git -C "$source_path" show-ref --verify --quiet "refs/remotes/origin/$default_branch"
-    ! git -C "$source_path" show-ref --verify --quiet "refs/heads/$task_branch"
+    if git -C "$source_path" show-ref --verify --quiet "refs/heads/$task_branch"; then
+      exit 1
+    fi
+    if git -C "$source_path" show-ref --verify --quiet "refs/remotes/origin/$task_branch"; then
+      exit 1
+    fi
     git -C "$source_path" worktree add --no-checkout -b "$task_branch" "$PWD" "refs/remotes/origin/$default_branch"
     git -C "$PWD" checkout "$task_branch"
     if command -v mise >/dev/null 2>&1; then
