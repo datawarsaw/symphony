@@ -4,6 +4,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.RepositoryRouter
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -438,6 +439,234 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute Issue.routable?(issue, [" "])
     refute Issue.routable?(issue, ["symphony", "security"])
     refute Issue.routable?(%{issue | dispatchable: false}, ["symphony"])
+  end
+
+  test "repository routing resolves one configured target and exports it to workspace hooks" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-repository-routing-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      routing: %{
+        target_label_prefix: "repo:",
+        default_branch: "trunk",
+        targets: %{
+          "wup" => %{source_path: "/sources/wup", remote: "datawarsaw/wup"},
+          "symphony-runtime" => %{source_path: "/sources/symphony"}
+        }
+      },
+      hook_after_create: "printf '%s|%s|%s|%s' \"$SYMPHONY_REPOSITORY_TARGET\" \"$SYMPHONY_REPOSITORY_SOURCE_PATH\" \"$SYMPHONY_REPOSITORY_DEFAULT_BRANCH\" \"$SYMPHONY_REPOSITORY_REMOTE\" > route.txt"
+    )
+
+    issue = %Issue{id: "issue-1", identifier: "MIC-129", labels: ["repo:symphony-runtime"]}
+
+    assert {:ok, route} = RepositoryRouter.resolve(issue, Config.settings!().routing)
+    assert route.target == "symphony-runtime"
+    assert route.source_path == "/sources/symphony"
+    assert route.default_branch == "trunk"
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    assert File.read!(Path.join(workspace, "route.txt")) == "symphony-runtime|/sources/symphony|trunk|"
+  end
+
+  test "repository routing fails closed when the remote task branch already exists" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-remote-task-branch-collision-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      remote_repo = Path.join(test_root, "remote.git") |> String.replace("\\\\", "/")
+      source_repo = Path.join(test_root, "source") |> String.replace("\\\\", "/")
+      publisher_repo = Path.join(test_root, "publisher") |> String.replace("\\\\", "/")
+      workspace_root = Path.join(test_root, "workspaces")
+      task_branch = "symphony/MIC-REMOTE-COLLISION"
+
+      assert {_, 0} = System.cmd("git", ["init", "--bare", remote_repo])
+      assert {_, 0} = System.cmd("git", ["init", "-b", "main", source_repo])
+      assert {_, 0} = System.cmd("git", ["-C", source_repo, "config", "user.name", "Test User"])
+
+      assert {_, 0} =
+               System.cmd("git", ["-C", source_repo, "config", "user.email", "test@example.com"])
+
+      File.write!(Path.join(source_repo, "README.md"), "initial\n")
+      assert {_, 0} = System.cmd("git", ["-C", source_repo, "add", "README.md"])
+      assert {_, 0} = System.cmd("git", ["-C", source_repo, "commit", "-m", "initial"])
+      assert {_, 0} = System.cmd("git", ["-C", source_repo, "remote", "add", "origin", remote_repo])
+      assert {_, 0} = System.cmd("git", ["-C", source_repo, "push", "-u", "origin", "main"])
+
+      assert {_, 0} = System.cmd("git", ["clone", remote_repo, publisher_repo])
+
+      assert {_, 0} =
+               System.cmd("git", ["-C", publisher_repo, "config", "user.name", "Test User"])
+
+      assert {_, 0} =
+               System.cmd("git", ["-C", publisher_repo, "config", "user.email", "test@example.com"])
+
+      assert {_, 0} = System.cmd("git", ["-C", publisher_repo, "checkout", "-b", task_branch])
+      File.write!(Path.join(publisher_repo, "branch-marker.txt"), "remote task branch\n")
+      assert {_, 0} = System.cmd("git", ["-C", publisher_repo, "add", "branch-marker.txt"])
+
+      assert {_, 0} =
+               System.cmd("git", ["-C", publisher_repo, "commit", "-m", "remote task branch"])
+
+      assert {_, 0} = System.cmd("git", ["-C", publisher_repo, "push", "origin", task_branch])
+
+      production_workflow = Path.expand("../../WORKFLOW.md", __DIR__)
+      assert {:ok, %{config: config}} = Workflow.load(production_workflow)
+      hook_after_create = get_in(config, ["hooks", "after_create"])
+      assert is_binary(hook_after_create)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        routing: %{
+          target_label_prefix: "repo:",
+          default_branch: "main",
+          targets: %{"symphony-runtime" => %{source_path: source_repo, remote: remote_repo}}
+        },
+        hook_after_create: hook_after_create
+      )
+
+      issue = %Issue{
+        id: "remote-branch-collision",
+        identifier: "MIC-REMOTE-COLLISION",
+        labels: ["repo:symphony-runtime"]
+      }
+
+      assert {:error, {:workspace_hook_failed, "after_create", 1, _output}} =
+               Workspace.create_for_issue(issue)
+
+      assert {_, 0} =
+               System.cmd("git", [
+                 "-C",
+                 source_repo,
+                 "show-ref",
+                 "--verify",
+                 "--quiet",
+                 "refs/remotes/origin/#{task_branch}"
+               ])
+
+      assert {_, 1} =
+               System.cmd("git", [
+                 "-C",
+                 source_repo,
+                 "show-ref",
+                 "--verify",
+                 "--quiet",
+                 "refs/heads/#{task_branch}"
+               ])
+
+      refute File.exists?(Path.join(workspace_root, Workspace.workspace_key(issue)))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "repository routing permits unrelated untracked source state" do
+    test_root = routed_source_test_root("untracked-source-state")
+
+    try do
+      fixture = routed_source_fixture!(test_root)
+      untracked_path = Path.join([fixture.source_repo, "state", "preserved-checkpoint.json"])
+      File.mkdir_p!(Path.dirname(untracked_path))
+      File.write!(untracked_path, "preserve me\n")
+      configure_routed_source_workflow!(fixture)
+
+      issue = routed_source_issue("MIC-UNTRACKED-SOURCE")
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.read!(untracked_path) == "preserve me\n"
+
+      assert {status, 0} =
+               System.cmd("git", ["-C", fixture.source_repo, "status", "--porcelain", "--", "state"])
+
+      assert status =~ "?? state/"
+
+      assert {"symphony/MIC-UNTRACKED-SOURCE\n", 0} =
+               System.cmd("git", ["-C", workspace, "branch", "--show-current"])
+
+      refute File.exists?(Path.join([workspace, "state", "preserved-checkpoint.json"]))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "repository routing fails closed for tracked source modifications" do
+    test_root = routed_source_test_root("tracked-source-state")
+
+    try do
+      fixture = routed_source_fixture!(test_root)
+      File.write!(Path.join(fixture.source_repo, "README.md"), "modified but unstaged\n")
+      configure_routed_source_workflow!(fixture)
+
+      issue = routed_source_issue("MIC-TRACKED-DIRTY")
+
+      assert {:error, {:workspace_hook_failed, "after_create", 1, _output}} =
+               Workspace.create_for_issue(issue)
+
+      assert {_, 1} =
+               System.cmd("git", [
+                 "-C",
+                 fixture.source_repo,
+                 "show-ref",
+                 "--verify",
+                 "--quiet",
+                 "refs/heads/symphony/MIC-TRACKED-DIRTY"
+               ])
+
+      refute File.exists?(routed_source_workspace_path(fixture, issue))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "repository routing fails closed for staged source modifications" do
+    test_root = routed_source_test_root("staged-source-state")
+
+    try do
+      fixture = routed_source_fixture!(test_root)
+      File.write!(Path.join(fixture.source_repo, "README.md"), "modified and staged\n")
+      git!(["-C", fixture.source_repo, "add", "README.md"])
+      configure_routed_source_workflow!(fixture)
+
+      issue = routed_source_issue("MIC-STAGED-DIRTY")
+
+      assert {:error, {:workspace_hook_failed, "after_create", 1, _output}} =
+               Workspace.create_for_issue(issue)
+
+      assert {_, 1} =
+               System.cmd("git", [
+                 "-C",
+                 fixture.source_repo,
+                 "show-ref",
+                 "--verify",
+                 "--quiet",
+                 "refs/heads/symphony/MIC-STAGED-DIRTY"
+               ])
+
+      refute File.exists?(routed_source_workspace_path(fixture, issue))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "repository routing fails closed for missing, unknown, and ambiguous targets" do
+    routing = %Schema.Routing{
+      targets: %{
+        "wup" => %{"source_path" => "/sources/wup"},
+        "symphony-runtime" => %{"source_path" => "/sources/symphony"}
+      }
+    }
+
+    assert {:error, :missing_repository_target} =
+             RepositoryRouter.resolve(%Issue{labels: ["symphony-pilot"]}, routing)
+
+    assert {:error, {:unsupported_repository_target, "unknown"}} =
+             RepositoryRouter.resolve(%Issue{labels: ["repo:unknown"]}, routing)
+
+    assert {:error, {:ambiguous_repository_target, ["wup", "symphony-runtime"]}} =
+             RepositoryRouter.resolve(%Issue{labels: ["repo:wup", "repo:symphony-runtime"]}, routing)
   end
 
   test "linear client normalizes blockers from inverse relations" do
@@ -1011,7 +1240,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
     assert config.tracker.required_labels == []
-    assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    expected_workspace_root = Path.join(System.tmp_dir!(), "symphony_workspaces")
+
+    normalized_config_workspace_root =
+      config.workspace.root |> Path.expand() |> String.replace("\\", "/")
+
+    normalized_expected_workspace_root =
+      expected_workspace_root |> Path.expand() |> String.replace("\\", "/")
+
+    assert normalized_config_workspace_root == normalized_expected_workspace_root
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
     assert config.codex.command == "codex app-server"
@@ -1666,6 +1903,70 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ workspace_path
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  defp routed_source_test_root(name) do
+    Path.join(
+      System.tmp_dir!(),
+      "symphony-elixir-#{name}-#{System.unique_integer([:positive])}"
+    )
+  end
+
+  defp routed_source_fixture!(test_root) do
+    remote_repo = Path.join(test_root, "remote.git") |> String.replace("\\\\", "/")
+    source_repo = Path.join(test_root, "source") |> String.replace("\\\\", "/")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    git!(["init", "--bare", remote_repo])
+    git!(["init", "-b", "main", source_repo])
+    git!(["-C", source_repo, "config", "user.name", "Test User"])
+    git!(["-C", source_repo, "config", "user.email", "test@example.com"])
+    File.write!(Path.join(source_repo, "README.md"), "initial\n")
+    git!(["-C", source_repo, "add", "README.md"])
+    git!(["-C", source_repo, "commit", "-m", "initial"])
+    git!(["-C", source_repo, "remote", "add", "origin", remote_repo])
+    git!(["-C", source_repo, "push", "-u", "origin", "main"])
+
+    production_workflow = Path.expand("../../WORKFLOW.md", __DIR__)
+    assert {:ok, %{config: config}} = Workflow.load(production_workflow)
+    hook_after_create = get_in(config, ["hooks", "after_create"])
+    assert is_binary(hook_after_create)
+
+    %{
+      hook_after_create: hook_after_create,
+      remote_repo: remote_repo,
+      source_repo: source_repo,
+      workspace_root: workspace_root
+    }
+  end
+
+  defp configure_routed_source_workflow!(fixture) do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: fixture.workspace_root,
+      routing: %{
+        target_label_prefix: "repo:",
+        default_branch: "main",
+        targets: %{
+          "symphony-runtime" => %{source_path: fixture.source_repo, remote: fixture.remote_repo}
+        }
+      },
+      hook_after_create: fixture.hook_after_create
+    )
+  end
+
+  defp routed_source_issue(identifier) do
+    %Issue{id: "source-state-#{identifier}", identifier: identifier, labels: ["repo:symphony-runtime"]}
+  end
+
+  defp routed_source_workspace_path(fixture, issue) do
+    Path.join(fixture.workspace_root, Workspace.workspace_key(issue))
+  end
+
+  defp git!(args) do
+    case System.cmd("git", args) do
+      {_output, 0} -> :ok
+      {output, status} -> raise "git #{Enum.join(args, " ")} failed with #{status}: #{output}"
     end
   end
 end
