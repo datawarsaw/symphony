@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, RepositoryRouter, SSH}
+  alias SymphonyElixir.{Config, PathSafety, RepositoryRouter, SSH, SourceSync}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -19,6 +19,7 @@ defmodule SymphonyElixir.Workspace do
       safe_id = workspace_key(issue_or_identifier)
 
       with {:ok, route} <- resolve_repository_route(issue_or_identifier),
+           :ok <- sync_source_baseline(route, issue_context, worker_host),
            issue_context = Map.put(issue_context, :repository_route, route),
            {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
@@ -623,6 +624,28 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp resolve_repository_route(_issue), do: {:ok, nil}
+
+  defp sync_source_baseline(nil, _issue_context, _worker_host), do: :ok
+
+  defp sync_source_baseline(%RepositoryRouter.Route{} = route, issue_context, nil) do
+    case SourceSync.sync(route) do
+      {:ok, result} ->
+        Logger.info("Source baseline synchronized #{issue_log_context(issue_context)} target=#{route.target} result=#{SourceSync.reason_code_string(result)}")
+
+        :ok
+
+      {:error, reason} ->
+        reason_code = SourceSync.reason_code_string(reason)
+
+        Logger.warning("Source baseline sync failed #{issue_log_context(issue_context)} target=#{route.target} reason=#{reason_code}")
+
+        {:error, {:source_baseline_sync_failed, route.target, reason}}
+    end
+  end
+
+  defp sync_source_baseline(%RepositoryRouter.Route{}, _issue_context, worker_host)
+       when is_binary(worker_host),
+       do: :ok
 
   defp repository_route_environment(%{
          repository_route: %RepositoryRouter.Route{} = route,
