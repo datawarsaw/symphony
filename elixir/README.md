@@ -175,8 +175,9 @@ Notes:
   multiple target labels are not dispatched. Route details are exported to workspace hooks as
   `SYMPHONY_REPOSITORY_TARGET`, `SYMPHONY_REPOSITORY_SOURCE_PATH`, and
   `SYMPHONY_REPOSITORY_DEFAULT_BRANCH` (and `SYMPHONY_REPOSITORY_REMOTE` when configured).
-  This lets the hook verify the expected source and create the issue worktree without repository
-  discovery or a cross-repository clone.
+  Symphony automatically verifies the source baseline before creating each task worktree,
+  safely fast-forwarding clean repositories that are strictly behind remote origin and failing
+  closed on dirty tracked files, staged changes, unmerged index state, ahead, or diverged branches.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or

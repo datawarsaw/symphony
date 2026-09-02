@@ -442,31 +442,39 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "repository routing resolves one configured target and exports it to workspace hooks" do
-    workspace_root =
-      Path.join(System.tmp_dir!(), "symphony-elixir-repository-routing-#{System.unique_integer([:positive])}")
+    test_root = routed_source_test_root("repository-routing")
 
-    write_workflow_file!(Workflow.workflow_file_path(),
-      workspace_root: workspace_root,
-      routing: %{
-        target_label_prefix: "repo:",
-        default_branch: "trunk",
-        targets: %{
-          "wup" => %{source_path: "/sources/wup", remote: "datawarsaw/wup"},
-          "symphony-runtime" => %{source_path: "/sources/symphony"}
-        }
-      },
-      hook_after_create: "printf '%s|%s|%s|%s' \"$SYMPHONY_REPOSITORY_TARGET\" \"$SYMPHONY_REPOSITORY_SOURCE_PATH\" \"$SYMPHONY_REPOSITORY_DEFAULT_BRANCH\" \"$SYMPHONY_REPOSITORY_REMOTE\" > route.txt"
-    )
+    try do
+      fixture = routed_source_fixture!(test_root)
+      git!(["-C", fixture.source_repo, "branch", "-m", "main", "trunk"])
+      git!(["-C", fixture.remote_repo, "branch", "-m", "main", "trunk"])
 
-    issue = %Issue{id: "issue-1", identifier: "MIC-129", labels: ["repo:symphony-runtime"]}
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: fixture.workspace_root,
+        routing: %{
+          target_label_prefix: "repo:",
+          default_branch: "trunk",
+          targets: %{
+            "wup" => %{source_path: "/sources/wup", remote: "datawarsaw/wup"},
+            "symphony-runtime" => %{source_path: fixture.source_repo, remote: fixture.remote_repo}
+          }
+        },
+        hook_after_create:
+          "printf '%s|%s|%s|%s' \"$SYMPHONY_REPOSITORY_TARGET\" \"$SYMPHONY_REPOSITORY_SOURCE_PATH\" \"$SYMPHONY_REPOSITORY_DEFAULT_BRANCH\" \"$SYMPHONY_REPOSITORY_REMOTE\" > route.txt"
+      )
 
-    assert {:ok, route} = RepositoryRouter.resolve(issue, Config.settings!().routing)
-    assert route.target == "symphony-runtime"
-    assert route.source_path == "/sources/symphony"
-    assert route.default_branch == "trunk"
+      issue = %Issue{id: "issue-1", identifier: "MIC-129", labels: ["repo:symphony-runtime"]}
 
-    assert {:ok, workspace} = Workspace.create_for_issue(issue)
-    assert File.read!(Path.join(workspace, "route.txt")) == "symphony-runtime|/sources/symphony|trunk|"
+      assert {:ok, route} = RepositoryRouter.resolve(issue, Config.settings!().routing)
+      assert route.target == "symphony-runtime"
+      assert route.source_path == fixture.source_repo
+      assert route.default_branch == "trunk"
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.read!(Path.join(workspace, "route.txt")) == "symphony-runtime|#{fixture.source_repo}|trunk|#{fixture.remote_repo}"
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "repository routing fails closed when the remote task branch already exists" do
@@ -602,7 +610,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       issue = routed_source_issue("MIC-TRACKED-DIRTY")
 
-      assert {:error, {:workspace_hook_failed, "after_create", 1, _output}} =
+      assert {:error, {:source_baseline_sync_failed, "symphony-runtime", :dirty_tracked}} =
                Workspace.create_for_issue(issue)
 
       assert {_, 1} =
@@ -632,7 +640,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       issue = routed_source_issue("MIC-STAGED-DIRTY")
 
-      assert {:error, {:workspace_hook_failed, "after_create", 1, _output}} =
+      assert {:error, {:source_baseline_sync_failed, "symphony-runtime", :dirty_index}} =
                Workspace.create_for_issue(issue)
 
       assert {_, 1} =
