@@ -7,12 +7,23 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{Config, PathSafety, RepositoryRouter, SSH, SourceSync}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @remote_provenance_marker "__SYMPHONY_PROVENANCE__"
 
   @type worker_host :: String.t() | nil
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+    case create_for_issue_with_route(issue_or_identifier, worker_host) do
+      {:ok, workspace, _route} -> {:ok, workspace}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc false
+  @spec create_for_issue_with_route(map() | String.t() | nil, worker_host()) ::
+          {:ok, Path.t(), RepositoryRouter.Route.t() | nil} | {:error, term()}
+  def create_for_issue_with_route(issue_or_identifier, worker_host \\ nil) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
@@ -26,7 +37,7 @@ defmodule SymphonyElixir.Workspace do
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
         case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
           :ok ->
-            {:ok, workspace}
+            {:ok, workspace, route}
 
           {:error, _reason} = error ->
             cleanup_failed_new_workspace(workspace, created?, worker_host)
@@ -223,9 +234,35 @@ defmodule SymphonyElixir.Workspace do
           :ok | {:error, term()}
   def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
     with {:ok, route} <- resolve_repository_route(issue_or_identifier) do
-      issue_context = issue_or_identifier |> issue_context() |> Map.put(:repository_route, route)
-      run_before_run_hook_for_context(workspace, issue_context, worker_host)
+      run_before_run_hook(workspace, issue_or_identifier, worker_host, route)
     end
+  end
+
+  @doc false
+  @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host(),
+          RepositoryRouter.Route.t() | nil) :: :ok | {:error, term()}
+  def run_before_run_hook(workspace, issue_or_identifier, worker_host, route)
+      when is_binary(workspace) and (is_nil(route) or is_struct(route, RepositoryRouter.Route)) do
+    issue_context = issue_or_identifier |> issue_context() |> Map.put(:repository_route, route)
+    run_before_run_hook_for_context(workspace, issue_context, worker_host)
+  end
+
+  @doc false
+  @spec capture_provenance(Path.t(), map() | String.t() | nil, worker_host()) ::
+          {:ok, map()} | {:error, term()}
+  def capture_provenance(workspace, issue_or_identifier, worker_host \\ nil)
+      when is_binary(workspace) do
+    with {:ok, route} <- resolve_repository_route(issue_or_identifier) do
+      capture_provenance(workspace, issue_or_identifier, worker_host, route)
+    end
+  end
+
+  @doc false
+  @spec capture_provenance(Path.t(), map() | String.t() | nil, worker_host(),
+          RepositoryRouter.Route.t() | nil) :: {:ok, map()} | {:error, term()}
+  def capture_provenance(workspace, _issue_or_identifier, worker_host, route)
+      when is_binary(workspace) and (is_nil(route) or is_struct(route, RepositoryRouter.Route)) do
+    capture_workspace_provenance(workspace, route, worker_host)
   end
 
   defp run_before_run_hook_for_context(workspace, issue_context, worker_host) do
@@ -238,6 +275,141 @@ defmodule SymphonyElixir.Workspace do
       command ->
         run_hook(command, workspace, issue_context, "before_run", worker_host)
     end
+  end
+
+  defp capture_workspace_provenance(workspace, nil, nil) do
+    with :ok <- validate_workspace_path(workspace, nil) do
+      case local_git_output(workspace, ["rev-parse", "--verify", "HEAD^{commit}"]) do
+        {:ok, head} ->
+          {:ok, unrouted_provenance(head, local_origin(workspace))}
+
+        {:error, :git_read_failed} ->
+          {:ok, empty_provenance()}
+      end
+    else
+      {:error, reason} -> {:error, {:workspace_provenance_failed, reason}}
+    end
+  end
+
+  defp capture_workspace_provenance(workspace, nil, worker_host) when is_binary(worker_host) do
+    with :ok <- validate_workspace_path(workspace, worker_host) do
+      case remote_git_provenance(workspace, worker_host) do
+        {:ok, {head, origin}} -> {:ok, unrouted_provenance(head, {:ok, origin})}
+        {:error, :git_read_failed} -> {:ok, empty_provenance()}
+        {:error, reason} -> {:error, {:workspace_provenance_failed, reason}}
+      end
+    else
+      {:error, reason} -> {:error, {:workspace_provenance_failed, reason}}
+    end
+  end
+
+  defp capture_workspace_provenance(workspace, %RepositoryRouter.Route{} = route, nil) do
+    with :ok <- validate_workspace_path(workspace, nil),
+         {:ok, head} <- local_git_output(workspace, ["rev-parse", "--verify", "HEAD^{commit}"]),
+         {:ok, origin} <- local_origin(workspace) do
+      {:ok, provenance(route, head, origin)}
+    else
+      {:error, reason} -> {:error, {:workspace_provenance_failed, reason}}
+    end
+  end
+
+  defp capture_workspace_provenance(workspace, %RepositoryRouter.Route{} = route, worker_host)
+         when is_binary(worker_host) do
+    with :ok <- validate_workspace_path(workspace, worker_host),
+         {:ok, {head, origin}} <- remote_git_provenance(workspace, worker_host) do
+      {:ok, provenance(route, head, origin)}
+    else
+      {:error, reason} -> {:error, {:workspace_provenance_failed, reason}}
+    end
+  end
+
+  defp empty_provenance do
+    %{
+      repository_target: nil,
+      repository_source_path: nil,
+      repository_default_branch: nil,
+      configured_remote: nil,
+      repository_origin: nil,
+      prepared_base_commit: nil
+    }
+  end
+
+  defp local_origin(workspace) do
+    case local_git_output(workspace, ["remote", "get-url", "origin"]) do
+      {:ok, origin} -> {:ok, origin}
+      {:error, :git_read_failed} -> {:ok, nil}
+    end
+  end
+
+  defp local_git_output(workspace, args) do
+    case System.cmd("git", ["-c", "safe.directory=#{workspace}", "-C", workspace | args],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} -> {:ok, String.trim(output)}
+      {_output, _status} -> {:error, :git_read_failed}
+    end
+  end
+
+  defp remote_git_provenance(workspace, worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("workspace", workspace),
+        "head=$(git -c \"safe.directory=$workspace\" -C \"$workspace\" rev-parse --verify 'HEAD^{commit}')",
+        "origin=$(git -c \"safe.directory=$workspace\" -C \"$workspace\" remote get-url origin 2>/dev/null || true)",
+        "printf '%s\\t%s\\t%s\\n' '#{@remote_provenance_marker}' \"$head\" \"${origin:-}\""
+      ]
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {output, 0}} -> parse_remote_provenance_output(output)
+      {:ok, {_output, _status}} -> {:error, :git_read_failed}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse_remote_provenance_output(output) do
+    output
+    |> IO.iodata_to_binary()
+    |> String.split("\n", trim: true)
+    |> Enum.find_value(fn line ->
+      case String.split(line, "\t", parts: 3) do
+        [@remote_provenance_marker, head, origin] when head != "" -> {:ok, {head, origin}}
+        _ -> nil
+      end
+    end)
+    |> case do
+      nil -> {:error, :invalid_git_read_output}
+      result -> result
+    end
+  end
+
+  defp provenance(route, head, origin) do
+    %{
+      repository_target: route.target,
+      repository_source_path: route.source_path,
+      repository_default_branch: route.default_branch,
+      configured_remote: redact_remote(route.remote),
+      repository_origin: redact_remote(origin),
+      prepared_base_commit: head
+    }
+  end
+
+  defp unrouted_provenance(head, {:ok, origin}) do
+    empty_provenance()
+    |> Map.put(:prepared_base_commit, head)
+    |> Map.put(:repository_origin, redact_remote(origin))
+  end
+
+  defp redact_remote(nil), do: nil
+
+  defp redact_remote(remote) when is_binary(remote) do
+    remote
+    |> String.trim()
+    |> String.replace(~r<(://)[^/@\s]+@>, "\\1")
+    |> String.replace(~r<^([^/@\s]+)@(?=[^:/\s]+[:/])>, "")
+    |> String.replace(~r/[?#].*$/, "")
   end
 
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok

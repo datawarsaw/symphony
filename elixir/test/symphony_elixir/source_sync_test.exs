@@ -114,6 +114,28 @@ defmodule SymphonyElixir.SourceSyncTest do
     end
   end
 
+  test "source refresh on retry preserves the existing implementation base and diff" do
+    with_source_fixture("retry-diff", fn fixture ->
+      configure_workspace_workflow!(fixture)
+      issue = %Issue{id: "retry-sync", identifier: "MIC-167-RETRY", labels: ["repo:symphony-runtime"]}
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      prepared_base = get_head_sha(workspace)
+      File.write!(Path.join(workspace, "README.md"), "uncommitted implementation\n")
+      File.write!(Path.join(workspace, "review-notes.md"), "test evidence\n")
+      remote_base = advance_remote!(fixture, "new upstream\n", "upstream update")
+
+      assert {:ok, ^workspace} = Workspace.create_for_issue(issue)
+      assert get_head_sha(fixture.source_repo) == remote_base
+      assert get_head_sha(workspace) == prepared_base
+      assert File.read!(Path.join(workspace, "README.md")) == "uncommitted implementation\n"
+      assert File.read!(Path.join(workspace, "review-notes.md")) == "test evidence\n"
+      assert {:ok, provenance} = Workspace.capture_provenance(workspace, issue)
+      assert provenance.prepared_base_commit == prepared_base
+      assert :ok = Workspace.run_after_run_hook(workspace, issue)
+      assert File.read!(Path.join(workspace, "README.md")) == "uncommitted implementation\n"
+    end)
+  end
+
   defp with_source_fixture(name, fun) do
     test_root = test_root_path(name)
 

@@ -1520,8 +1520,10 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "This is an unattended orchestration session."
     assert prompt =~ "Only stop early for a true external blocker"
     assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "Treat `.git` as read-only."
+    assert prompt =~ "Delivery is a separate host or human-approved phase."
+    assert prompt =~ "move the ticket to `In Review`. Preserve the workspace and source diff."
+    refute prompt =~ ".codex/skills/land/SKILL.md"
     assert prompt =~ "Follow-up context:"
     assert prompt =~ "follow-up attempt #2"
   end
