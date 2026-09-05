@@ -28,9 +28,9 @@ defmodule SymphonyElixir.SourceSync do
           {:ok, :current | :fast_forwarded}
           | {:error, reason_code() | {reason_code(), term()}}
 
-  @spec sync(Route.t() | Path.t(), keyword()) :: sync_result()
   def sync(route_or_path, opts \\ [])
 
+  @spec sync(Route.t() | Path.t(), keyword()) :: sync_result()
   def sync(%Route{source_path: path, default_branch: branch, remote: remote}, opts) do
     sync_repo(path, branch, Keyword.put_new(opts, :expected_remote, remote))
   end

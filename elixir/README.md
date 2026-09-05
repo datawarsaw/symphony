@@ -15,7 +15,8 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
    Cloud, Asana, and GitLab)
-2. Creates a workspace per issue
+2. Uses host-side repository routing, source synchronization, and workspace hooks to prepare a
+   workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
 4. Sends a workflow prompt to Codex
@@ -27,8 +28,13 @@ Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud se
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
 
-If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
-Symphony stops the active agent for that issue and cleans up matching workspaces.
+After the host before_run hook, AgentRunner logs sanitized repository provenance and includes it
+in the first Codex prompt: the selected target/source/default branch, configured remote, actual
+origin, and the prepared workspace commit. These read-only checks do not update Git metadata.
+
+A completed implementation handoff preserves its workspace and uncommitted source diff for review.
+Delivery is a separate host or human-approved phase. In Review does not trigger cleanup;
+existing automatic cleanup still applies when an issue enters a configured terminal state.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
@@ -167,15 +173,17 @@ Notes:
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
-- Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
-  `git clone ... .` there, along with any other setup commands you need.
+- `hooks.after_create` runs host-side to bootstrap a fresh workspace. For a Git-backed repo, it
+  may clone or materialize the prepared source there, along with any setup commands it needs.
+  Codex must not repeat that preparation or mutate `.git`; it may edit source files, run tests,
+  and collect read-only Git status/diff/log/rev-parse evidence.
 - `routing.targets` enables deterministic multi-repository dispatch. Once enabled, every issue
   needs exactly one label with `routing.target_label_prefix` (default `repo:`), such as
   `repo:wup`. The selected target must be in the configured allowlist; missing, unknown, or
   multiple target labels are not dispatched. Route details are exported to workspace hooks as
   `SYMPHONY_REPOSITORY_TARGET`, `SYMPHONY_REPOSITORY_SOURCE_PATH`, and
   `SYMPHONY_REPOSITORY_DEFAULT_BRANCH` (and `SYMPHONY_REPOSITORY_REMOTE` when configured).
-  Symphony automatically verifies the source baseline before creating each task worktree,
+  Symphony automatically verifies the source baseline before configured host hooks create each task worktree,
   safely fast-forwarding clean repositories that are strictly behind remote origin and failing
   closed on dirty tracked files, staged changes, unmerged index state, ahead, or diverged branches.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
@@ -204,7 +212,9 @@ codex:
 ```
 
 For a multi-repository workflow, configure explicit local sources and use the exported route
-variables in `after_create`:
+variables in the host-side `after_create` hook. This hook, together with `RepositoryRouter` and
+`SourceSync`, is the only repository-preparation flow; do not create a second
+`workspace.repository` or `base_ref` convention for Codex:
 
 ```yaml
 routing:
