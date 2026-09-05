@@ -43,7 +43,8 @@ defmodule SymphonyElixir.AgentRunner do
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host),
+               :ok <- Workspace.validate_preparation(workspace, worker_host) do
             run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after

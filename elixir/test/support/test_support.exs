@@ -51,7 +51,7 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   def write_workflow_file!(path, overrides \\ []) do
-    workflow = workflow_content(overrides)
+    workflow = overrides |> workflow_content() |> normalize_newlines()
     File.write!(path, workflow)
 
     if Process.whereis(SymphonyElixir.WorkflowStore) do
@@ -101,6 +101,8 @@ defmodule SymphonyElixir.TestSupport do
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
+          workspace_repository: nil,
+          workspace_base_ref: "refs/heads/main",
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
@@ -139,6 +141,8 @@ defmodule SymphonyElixir.TestSupport do
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
+    workspace_repository = Keyword.get(config, :workspace_repository)
+    workspace_base_ref = Keyword.get(config, :workspace_base_ref)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
@@ -180,6 +184,8 @@ defmodule SymphonyElixir.TestSupport do
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
+        "  repository: #{yaml_value(workspace_repository)}",
+        "  base_ref: #{yaml_value(workspace_base_ref)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
@@ -206,7 +212,10 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value) when is_binary(value) do
-    "\"" <> String.replace(value, "\"", "\\\"") <> "\""
+    "\"" <>
+      (value
+       |> String.replace("\\", "\\\\")
+       |> String.replace("\"", "\\\"")) <> "\""
   end
 
   defp yaml_value(value) when is_integer(value), do: to_string(value)
@@ -288,5 +297,9 @@ defmodule SymphonyElixir.TestSupport do
       |> Enum.map_join("\n", &("    " <> &1))
 
     "  #{name}: |\n#{indented}"
+  end
+
+  defp normalize_newlines(contents) do
+    String.replace(contents, "\r\n", "\n")
   end
 end

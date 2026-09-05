@@ -15,7 +15,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
    Cloud, Asana, and GitLab)
-2. Creates a workspace per issue
+2. Creates and synchronizes an isolated workspace per issue on the orchestration host
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
 4. Sends a workflow prompt to Codex
@@ -42,16 +42,44 @@ tracker issue can become a dispatch candidate again after restart.
 2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
    set it as the `LINEAR_API_KEY` environment variable.
 3. Copy this directory's `WORKFLOW.md` to your repo.
-4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
+4. Optionally copy the `linear` skill to your repo. Delivery skills belong to a separate process.
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
      operations such as comment editing or upload flows.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
-     issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
+     issue statuses: "Rework" and "In Review". You can customize them in
      Team Settings → Workflow in Linear.
 6. Follow the instructions below to install the required runtime dependencies and start the service.
+
+## Host repository preparation
+
+Set `workspace.repository` to an operator-approved Git repository and `workspace.base_ref` to the
+selected base ref (default `refs/heads/main`). These values come from trusted workflow configuration,
+never ticket text. Configure the source for this deployment; per-issue repository routing is separate.
+Local repository paths resolve relative to the workflow file directory and are recorded as absolute
+paths. Git URLs remain unchanged.
+The bundled workflow uses this preparation mode and does not clone in `after_create`.
+
+Before Codex starts, the host clones a fresh workspace or fetches the selected base in an existing
+checkout, verifies its origin, and refreshes a clean tree. Provenance is stored in
+`.git/.symphony-provenance.json` with `repository`, `origin`, and `base_commit`. This file is readable
+with Git metadata protected during implementation and does not pollute the source diff.
+Preparation rejects nonregular provenance destinations, and the final launch gate rechecks Git
+metadata and checkout location after host hooks.
+
+A dirty workspace can resume when its prepared base has not changed. If the base advances, preparation
+fails and retains the source changes for review; it does not reset, stash, or discard them. Failed
+Git operations prevent agent launch. Host credentials and Git must be available before dispatch.
+Configured repository preparation currently fails closed on SSH workers; legacy hook-managed
+workspaces remain supported when `workspace.repository` is absent.
+
+Hooks are trusted host code. Keep them limited to dependency/bootstrap work; do not perform delivery
+or discard source changes in `after_run`. Review states must be non-active and non-terminal so the
+orchestrator retains review workspaces. Terminal-state cleanup remains an explicit lifecycle action.
+The implementation prompt requires no fetch, config, branch, commit, push, PR, merge, or deployment.
+Keep the existing workspace-write sandbox; granting unrestricted access is unnecessary.
 
 ## Prerequisites
 

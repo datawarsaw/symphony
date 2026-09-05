@@ -4,9 +4,10 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, PathSafety, SSH, Workflow}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @provenance_file ".symphony-provenance.json"
 
   @type worker_host :: String.t() | nil
 
@@ -21,9 +22,16 @@ defmodule SymphonyElixir.Workspace do
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
-        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+        case prepare_repository(workspace, worker_host) do
           :ok ->
-            {:ok, workspace}
+            case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+              :ok ->
+                {:ok, workspace}
+
+              {:error, _reason} = error ->
+                cleanup_failed_new_workspace(workspace, created?, worker_host)
+                error
+            end
 
           {:error, _reason} = error ->
             cleanup_failed_new_workspace(workspace, created?, worker_host)
@@ -34,6 +42,50 @@ defmodule SymphonyElixir.Workspace do
       error in [ArgumentError, ErlangError, File.Error] ->
         Logger.error("Workspace creation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
         {:error, error}
+    end
+  end
+
+  @doc false
+  @spec validate_preparation(Path.t()) :: :ok | {:error, term()}
+  def validate_preparation(workspace), do: validate_preparation(workspace, nil)
+
+  @doc false
+  @spec validate_preparation(Path.t(), worker_host()) :: :ok | {:error, term()}
+  def validate_preparation(_workspace, worker_host) when is_binary(worker_host) do
+    case Config.settings!().workspace.repository do
+      nil -> :ok
+      "" -> :ok
+      _repository -> {:error, {:workspace_sync_unsupported_remote, worker_host}}
+    end
+  end
+
+  def validate_preparation(workspace, nil) when is_binary(workspace) do
+    case Config.settings!().workspace.repository do
+      repository when is_binary(repository) and repository != "" ->
+        with :ok <- verify_git_metadata(workspace),
+             :ok <- verify_checkout_location(workspace),
+             :ok <- verify_provenance_destination(workspace),
+             {:ok, %{origin: expected_origin, base_commit: base_commit}} <-
+               read_repository_provenance(workspace, normalize_repository(repository)),
+             {:ok, origin} <- git_output(workspace, ["remote", "get-url", "origin"]),
+             :ok <- verify_origin(expected_origin, origin),
+             {:ok, ^base_commit} <- git_output(workspace, ["rev-parse", "HEAD"]) do
+          :ok
+        else
+          {:error, {:workspace_sync_failed, :provenance_repository_mismatch, _}} = error -> error
+          _ -> {:error, {:workspace_sync_failed, :preparation_changed, workspace}}
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp read_repository_provenance(workspace, repository) do
+    case read_provenance(workspace) do
+      {:ok, %{repository: ^repository}} = result -> result
+      {:ok, _provenance} -> {:error, {:workspace_sync_failed, :provenance_repository_mismatch, workspace}}
+      :error -> :error
     end
   end
 
@@ -88,6 +140,201 @@ defmodule SymphonyElixir.Workspace do
     File.rm_rf!(workspace)
     File.mkdir_p!(workspace)
     {:ok, workspace, true}
+  end
+
+  # Repository synchronization deliberately happens here, on the orchestration host, before the
+  # app-server starts. Codex receives the prepared checkout with its Git directory read-only.
+  defp prepare_repository(_workspace, worker_host) when is_binary(worker_host) do
+    case Config.settings!().workspace.repository do
+      nil -> :ok
+      "" -> :ok
+      _source -> {:error, {:workspace_sync_unsupported_remote, worker_host}}
+    end
+  end
+
+  defp prepare_repository(workspace, nil) do
+    case Config.settings!().workspace do
+      %{repository: repository} when is_binary(repository) and repository != "" ->
+        sync_local_repository(workspace, repository)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp sync_local_repository(workspace, repository) do
+    repository = normalize_repository(repository)
+
+    with :ok <- ensure_checkout(workspace, repository),
+         :ok <- verify_checkout_location(workspace),
+         :ok <- verify_provenance_destination(workspace),
+         {:ok, origin} <- git_output(workspace, ["remote", "get-url", "origin"]),
+         :ok <- verify_origin(repository, origin),
+         :ok <- git(workspace, ["fetch", "--quiet", "origin", "--", Config.settings!().workspace.base_ref]),
+         {:ok, base_commit} <- git_output(workspace, ["rev-parse", "FETCH_HEAD"]),
+         {:ok, dirty?} <- dirty_checkout?(workspace),
+         :ok <- checkout_or_preserve_dirty(workspace, dirty?, base_commit),
+         :ok <- write_provenance(workspace, repository, origin, base_commit) do
+      :ok
+    end
+  end
+
+  defp ensure_checkout(workspace, source) do
+    git_metadata = Path.join(workspace, ".git")
+
+    case File.lstat(git_metadata) do
+      {:ok, %File.Stat{type: :directory}} ->
+        :ok
+
+      {:ok, _stat} ->
+        {:error, {:workspace_sync_failed, :unsafe_git_metadata, git_metadata}}
+
+      {:error, :enoent} ->
+        if directory_empty?(workspace) do
+          git(Path.dirname(workspace), ["clone", "--no-local", "--", source, workspace])
+        else
+          {:error, {:workspace_sync_failed, :not_a_git_checkout, workspace}}
+        end
+
+      {:error, reason} ->
+        {:error, {:workspace_sync_failed, :git_metadata_unreadable, git_metadata, reason}}
+    end
+  end
+
+  defp directory_empty?(workspace) do
+    case File.ls(workspace) do
+      {:ok, []} -> true
+      _ -> false
+    end
+  end
+
+  defp verify_git_metadata(workspace) do
+    metadata = Path.join(workspace, ".git")
+
+    case File.lstat(metadata) do
+      {:ok, %File.Stat{type: :directory}} -> :ok
+      _ -> {:error, {:workspace_sync_failed, :unsafe_git_metadata, metadata}}
+    end
+  end
+
+  defp verify_provenance_destination(workspace) do
+    path = Path.join([workspace, ".git", @provenance_file])
+
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} -> :ok
+      {:error, :enoent} -> :ok
+      _ -> {:error, {:workspace_sync_failed, :unsafe_provenance_metadata, path}}
+    end
+  end
+
+  defp verify_origin(repository, origin) do
+    if normalize_repository(repository) == normalize_repository(origin) do
+      :ok
+    else
+      {:error, {:workspace_sync_failed, :unexpected_origin, repository, origin}}
+    end
+  end
+
+  defp verify_checkout_location(workspace) do
+    with {:ok, top_level} <- git_output(workspace, ["rev-parse", "--show-toplevel"]),
+         {:ok, git_dir} <- git_output(workspace, ["rev-parse", "--absolute-git-dir"]),
+         {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
+         {:ok, ^canonical_workspace} <- PathSafety.canonicalize(top_level),
+         {:ok, canonical_git_dir} <- PathSafety.canonicalize(git_dir),
+         {:ok, ^canonical_git_dir} <- PathSafety.canonicalize(Path.join(workspace, ".git")) do
+      :ok
+    else
+      _ -> {:error, {:workspace_sync_failed, :unsafe_checkout_location, workspace}}
+    end
+  end
+
+  defp normalize_repository(repository) do
+    windows_drive? = String.match?(repository, ~r/^[A-Za-z]:[\\\/]/)
+    scp_source? = String.match?(repository, ~r/^(?:[^\s\/\\@]+@)?(?:\[[^\]]+\]|[^\s\/\\:]+):.+$/)
+
+    if String.contains?(repository, "://") or (scp_source? and not windows_drive?) do
+      repository
+    else
+      workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+      Path.expand(repository, workflow_dir)
+    end
+  end
+
+  defp dirty_checkout?(workspace) do
+    with {:ok, output} <- git_output(workspace, ["status", "--porcelain", "--untracked-files=all"]) do
+      {:ok, String.trim(output) != ""}
+    end
+  end
+
+  defp checkout_or_preserve_dirty(workspace, false, _base_commit) do
+    git(workspace, ["checkout", "--quiet", "--detach", "FETCH_HEAD"])
+  end
+
+  defp checkout_or_preserve_dirty(workspace, true, base_commit) do
+    with {:ok, head} <- git_output(workspace, ["rev-parse", "HEAD"]) do
+      case read_provenance(workspace) do
+        {:ok, %{base_commit: ^base_commit}} when head == base_commit -> :ok
+        _ -> {:error, {:workspace_sync_failed, :dirty_workspace, workspace, base_commit}}
+      end
+    end
+  end
+
+  defp write_provenance(workspace, source, origin, base_commit) do
+    provenance = %{repository: source, origin: origin, base_commit: base_commit}
+    File.write(Path.join([workspace, ".git", @provenance_file]), Jason.encode!(provenance))
+  end
+
+  defp read_provenance(workspace) do
+    with {:ok, contents} <- File.read(Path.join([workspace, ".git", @provenance_file])),
+         {:ok, provenance} <- Jason.decode(contents),
+         repository when is_binary(repository) <- Map.get(provenance, "repository"),
+         origin when is_binary(origin) <- Map.get(provenance, "origin"),
+         base_commit when is_binary(base_commit) <- Map.get(provenance, "base_commit") do
+      {:ok, %{repository: repository, origin: origin, base_commit: base_commit}}
+    else
+      _ -> :error
+    end
+  end
+
+  defp git(workspace, args) do
+    case run_git(workspace, args) do
+      {_output, 0} -> :ok
+      {:error, :timeout} -> {:error, {:workspace_sync_failed, :git_timeout, workspace}}
+      {:error, {:exception, message}} -> {:error, {:workspace_sync_failed, :git_unavailable, message}}
+      {output, status} -> {:error, {:workspace_sync_failed, :git, status, output}}
+    end
+  end
+
+  defp git_output(workspace, args) do
+    case run_git(workspace, args) do
+      {output, 0} -> {:ok, String.trim(output)}
+      {:error, :timeout} -> {:error, {:workspace_sync_failed, :git_timeout, workspace}}
+      {:error, {:exception, message}} -> {:error, {:workspace_sync_failed, :git_unavailable, message}}
+      {output, status} -> {:error, {:workspace_sync_failed, :git, status, output}}
+    end
+  end
+
+  defp run_git(workspace, args) do
+    task =
+      Task.async(fn ->
+        try do
+          System.cmd("git", ["-C", workspace | args],
+            stderr_to_stdout: true,
+            env: [{"GIT_TERMINAL_PROMPT", "0"}]
+          )
+        rescue
+          error -> {:error, {:exception, Exception.message(error)}}
+        end
+      end)
+
+    case Task.yield(task, Config.settings!().hooks.timeout_ms) do
+      {:ok, result} ->
+        result
+
+      nil ->
+        Task.shutdown(task, :brutal_kill)
+        {:error, :timeout}
+    end
   end
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}

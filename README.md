@@ -3,6 +3,11 @@
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
+The implementation workflow prepares and synchronizes an approved repository on the orchestration
+host before Codex starts. Workers edit and test isolated source copies with Git metadata read-only,
+then preserve their diffs for independent review. Commit, publication, merge, and deployment belong
+to a separate delivery phase after the human gate.
+
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
 _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._

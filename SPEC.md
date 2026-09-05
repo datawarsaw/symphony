@@ -409,6 +409,22 @@ Fields:
 
 #### 5.3.3 `workspace` (object)
 
+Implementation extension: `repository` is an optional operator-approved Git source and `base_ref`
+is its selected base (default `refs/heads/main`). With repository preparation enabled, the host must
+clone/fetch and synchronize the isolated checkout before starting the coding agent. Existing origin
+must match the approved source. Record repository, origin and resolved base commit in
+`.git/.symphony-provenance.json`. Failed preparation must prevent launch with diagnostics.
+Local repository sources resolve relative to the workflow directory before cloning and provenance
+recording. Reject redirected provenance destinations and revalidate checkout location after hooks.
+Preserve source diffs: unchanged-base retries may resume; an advanced base with dirty source must
+fail safely. Unsupported remote preparation must fail closed. Without this configuration, existing
+hook-managed population remains available.
+
+The bundled implementation workflow treats Git metadata as read-only inside Codex. Source editing,
+tests and read-only Git evidence precede a non-terminal In Review handoff; Git metadata writes and
+delivery belong to a separate reviewed phase. Agent exit alone must not discard source changes.
+
+
 Fields:
 
 - `root` (path string or `$VAR`)

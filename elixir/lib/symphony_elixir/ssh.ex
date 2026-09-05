@@ -4,7 +4,8 @@ defmodule SymphonyElixir.SSH do
   @spec run(String.t(), String.t(), keyword()) :: {:ok, {String.t(), non_neg_integer()}} | {:error, term()}
   def run(host, command, opts \\ []) when is_binary(host) and is_binary(command) do
     with {:ok, executable} <- ssh_executable() do
-      {:ok, System.cmd(executable, ssh_args(host, command), opts)}
+      runner = Application.get_env(:symphony_elixir, :ssh_command_runner, &System.cmd/3)
+      {:ok, runner.(executable, ssh_args(host, command), opts)}
     end
   end
 
@@ -22,7 +23,9 @@ defmodule SymphonyElixir.SSH do
         ]
         |> maybe_put_line_option(line_bytes)
 
-      {:ok, Port.open({:spawn_executable, String.to_charlist(executable)}, port_opts)}
+      port_opener = Application.get_env(:symphony_elixir, :ssh_port_opener, &Port.open/2)
+
+      {:ok, port_opener.({:spawn_executable, String.to_charlist(executable)}, port_opts)}
     end
   end
 
@@ -32,7 +35,10 @@ defmodule SymphonyElixir.SSH do
   end
 
   defp ssh_executable do
-    case System.find_executable("ssh") do
+    executable_resolver =
+      Application.get_env(:symphony_elixir, :ssh_executable_resolver, &System.find_executable/1)
+
+    case executable_resolver.("ssh") do
       nil -> {:error, :ssh_not_found}
       executable -> {:ok, executable}
     end

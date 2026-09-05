@@ -112,12 +112,24 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:repository, :string)
+      field(:base_ref, :string, default: "refs/heads/main")
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :repository, :base_ref], empty_values: [])
+      |> validate_change(:repository, &validate_git_value/2)
+      |> validate_change(:base_ref, &validate_git_value/2)
+    end
+
+    defp validate_git_value(field, value) when is_binary(value) do
+      if String.trim(value) == "" or String.contains?(value, ["\n", "\r", <<0>>]) do
+        [{field, "must be a non-blank single-line value"}]
+      else
+        []
+      end
     end
   end
 

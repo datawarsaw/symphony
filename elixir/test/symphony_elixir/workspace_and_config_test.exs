@@ -6,11 +6,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Linear.Client
 
   test "workspace bootstrap can be implemented in after_create hook" do
-    test_root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-workspace-hook-bootstrap-#{System.unique_integer([:positive])}"
-      )
+    test_root = workspace_fixture_root("hook bootstrap")
 
     try do
       template_repo = Path.join(test_root, "source")
@@ -20,22 +16,403 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.mkdir_p!(Path.join(template_repo, "keep"))
       File.write!(Path.join([template_repo, "keep", "file.txt"]), "keep me")
       File.write!(Path.join(template_repo, "README.md"), "hook clone\n")
-      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
-      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
-      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
-      System.cmd("git", ["-C", template_repo, "add", "README.md", "keep/file.txt"])
-      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+      git!(template_repo, ["init", "-b", "main"])
+      git!(template_repo, ["add", "README.md", "keep/file.txt"])
+      git!(template_repo, ["commit", "-m", "initial"])
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "git clone --depth 1 #{template_repo} ."
+        hook_after_create: "git clone --depth 1 #{git_bash_quote(template_repo)} ."
       )
 
+      assert Config.settings!().workspace.root == Path.expand(workspace_root)
       assert {:ok, workspace} = Workspace.create_for_issue("S-1")
       assert File.exists?(Path.join(workspace, ".git"))
-      assert File.read!(Path.join(workspace, "README.md")) == "hook clone\n"
+      assert normalized_file_contents(workspace, "README.md") == "hook clone\n"
       assert File.read!(Path.join([workspace, "keep", "file.txt"])) == "keep me"
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "host prepares a fresh repository checkout and records its provenance" do
+    test_root = workspace_fixture_root("fresh")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      commit = create_source_repository!(source, "one\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-PREPARE")
+      assert normalized_file_contents(workspace, "README.md") == "one\n"
+
+      assert {:ok, provenance} =
+               workspace
+               |> then(&Path.join([&1, ".git", ".symphony-provenance.json"]))
+               |> File.read!()
+               |> Jason.decode()
+
+      assert provenance["repository"] == source
+      assert same_local_path?(provenance["origin"], source)
+      assert provenance["base_commit"] == commit
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "host resolves a relative repository from the workflow directory" do
+    test_root = workspace_fixture_root("relative-repository")
+    workflow_dir = Path.join(test_root, "workflow")
+    workflow_file = Path.join(workflow_dir, "WORKFLOW.md")
+    source = Path.join(workflow_dir, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      create_source_repository!(source, "one\n")
+      File.mkdir_p!(workflow_dir)
+      write_workflow_file!(workflow_file, workspace_root: workspace_root, workspace_repository: "source")
+      Workflow.set_workflow_file_path(workflow_file)
+      :ok = WorkflowStore.force_reload()
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-RELATIVE-REPOSITORY")
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-RELATIVE-REPOSITORY")
+
+      assert {:ok, provenance} =
+               workspace
+               |> then(&Path.join([&1, ".git", ".symphony-provenance.json"]))
+               |> File.read!()
+               |> Jason.decode()
+
+      assert same_local_path?(provenance["repository"], source)
+      assert same_local_path?(provenance["origin"], source)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "host refreshes a clean workspace but preserves a dirty workspace at its recorded base" do
+    test_root = workspace_fixture_root("refresh")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      _first_commit = create_source_repository!(source, "one\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-REFRESH")
+
+      second_commit = commit_source_change!(source, "two\n")
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-REFRESH")
+      assert normalized_file_contents(workspace, "README.md") == "two\n"
+
+      File.write!(Path.join(workspace, "README.md"), "agent diff\n")
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-REFRESH")
+      assert File.read!(Path.join(workspace, "README.md")) == "agent diff\n"
+
+      assert {:ok, provenance} =
+               workspace
+               |> then(&Path.join([&1, ".git", ".symphony-provenance.json"]))
+               |> File.read!()
+               |> Jason.decode()
+
+      assert provenance["base_commit"] == second_commit
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "host refuses to refresh a dirty workspace when the selected base advanced" do
+    test_root = workspace_fixture_root("dirty-advanced")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      create_source_repository!(source, "one\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-DIRTY")
+      File.write!(Path.join(workspace, "README.md"), "agent diff\n")
+      commit_source_change!(source, "two\n")
+
+      assert {:error, {:workspace_sync_failed, :dirty_workspace, ^workspace, _base_commit}} =
+               Workspace.create_for_issue("MT-DIRTY")
+
+      assert File.read!(Path.join(workspace, "README.md")) == "agent diff\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "repository sync failure prevents workspace preparation" do
+    test_root = workspace_fixture_root("sync-failure")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_repository: Path.join(test_root, "missing-source")
+      )
+
+      assert {:error, {:workspace_sync_failed, :git, _status, _output}} =
+               Workspace.create_for_issue("MT-SYNC-FAIL")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "preparation validation prevents launch when a host hook changes the prepared revision" do
+    test_root = workspace_fixture_root("preparation-validation")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      create_source_repository!(source, "one\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-VALIDATE")
+
+      File.write!(Path.join(workspace, "README.md"), "host changed\n")
+      git!(workspace, ["add", "README.md"])
+      git!(workspace, ["commit", "-m", "host mutation"])
+
+      assert {:error, {:workspace_sync_failed, :preparation_changed, ^workspace}} =
+               Workspace.validate_preparation(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  @tag skip:
+         if(match?({:win32, _}, :os.type()),
+           do: "requires Windows symlink privileges",
+           else: false
+         )
+  test "host rejects a workspace .git symlink before it can write outside the workspace" do
+    test_root = workspace_fixture_root("git-symlink")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-GIT-SYMLINK")
+    outside_git_dir = Path.join(source, ".git")
+
+    try do
+      create_source_repository!(source, "one\n")
+      File.mkdir_p!(workspace)
+      File.ln_s!(outside_git_dir, Path.join(workspace, ".git"))
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+
+      assert {:error, {:workspace_sync_failed, :unsafe_git_metadata, _git_metadata}} =
+               Workspace.create_for_issue("MT-GIT-SYMLINK")
+
+      refute File.exists?(Path.join(outside_git_dir, ".symphony-provenance.json"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "host rejects non-directory Git metadata without changing it" do
+    test_root = workspace_fixture_root("git-metadata-file")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-GIT-METADATA-FILE")
+    git_metadata = Path.join(workspace, ".git")
+
+    try do
+      create_source_repository!(source, "one\n")
+      File.mkdir_p!(workspace)
+      File.write!(git_metadata, "must not be replaced\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+
+      assert {:error, {:workspace_sync_failed, :unsafe_git_metadata, ^git_metadata}} =
+               Workspace.create_for_issue("MT-GIT-METADATA-FILE")
+
+      assert File.read!(git_metadata) == "must not be replaced\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "host rejects a checkout whose git metadata redirects its worktree outside the workspace" do
+    test_root = workspace_fixture_root("git-worktree")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    outside = Path.join(test_root, "outside")
+
+    try do
+      create_source_repository!(source, "one\n")
+      File.mkdir_p!(outside)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-GIT-WORKTREE")
+      git!(workspace, ["config", "core.worktree", outside])
+
+      assert {:error, {:workspace_sync_failed, :preparation_changed, ^workspace}} =
+               Workspace.validate_preparation(workspace)
+
+      assert {:error, {:workspace_sync_failed, :unsafe_checkout_location, ^workspace}} =
+               Workspace.create_for_issue("MT-GIT-WORKTREE")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "host rejects an existing checkout whose origin differs from the approved repository" do
+    test_root = workspace_fixture_root("origin-mismatch")
+    source = Path.join(test_root, "source")
+    other_source = Path.join(test_root, "other-source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      create_source_repository!(source, "one\n")
+      create_source_repository!(other_source, "other\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-ORIGIN")
+      git!(workspace, ["remote", "set-url", "origin", other_source])
+
+      assert {:error, {:workspace_sync_failed, :unexpected_origin, ^source, actual_origin}} =
+               Workspace.create_for_issue("MT-ORIGIN")
+
+      assert same_local_path?(actual_origin, other_source)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "preparation validation accepts scp-style approved repository URLs" do
+    test_root = workspace_fixture_root("scp-repository")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      create_source_repository!(source, "one\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-SCP-REPOSITORY")
+      provenance_path = Path.join([workspace, ".git", ".symphony-provenance.json"])
+
+      assert {:ok, provenance} = provenance_path |> File.read!() |> Jason.decode()
+
+      Enum.each(["deploy@example.invalid:team/repo.git", "example.invalid:repo.git"], fn repository ->
+        git!(workspace, ["remote", "set-url", "origin", repository])
+
+        File.write!(
+          provenance_path,
+          Jason.encode!(%{provenance | "repository" => repository, "origin" => repository})
+        )
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: workspace_root,
+          workspace_repository: repository
+        )
+
+        assert :ok = Workspace.validate_preparation(workspace)
+      end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "host refuses a directory where it records checkout provenance" do
+    test_root = workspace_fixture_root("provenance-directory")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      create_source_repository!(source, "one\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-PROVENANCE-DIRECTORY")
+      provenance_path = Path.join([workspace, ".git", ".symphony-provenance.json"])
+      File.rm!(provenance_path)
+      File.mkdir!(provenance_path)
+
+      assert {:error, {:workspace_sync_failed, :unsafe_provenance_metadata, ^provenance_path}} =
+               Workspace.create_for_issue("MT-PROVENANCE-DIRECTORY")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  @tag skip:
+         if(match?({:win32, _}, :os.type()),
+           do: "requires Windows symlink privileges",
+           else: false
+         )
+  test "host refuses a provenance symlink before it can write outside the checkout" do
+    test_root = workspace_fixture_root("provenance-symlink")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+    sentinel_path = Path.join(test_root, "sentinel")
+
+    try do
+      create_source_repository!(source, "one\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-PROVENANCE-SYMLINK")
+      provenance_path = Path.join([workspace, ".git", ".symphony-provenance.json"])
+      File.write!(sentinel_path, "must not change\n")
+      File.rm!(provenance_path)
+      File.ln_s!(sentinel_path, provenance_path)
+
+      assert {:error, {:workspace_sync_failed, :unsafe_provenance_metadata, ^provenance_path}} =
+               Workspace.create_for_issue("MT-PROVENANCE-SYMLINK")
+
+      assert File.read!(sentinel_path) == "must not change\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "repository sync failure prevents AgentRunner from launching Codex" do
+    test_root = workspace_fixture_root("agent-runner-sync-failure")
+    workspace_root = Path.join(test_root, "workspaces")
+    codex_binary = Path.join(test_root, "fake-codex")
+    codex_trace = Path.join(test_root, "codex-started")
+
+    try do
+      File.mkdir_p!(test_root)
+      File.write!(codex_binary, "#!/bin/sh\ntouch \"#{codex_trace}\"\n")
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_repository: Path.join(test_root, "missing-source"),
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{id: "sync-failure", identifier: "MT-NO-LAUNCH", title: "No launch", state: "In Progress"}
+
+      assert_raise RuntimeError, ~r/workspace_sync_failed/, fn -> AgentRunner.run(issue) end
+      refute File.exists?(codex_trace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  @tag skip:
+         if(match?({:unix, _}, :os.type()) and System.get_env("USER") != "root",
+           do: false,
+           else: "requires POSIX permissions without root's DAC override"
+         )
+  test "prepared source changes survive with a read-only Git directory" do
+    test_root = workspace_fixture_root("read-only-git")
+    source = Path.join(test_root, "source")
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      create_source_repository!(source, "one\n")
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, workspace_repository: source)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-READONLY-GIT")
+
+      git_metadata = Path.join(workspace, ".git")
+      metadata_before = metadata_snapshot(git_metadata)
+
+      assert {_, 0} = System.cmd("chmod", ["-R", "a-w", git_metadata], stderr_to_stdout: true)
+      assert {:error, :eacces} = File.write(Path.join(git_metadata, "agent-write"), "blocked")
+
+      File.write!(Path.join(workspace, "README.md"), "agent diff\n")
+      assert :ok = Workspace.validate_preparation(workspace)
+      assert :ok = Workspace.run_after_run_hook(workspace, "MT-READONLY-GIT")
+      assert metadata_snapshot(git_metadata) == metadata_before
+      assert git_output!(workspace, ["diff", "--", "README.md"]) =~ "+agent diff"
+    after
+      if match?({:unix, _}, :os.type()) do
+        System.cmd("chmod", ["-R", "u+w", test_root], stderr_to_stdout: true)
+      end
+
       File.rm_rf(test_root)
     end
   end
@@ -168,6 +545,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag skip:
+         if(match?({:win32, _}, :os.type()),
+           do: "requires Windows symlink privileges",
+           else: false
+         )
   test "workspace rejects symlink escapes under the configured root" do
     test_root =
       Path.join(
@@ -196,6 +578,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag skip:
+         if(match?({:win32, _}, :os.type()),
+           do: "requires Windows symlink privileges",
+           else: false
+         )
   test "recorded workspace removal rejects symlink escapes before hooks" do
     test_root =
       Path.join(
@@ -232,6 +619,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag skip:
+         if(match?({:win32, _}, :os.type()),
+           do: "requires Windows symlink privileges",
+           else: false
+         )
   test "workspace canonicalizes symlinked workspace roots before creating issue directories" do
     test_root =
       Path.join(
@@ -1169,7 +1561,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
-    workspace_root = Path.join("/tmp", "symphony-workspace-root")
+    workspace_root = Path.expand("symphony-workspace-root", System.tmp_dir!())
     api_key = "resolved-secret"
     codex_bin = Path.join(["~", "bin", "codex"])
 
@@ -1531,11 +1923,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "path safety returns errors for invalid path segments" do
-    invalid_segment = String.duplicate("a", 300)
-    path = Path.join(System.tmp_dir!(), invalid_segment)
+    [root | _segments] = Path.split(Path.expand("."))
+    invalid_segment = "invalid" <> <<0>> <> "segment"
+    path = Path.join(root, invalid_segment)
     expanded_path = Path.expand(path)
 
-    assert {:error, {:path_canonicalize_failed, ^expanded_path, :enametoolong}} =
+    assert {:error, {:path_canonicalize_failed, ^expanded_path, :einval}} =
              SymphonyElixir.PathSafety.canonicalize(path)
   end
 
@@ -1599,73 +1992,160 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "remote workspace lifecycle uses ssh host aliases from worker config" do
-    test_root =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-remote-workspace-#{System.unique_integer([:positive])}"
-      )
-
-    previous_path = System.get_env("PATH")
-    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_ssh_command_runner = Application.get_env(:symphony_elixir, :ssh_command_runner)
+    previous_ssh_executable_resolver = Application.get_env(:symphony_elixir, :ssh_executable_resolver)
+    previous_ssh_config = System.get_env("SYMPHONY_SSH_CONFIG")
 
     on_exit(fn ->
-      restore_env("PATH", previous_path)
-      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+      if previous_ssh_command_runner do
+        Application.put_env(:symphony_elixir, :ssh_command_runner, previous_ssh_command_runner)
+      else
+        Application.delete_env(:symphony_elixir, :ssh_command_runner)
+      end
+
+      if previous_ssh_executable_resolver do
+        Application.put_env(:symphony_elixir, :ssh_executable_resolver, previous_ssh_executable_resolver)
+      else
+        Application.delete_env(:symphony_elixir, :ssh_executable_resolver)
+      end
+
+      restore_env("SYMPHONY_SSH_CONFIG", previous_ssh_config)
     end)
 
-    try do
-      trace_file = Path.join(test_root, "ssh.trace")
-      fake_ssh = Path.join(test_root, "ssh")
-      workspace_root = "~/.symphony-remote-workspaces"
-      workspace_path = "/remote/home/.symphony-remote-workspaces/MT-SSH-WS"
+    workspace_root = "~/.symphony-remote-workspaces"
+    workspace_path = "/remote/home/.symphony-remote-workspaces/MT-SSH-WS"
+    test_pid = self()
 
-      File.mkdir_p!(test_root)
-      System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+    System.delete_env("SYMPHONY_SSH_CONFIG")
 
-      File.write!(fake_ssh, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
-      printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+    Application.put_env(:symphony_elixir, :ssh_executable_resolver, fn "ssh" -> "/test/bin/ssh" end)
 
-      case "$*" in
-        *"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{workspace_path}'
-          ;;
-      esac
+    Application.put_env(:symphony_elixir, :ssh_command_runner, fn executable, args, _opts ->
+      send(test_pid, {:ssh_command, executable, args})
 
-      exit 0
-      """)
+      if Enum.any?(args, &String.contains?(&1, "__SYMPHONY_WORKSPACE__")) do
+        {"__SYMPHONY_WORKSPACE__\t1\t#{workspace_path}\n", 0}
+      else
+        {"", 0}
+      end
+    end)
 
-      File.chmod!(fake_ssh, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      worker_ssh_hosts: ["worker-01:2200"],
+      hook_before_run: "echo before-run",
+      hook_after_run: "echo after-run",
+      hook_before_remove: "echo before-remove"
+    )
 
-      write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: workspace_root,
-        worker_ssh_hosts: ["worker-01:2200"],
-        hook_before_run: "echo before-run",
-        hook_after_run: "echo after-run",
-        hook_before_remove: "echo before-remove"
-      )
+    assert Config.settings!().worker.ssh_hosts == ["worker-01:2200"]
+    assert Config.settings!().workspace.root == workspace_root
+    assert {:ok, ^workspace_path} = Workspace.create_for_issue("MT-SSH-WS", "worker-01:2200")
+    assert_receive {:ssh_command, _executable, ["-T", "-p", "2200", "worker-01", create_command]}
+    assert create_command =~ "bash -lc"
+    assert create_command =~ "__SYMPHONY_WORKSPACE__"
+    assert create_command =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
+    assert create_command =~ "${workspace#\\~/}"
 
-      assert Config.settings!().worker.ssh_hosts == ["worker-01:2200"]
-      assert Config.settings!().workspace.root == workspace_root
-      assert {:ok, ^workspace_path} = Workspace.create_for_issue("MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.run_before_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.run_after_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200")
+    assert :ok = Workspace.run_before_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
+    assert :ok = Workspace.run_after_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
+    assert_receive {:ssh_command, _executable, [_ | before_run_args]}
+    assert Enum.join(before_run_args, " ") =~ "echo before-run"
+    assert_receive {:ssh_command, _executable, [_ | after_run_args]}
+    assert Enum.join(after_run_args, " ") =~ "echo after-run"
 
-      trace = File.read!(trace_file)
-      assert trace =~ "-p 2200 worker-01 bash -lc"
-      assert trace =~ "__SYMPHONY_WORKSPACE__"
-      assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
-      assert trace =~ "${workspace#\\~/}"
-      assert trace =~ "echo before-run"
-      assert trace =~ "echo after-run"
-      assert trace =~ "echo before-remove"
-      assert trace =~ "rm -rf"
-      assert trace =~ workspace_path
-    after
-      File.rm_rf(test_root)
-    end
+    assert :ok = Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200")
+    assert_receive {:ssh_command, _executable, [_ | before_remove_args]}
+    assert Enum.join(before_remove_args, " ") =~ "echo before-remove"
+    assert_receive {:ssh_command, _executable, [_ | remove_args]}
+    assert Enum.join(remove_args, " ") =~ "rm -rf"
+  end
+
+  defp workspace_fixture_root(name) do
+    Path.expand(
+      Path.join([
+        File.cwd!(),
+        ".test-workspaces",
+        "#{name}-#{System.unique_integer([:positive])}"
+      ])
+    )
+  end
+
+  defp create_source_repository!(source, contents) do
+    File.mkdir_p!(source)
+    git!(source, ["init", "-b", "main"])
+    File.write!(Path.join(source, "README.md"), contents)
+    git!(source, ["add", "README.md"])
+    git!(source, ["commit", "-m", "initial"])
+    git_output!(source, ["rev-parse", "HEAD"])
+  end
+
+  defp commit_source_change!(source, contents) do
+    File.write!(Path.join(source, "README.md"), contents)
+    git!(source, ["add", "README.md"])
+    git!(source, ["commit", "-m", "update"])
+    git_output!(source, ["rev-parse", "HEAD"])
+  end
+
+  defp git!(directory, args) do
+    assert {_, 0} =
+             System.cmd(
+               "git",
+               [
+                 "-C",
+                 directory,
+                 "-c",
+                 "core.autocrlf=false",
+                 "-c",
+                 "user.name=Symphony Test",
+                 "-c",
+                 "user.email=test@example.com" | args
+               ],
+               stderr_to_stdout: true
+             )
+  end
+
+  defp git_output!(directory, args) do
+    assert {output, 0} = System.cmd("git", ["-C", directory | args], stderr_to_stdout: true)
+    String.trim(output)
+  end
+
+  defp git_bash_quote(path) do
+    escaped_path =
+      path |> Path.expand() |> String.replace("\\", "/") |> String.replace("\"", "\\\"")
+
+    "\"#{escaped_path}\""
+  end
+
+  defp same_local_path?(left, right) do
+    normalize_local_path(left) == normalize_local_path(right)
+  end
+
+  defp normalize_local_path(path) do
+    normalized = path |> Path.expand() |> String.replace("\\", "/")
+
+    if match?({:win32, _}, :os.type()), do: String.downcase(normalized), else: normalized
+  end
+
+  defp normalized_file_contents(workspace, relative_path) do
+    workspace
+    |> Path.join(relative_path)
+    |> File.read!()
+    |> String.replace("\r\n", "\n")
+  end
+
+  defp metadata_snapshot(path) do
+    path
+    |> File.ls!()
+    |> Enum.sort()
+    |> Enum.reduce(%{}, fn entry, snapshot ->
+      entry_path = Path.join(path, entry)
+
+      if File.dir?(entry_path) do
+        Map.put(snapshot, entry, metadata_snapshot(entry_path))
+      else
+        Map.put(snapshot, entry, File.read!(entry_path))
+      end
+    end)
   end
 end
