@@ -4,12 +4,14 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, RepositoryRouter, SSH, SourceSync}
+  alias SymphonyElixir.{Config, PathSafety, RepositoryRouter, SourceSync, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
   @remote_provenance_marker "__SYMPHONY_PROVENANCE__"
 
   @type worker_host :: String.t() | nil
+  @type route :: RepositoryRouter.Route.t() | nil
+  @type issue_reference :: map() | String.t() | nil
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
@@ -239,8 +241,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   @doc false
-  @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host(),
-          RepositoryRouter.Route.t() | nil) :: :ok | {:error, term()}
+  @spec run_before_run_hook(Path.t(), issue_reference(), worker_host(), route()) :: :ok | {:error, term()}
   def run_before_run_hook(workspace, issue_or_identifier, worker_host, route)
       when is_binary(workspace) and (is_nil(route) or is_struct(route, RepositoryRouter.Route)) do
     issue_context = issue_or_identifier |> issue_context() |> Map.put(:repository_route, route)
@@ -258,8 +259,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   @doc false
-  @spec capture_provenance(Path.t(), map() | String.t() | nil, worker_host(),
-          RepositoryRouter.Route.t() | nil) :: {:ok, map()} | {:error, term()}
+  @spec capture_provenance(Path.t(), issue_reference(), worker_host(), route()) :: {:ok, map()} | {:error, term()}
   def capture_provenance(workspace, _issue_or_identifier, worker_host, route)
       when is_binary(workspace) and (is_nil(route) or is_struct(route, RepositoryRouter.Route)) do
     capture_workspace_provenance(workspace, route, worker_host)
@@ -278,28 +278,32 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp capture_workspace_provenance(workspace, nil, nil) do
-    with :ok <- validate_workspace_path(workspace, nil) do
-      case local_git_output(workspace, ["rev-parse", "--verify", "HEAD^{commit}"]) do
-        {:ok, head} ->
-          {:ok, unrouted_provenance(head, local_origin(workspace))}
+    case validate_workspace_path(workspace, nil) do
+      :ok ->
+        case local_git_output(workspace, ["rev-parse", "--verify", "HEAD^{commit}"]) do
+          {:ok, head} ->
+            {:ok, unrouted_provenance(head, local_origin(workspace))}
 
-        {:error, :git_read_failed} ->
-          {:ok, empty_provenance()}
-      end
-    else
-      {:error, reason} -> {:error, {:workspace_provenance_failed, reason}}
+          {:error, :git_read_failed} ->
+            {:ok, empty_provenance()}
+        end
+
+      {:error, reason} ->
+        {:error, {:workspace_provenance_failed, reason}}
     end
   end
 
   defp capture_workspace_provenance(workspace, nil, worker_host) when is_binary(worker_host) do
-    with :ok <- validate_workspace_path(workspace, worker_host) do
-      case remote_git_provenance(workspace, worker_host) do
-        {:ok, {head, origin}} -> {:ok, unrouted_provenance(head, {:ok, origin})}
-        {:error, :git_read_failed} -> {:ok, empty_provenance()}
-        {:error, reason} -> {:error, {:workspace_provenance_failed, reason}}
-      end
-    else
-      {:error, reason} -> {:error, {:workspace_provenance_failed, reason}}
+    case validate_workspace_path(workspace, worker_host) do
+      :ok ->
+        case remote_git_provenance(workspace, worker_host) do
+          {:ok, {head, origin}} -> {:ok, unrouted_provenance(head, {:ok, origin})}
+          {:error, :git_read_failed} -> {:ok, empty_provenance()}
+          {:error, reason} -> {:error, {:workspace_provenance_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:workspace_provenance_failed, reason}}
     end
   end
 
@@ -314,7 +318,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp capture_workspace_provenance(workspace, %RepositoryRouter.Route{} = route, worker_host)
-         when is_binary(worker_host) do
+       when is_binary(worker_host) do
     with :ok <- validate_workspace_path(workspace, worker_host),
          {:ok, {head, origin}} <- remote_git_provenance(workspace, worker_host) do
       {:ok, provenance(route, head, origin)}
@@ -342,9 +346,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp local_git_output(workspace, args) do
-    case System.cmd("git", ["-c", "safe.directory=#{workspace}", "-C", workspace | args],
-           stderr_to_stdout: true
-         ) do
+    case System.cmd("git", ["-c", "safe.directory=#{workspace}", "-C", workspace | args], stderr_to_stdout: true) do
       {output, 0} -> {:ok, String.trim(output)}
       {_output, _status} -> {:error, :git_read_failed}
     end

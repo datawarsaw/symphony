@@ -134,7 +134,13 @@ defmodule SymphonyElixir.Config.Schema do
       field(:default_branch, :string, default: "main")
     end
 
-    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    @type t :: %__MODULE__{
+            target_label_prefix: String.t() | nil,
+            targets: map() | nil,
+            default_branch: String.t() | nil
+          }
+
+    @spec changeset(t(), map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
       |> cast(attrs, [:target_label_prefix, :targets, :default_branch], empty_values: [])
