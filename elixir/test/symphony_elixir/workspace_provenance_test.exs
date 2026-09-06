@@ -1,8 +1,8 @@
 defmodule SymphonyElixir.WorkspaceProvenanceTest do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.RepositoryRouter
+  alias SymphonyElixir.Tracker.Issue
 
   test "captures routed workspace provenance with credential-safe remote evidence" do
     test_root = Path.join(System.tmp_dir!(), "symphony-provenance-#{System.unique_integer([:positive])}")
@@ -127,6 +127,7 @@ defmodule SymphonyElixir.WorkspaceProvenanceTest do
       assert :ok = File.write(Path.join(workspace, "README.md"), "agent source edit\n")
 
       issue = %Issue{id: "mic-167-readonly", identifier: "MIC-167-READONLY", labels: ["repo:symphony-runtime"]}
+
       assert {:ok, %{prepared_base_commit: ^head, repository_origin: "https://github.com/datawarsaw/symphony.git"}} =
                Workspace.capture_provenance(workspace, issue)
 
@@ -183,7 +184,8 @@ defmodule SymphonyElixir.WorkspaceProvenanceTest do
 
       assert :ok = Workspace.run_before_run_hook(workspace, issue, nil, route)
       assert File.read!(Path.join(workspace, "selected-route.txt")) == initial_source
-      assert {:ok, %{repository_source_path: ^initial_source}} = Workspace.capture_provenance(workspace, issue, nil, route)
+      assert {:ok, provenance} = Workspace.capture_provenance(workspace, issue, nil, route)
+      assert provenance.repository_source_path == initial_source
     after
       File.rm_rf(test_root)
     end

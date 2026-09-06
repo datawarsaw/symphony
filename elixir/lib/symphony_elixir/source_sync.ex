@@ -62,9 +62,8 @@ defmodule SymphonyElixir.SourceSync do
     with :ok <- validate_git_repository(source_path),
          :ok <- validate_remote_origin(source_path, expected_remote),
          :ok <- check_clean_working_tree(source_path),
-         :ok <- fetch_origin_and_verify_default_branch(source_path, default_branch),
-         {:ok, sync_action} <- determine_and_apply_sync(source_path, default_branch) do
-      {:ok, sync_action}
+         :ok <- fetch_origin_and_verify_default_branch(source_path, default_branch) do
+      determine_and_apply_sync(source_path, default_branch)
     end
   end
 
@@ -93,9 +92,8 @@ defmodule SymphonyElixir.SourceSync do
 
   defp check_clean_working_tree(source_path) do
     with :ok <- check_unmerged_entries(source_path),
-         :ok <- check_staged_changes(source_path),
-         :ok <- check_tracked_changes(source_path) do
-      :ok
+         :ok <- check_staged_changes(source_path) do
+      check_tracked_changes(source_path)
     end
   end
 
@@ -142,42 +140,77 @@ defmodule SymphonyElixir.SourceSync do
 
     case git_cmd(source_path, ["show-ref", "--verify", "--quiet", local_ref]) do
       {:error, _} ->
-        with {:ok, _} <- git_cmd(source_path, ["branch", default_branch, remote_ref]),
-             :ok <- verify_head_matches_remote(source_path, default_branch, remote_ref) do
-          {:ok, :fast_forwarded}
-        else
+        create_default_branch(source_path, default_branch, remote_ref)
+
+      {:ok, _} ->
+        sync_existing_default_branch(source_path, default_branch, local_ref, remote_ref)
+    end
+  end
+
+  defp create_default_branch(source_path, default_branch, remote_ref) do
+    case git_cmd(source_path, ["branch", default_branch, remote_ref]) do
+      {:ok, _} ->
+        case verify_head_matches_remote(source_path, default_branch, remote_ref) do
+          :ok -> {:ok, :fast_forwarded}
           _ -> {:error, :head_verification_failed}
         end
 
-      {:ok, _} ->
-        with {:ok, local_sha} <- git_rev_parse(source_path, local_ref),
-             {:ok, remote_sha} <- git_rev_parse(source_path, remote_ref) do
-          if local_sha == remote_sha do
-            with :ok <- verify_head_matches_remote_if_checked_out(source_path, default_branch, remote_sha) do
-              {:ok, :current}
-            end
-          else
-            case git_cmd(source_path, ["rev-list", "--left-right", "--count", "#{local_ref}...#{remote_ref}"]) do
-              {:ok, count_output} ->
-                case parse_ahead_behind(count_output) do
-                  {0, behind} when behind > 0 ->
-                    apply_fast_forward(source_path, default_branch, remote_ref, remote_sha)
+      {:error, _} ->
+        {:error, :head_verification_failed}
+    end
+  end
 
-                  {ahead, 0} when ahead > 0 ->
-                    {:error, :local_ahead}
+  defp sync_existing_default_branch(source_path, default_branch, local_ref, remote_ref) do
+    with {:ok, local_sha} <- git_rev_parse(source_path, local_ref),
+         {:ok, remote_sha} <- git_rev_parse(source_path, remote_ref) do
+      sync_default_branch_at_shas(source_path, default_branch, local_ref, remote_ref, local_sha, remote_sha)
+    end
+  end
 
-                  {ahead, behind} when ahead > 0 and behind > 0 ->
-                    {:error, :diverged}
+  defp sync_default_branch_at_shas(
+         source_path,
+         default_branch,
+         _local_ref,
+         _remote_ref,
+         remote_sha,
+         remote_sha
+       ) do
+    case verify_head_matches_remote_if_checked_out(source_path, default_branch, remote_sha) do
+      :ok -> {:ok, :current}
+      error -> error
+    end
+  end
 
-                  _ ->
-                    {:error, :diverged}
-                end
+  defp sync_default_branch_at_shas(
+         source_path,
+         default_branch,
+         local_ref,
+         remote_ref,
+         _local_sha,
+         remote_sha
+       ) do
+    case git_cmd(source_path, ["rev-list", "--left-right", "--count", "#{local_ref}...#{remote_ref}"]) do
+      {:ok, count_output} ->
+        apply_ahead_behind_sync(source_path, default_branch, remote_ref, remote_sha, count_output)
 
-              {:error, _} ->
-                {:error, :remote_unavailable}
-            end
-          end
-        end
+      {:error, _} ->
+        {:error, :remote_unavailable}
+    end
+  end
+
+  defp apply_ahead_behind_sync(source_path, default_branch, remote_ref, remote_sha, count_output) do
+    case parse_ahead_behind(count_output) do
+      {0, behind} when behind > 0 ->
+        apply_fast_forward(source_path, default_branch, remote_ref, remote_sha)
+
+      {ahead, 0} when ahead > 0 ->
+        {:error, :local_ahead}
+
+      {ahead, behind} when ahead > 0 and behind > 0 ->
+        {:error, :diverged}
+
+      _ ->
+        {:error, :diverged}
     end
   end
 
@@ -218,9 +251,8 @@ defmodule SymphonyElixir.SourceSync do
     local_ref = "refs/heads/#{default_branch}"
 
     with {:ok, local_sha} <- git_rev_parse(source_path, local_ref),
-         :ok <- if(local_sha == expected_remote_sha, do: :ok, else: {:error, :head_verification_failed}),
-         :ok <- verify_head_matches_remote_if_checked_out(source_path, default_branch, expected_remote_sha) do
-      :ok
+         :ok <- if(local_sha == expected_remote_sha, do: :ok, else: {:error, :head_verification_failed}) do
+      verify_head_matches_remote_if_checked_out(source_path, default_branch, expected_remote_sha)
     end
   end
 
