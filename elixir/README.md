@@ -36,6 +36,12 @@ A completed implementation handoff preserves its workspace and uncommitted sourc
 Delivery is a separate host or human-approved phase. In Review does not trigger cleanup;
 existing automatic cleanup still applies when an issue enters a configured terminal state.
 
+The post-review caller can run `mix human_acceptance --input evidence.json` to preview an
+evidence pack, or add `--publish ISSUE_ID --workflow WORKFLOW.md` to upsert one Linear comment.
+This command does not start the scheduler or change issue state. It consumes the structured
+current-target reviewer receipt; it does not dispatch the reviewer. See the
+[evidence contract and invocation flow](docs/human-acceptance.md).
+
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
