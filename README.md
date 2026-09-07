@@ -7,6 +7,10 @@ The supplied implementation workflow keeps repository preparation on the host an
 Git metadata during Codex turns. Workers leave source changes and validation evidence for In Review;
 commit, push, PR creation, merge, and deployment belong to a separate host/human-approved delivery phase.
 
+After independent review, the [Human Acceptance evidence pack](elixir/docs/human-acceptance.md)
+turns a supplied evidence snapshot into one compact Linear comment with change shape, tests,
+review verdict, risks, and the exact acceptance target. Missing evidence stays explicit.
+
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
 _In this [demo](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board and spawns agents to implement tasks and provide evidence. The supplied implementation workflow hands source changes and validation results to reviewers at In Review._

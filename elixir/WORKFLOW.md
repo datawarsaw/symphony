@@ -302,6 +302,13 @@ Use this only when completion is blocked by missing required tools or missing au
 
 ## Workpad template
 
+The separate post-review owner may use `mix human_acceptance --input evidence.json --publish ISSUE_ID`
+to upsert the dedicated `[HUMAN ACCEPTANCE]` evidence comment after independent review. The
+implementation worker still maintains only its workpad and stops at `In Review`. The evidence
+command neither dispatches a reviewer nor moves the issue. Without a structured independent PASS
+matching the entire current acceptance target, the pack is a draft and must not be used to move
+the issue to Human Acceptance. See `docs/human-acceptance.md` for the versioned snapshot contract.
+
 Use this exact structure for the persistent workpad comment and keep it updated in place throughout execution:
 
 ````md
