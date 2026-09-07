@@ -137,6 +137,34 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     assert String.starts_with?(handoff, "TODO HANDOFF")
   end
 
+  test "Discovery forwards app-server activity to the orchestrator so the watchdog sees life", %{issue: issue} do
+    python = System.find_executable("python") || System.find_executable("python3")
+    assert is_binary(python), "Python is required for the deterministic protocol peer"
+    script = Path.expand("../fixtures/discovery_app_server.py", __DIR__)
+    fixture = Path.expand("../fixtures/discovery-ready.txt", __DIR__)
+    {:ok, route} = SymphonyElixir.RepositoryRouter.resolve(issue, Config.settings!().routing)
+    command = Enum.map_join([python, "-u", script, fixture, route.source_path], " ", &shell_quote/1)
+    path = Workflow.workflow_file_path()
+    workflow = Regex.replace(~r/^  command:.*$/m, File.read!(path), fn _ -> "  command: " <> Jason.encode!(command) end)
+    File.write!(path, workflow)
+    WorkflowStore.force_reload()
+
+    assert :ok = AgentRunner.run(issue, self())
+
+    assert_receive {:codex_worker_update, "discovery-issue",
+                    %{event: :session_started, session_id: session_id, timestamp: %DateTime{}}},
+                   5_000
+
+    assert is_binary(session_id)
+    assert session_id == "discovery-thread-discovery-turn"
+
+    assert_receive {:codex_worker_update, "discovery-issue",
+                    %{event: event, timestamp: %DateTime{}}},
+                   5_000
+
+    assert event in [:turn_completed, :tool_call_failed, :notification]
+    assert_receive {:discovery_completed, "discovery-issue", "READY"}, 5_000
+  end
   test "protocol rate-limit exhaustion uses Gemini with identical input and discards partial output", %{issue: issue} do
     python = System.find_executable("python") || System.find_executable("python3")
     script = Path.expand("../fixtures/discovery_app_server.py", __DIR__)

@@ -42,7 +42,7 @@ defmodule SymphonyElixir.Discovery do
          true <- is_nil(Keyword.get(opts, :worker_host)),
          {:ok, input} <- snapshot(issue),
          {:ok, workspace} <- workspace(input),
-         {:ok, evidence} <- cached_or_execute(issue, workspace, input, opts) do
+         {:ok, evidence} <- cached_or_execute(issue, workspace, input, recipient, opts) do
       if is_pid(recipient), do: send(recipient, {:discovery_completed, issue.id, evidence.status})
       :ok
     else
@@ -96,13 +96,18 @@ defmodule SymphonyElixir.Discovery do
 
   defp consume_evidence(_, _), do: {:error, :discovery_not_ready}
 
-  defp cached_or_execute(issue, workspace, input, opts) do
+  defp cached_or_execute(issue, workspace, input, recipient, opts) do
     case read_evidence(issue.id, input) do
       {:ok, evidence} ->
         {:ok, evidence}
 
       {:error, :enoent} ->
-        evidence = execute(input, fn route, frozen -> run_session(workspace, issue, route, frozen) end, opts)
+        evidence =
+          execute(
+            input,
+            fn route, frozen -> run_session(workspace, issue, route, frozen, recipient) end,
+            opts
+          )
         evidence = bind_issue(evidence, issue)
         persist(issue.id, input, evidence)
 
@@ -128,7 +133,7 @@ defmodule SymphonyElixir.Discovery do
 
   defp bind_issue(evidence, _issue), do: evidence
 
-  defp run_session(workspace, issue, route, input) do
+  defp run_session(workspace, issue, route, input, recipient) do
     key = make_ref()
     Process.put(key, %{output: [], failure: nil})
 
@@ -137,7 +142,7 @@ defmodule SymphonyElixir.Discovery do
         AppServer.run(workspace, input, issue,
           discovery_route: route,
           tool_executor: fn _, _ -> %{"success" => false, "output" => "Discovery tool execution denied"} end,
-          on_message: fn message -> collect(key, message) end
+          on_message: fn message -> collect(key, message) |> forward_update(recipient, issue, message) end
         )
 
       captured = Process.get(key)
@@ -154,15 +159,24 @@ defmodule SymphonyElixir.Discovery do
 
   defp collect(key, %{payload: %{"method" => "item/completed", "params" => %{"item" => %{"type" => "agentMessage", "text" => text} = item}}}) do
     if Map.get(item, "phase") in [nil, "final_answer"] do
-      Process.put(key, Map.update!(Process.get(key), :output, &[text | &1]))
+      {:ok, Process.put(key, Map.update!(Process.get(key), :output, &[text | &1]))}
+    else
+      :ok
     end
   end
 
   defp collect(key, %{payload: %{"method" => "turn/completed", "params" => %{"turn" => %{"status" => status} = turn}}}) when status != "completed" do
-    Process.put(key, Map.put(Process.get(key), :failure, turn))
+    {:ok, Process.put(key, Map.put(Process.get(key), :failure, turn))}
   end
 
   defp collect(_, _), do: :ok
+
+  defp forward_update(_collect_result, recipient, %{id: issue_id}, message)
+       when is_binary(issue_id) and is_pid(recipient) and is_map(message) do
+    send(recipient, {:codex_worker_update, issue_id, message})
+    :ok
+  end
+  defp forward_update(_collect_result, _recipient, _issue, _message), do: :ok
 
   defp technical({:error, error}), do: Session.technical_failure(error)
   defp technical(_), do: nil
