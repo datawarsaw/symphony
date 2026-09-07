@@ -67,6 +67,10 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+# Optional local read-only gate. Enabling it also polls the Discovery state.
+discovery:
+  enabled: false
+  skill_path: C:/AI/code-skills/discovery-gate/SKILL.md
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never

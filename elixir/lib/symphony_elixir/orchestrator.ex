@@ -187,6 +187,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
 
+  def handle_info({:discovery_completed, issue_id, verdict}, %{running: running} = state) do
+    case Map.fetch(running, issue_id) do
+      {:ok, entry} ->
+        {:noreply, %{state | running: Map.put(running, issue_id, Map.put(entry, :discovery_result, verdict))}}
+
+      :error ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
       case pop_retry_attempt_state(state, issue_id, retry_token) do
@@ -203,6 +213,10 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  defp handle_agent_down(:normal, state, issue_id, %{discovery_result: verdict} = entry, _session_id) do
+    block_issue_from_entry(state, issue_id, entry, "Discovery #{verdict}; awaiting a separate lifecycle action")
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
@@ -455,6 +469,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_blocked_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
     cond do
+      discovery_result_changed?(Map.get(state.blocked, issue.id), issue) ->
+        release_issue_claim(state, issue.id)
+
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
@@ -474,6 +491,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp discovery_result_changed?(%{discovery_result: result, issue: previous}, issue) when not is_nil(result) do
+    fields = [:id, :title, :description, :labels, :parent, :project]
+    not SymphonyElixir.Discovery.discovery?(issue) or Map.take(previous, fields) != Map.take(issue, fields)
+  end
+
+  defp discovery_result_changed?(_, _), do: false
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -763,6 +787,7 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(running_entry, :workspace_path),
       session_id: running_entry_session_id(running_entry),
       error: error,
+      discovery_result: Map.get(running_entry, :discovery_result),
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),

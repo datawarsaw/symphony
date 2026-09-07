@@ -47,3 +47,5 @@ help with the setup:
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+An opt-in [dedicated Discovery lane](docs/discovery-worker-lane.md) validates issues before Todo using the installed Discovery Gate contract and read-only app-server sessions.

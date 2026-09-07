@@ -1,0 +1,104 @@
+DISCOVERY BRIEF
+
+ISSUE
+MIC-TEST Dedicated Discovery worker
+
+PROBLEM
+Validate a bounded issue before implementation.
+
+CURRENT STATE
+The existing runner owns app-server sessions.
+
+REAL ACTION / OWNERSHIP PATH
+Linear issue -> orchestrator -> runner -> app-server -> configured provider.
+
+ARCHITECTURE FIT
+Extend the existing session boundary.
+
+DEPENDENCIES
+INTERNAL:
+Existing app-server client and workflow config.
+EXTERNAL:
+Configured provider authentication.
+
+DESTINATION / REPO
+C:/repo/symphony
+
+OPTIONS
+A. Extend the existing runner.
+B. Defer the lane.
+
+RECOMMENDATION
+Extend the existing runner.
+
+ACCEPTANCE CRITERIA
+- Discovery cannot mutate source or lifecycle state.
+
+INVARIANTS / REGRESSION RISKS
+- Preserve implementation, review, Human Acceptance and delivery policy.
+
+OPEN QUESTIONS
+NONE
+
+RESEARCH REQUIRED: NO
+IMPLEMENTATION SIZE: MEDIUM
+EXPECTED CONTEXT SURFACE: BOUNDED
+INDEPENDENT SUBSYSTEMS: 1 Discovery lane
+SPLIT REQUIRED: NO
+
+PROPOSED IMPLEMENTATION SCOPE
+Add the bounded lane and focused tests.
+
+OUT OF SCOPE
+Provider redesign and implementation policy changes.
+
+VERDICT: READY
+
+VERDICT RATIONALE
+The ownership and verification path are established.
+
+SUBAGENTS USED: 0
+
+TODO HANDOFF
+
+ISSUE
+MIC-TEST Dedicated Discovery worker
+
+OBJECTIVE
+Add a dedicated read-only Discovery lane.
+
+DESTINATION
+REPO: C:/repo/symphony
+WORKING AREA: elixir/lib and elixir/test
+
+IMPLEMENTATION CONTRACT
+- Use the existing app-server session.
+- Preserve non-READY outcomes.
+- Run fallback only on technical failure.
+
+ACCEPTANCE CRITERIA
+- Discovery cannot mutate source or lifecycle state.
+
+PRESERVE
+- Independent review, Human Acceptance, delivery and security boundaries.
+
+CONFIG / SECRETS
+Reuse host provider authentication; never include secrets in evidence.
+
+DEPENDENCIES RESOLVED
+- The existing app-server owns worker execution.
+
+OUT OF SCOPE
+- Provider redesign.
+
+VERIFICATION
+- Focused contract, routing and session isolation tests.
+
+IMPLEMENTATION SIZE: MEDIUM
+EXPECTED CONTEXT SURFACE: BOUNDED
+SPLIT REQUIRED: NO
+SUBAGENTS: DISABLED
+
+STOP CONDITIONS
+- If evidence invalidates ownership or acceptance, stop and return to Discovery.
+- If work expands into independent subsystems, return SPLIT without subagents.

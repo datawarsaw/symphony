@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, RepositoryRouter, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Discovery, PromptBuilder, RepositoryRouter, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -36,6 +36,16 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    if Discovery.discovery?(issue) do
+      Discovery.run(issue, codex_update_recipient, Keyword.put(opts, :worker_host, worker_host))
+    else
+      with {:ok, implementation_issue} <- Discovery.implementation_issue(issue) do
+        run_implementation_on_worker_host(implementation_issue, codex_update_recipient, opts, worker_host)
+      end
+    end
+  end
+
+  defp run_implementation_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
     case Workspace.create_for_issue_with_route(issue, worker_host) do

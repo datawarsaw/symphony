@@ -441,3 +441,7 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+## Dedicated Discovery lane
+
+See [configuration, safety and evidence handling](../docs/discovery-worker-lane.md). Discovery is disabled by default, runs locally, and never changes issue state. READY handoffs are consumed only on a separately scheduled implementation run.

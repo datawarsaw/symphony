@@ -2310,3 +2310,7 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+## Optional Discovery lane extension
+
+An implementation may opt into a separate read-only Discovery lane before Todo. Discovery must preserve the implementation worker and review/delivery semantics, use immutable inputs across technical fallback, retain successful non-READY verdicts without implementing, and require a complete unsplit Todo Handoff for READY. A Discovery verdict alone does not authorize a tracker transition or implementation dispatch. The Elixir extension is documented in `docs/discovery-worker-lane.md`.

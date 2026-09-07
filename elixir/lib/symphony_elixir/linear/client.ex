@@ -18,6 +18,8 @@ defmodule SymphonyElixir.Linear.Client do
         identifier
         title
         description
+        parent { id identifier title }
+        project { id name slugId }
         priority
         state {
           name
@@ -63,6 +65,8 @@ defmodule SymphonyElixir.Linear.Client do
         identifier
         title
         description
+        parent { id identifier title }
+        project { id name slugId }
         priority
         state {
           name
@@ -474,6 +478,8 @@ defmodule SymphonyElixir.Linear.Client do
         identifier: issue["identifier"],
         title: issue["title"],
         description: issue["description"],
+        parent: issue["parent"],
+        project: issue["project"],
         priority: parse_priority(issue["priority"]),
         state: state_name,
         branch_name: issue["branchName"],

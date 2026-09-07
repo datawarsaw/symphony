@@ -4,7 +4,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.Discovery.Session
+  alias SymphonyElixir.PathSafety
+  alias SymphonyElixir.SSH
 
   @initialize_id 1
   @thread_start_id 2
@@ -12,6 +16,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @type session :: %{
+          optional(:discovery_route) => map() | nil,
           port: port(),
           metadata: map(),
           approval_policy: String.t() | map(),
@@ -39,26 +44,29 @@ defmodule SymphonyElixir.Codex.AppServer do
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
+    discovery_route = Keyword.get(opts, :discovery_route)
+    dynamic_tool_binding = if discovery_route, do: Map.put(dynamic_tool_binding, :tool_specs, []), else: dynamic_tool_binding
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, discovery_route),
            {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
+             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding, discovery_route) do
         {:ok,
          %{
            port: port,
            metadata: metadata,
            approval_policy: session_policies.approval_policy,
-           auto_approve_requests: session_policies.approval_policy == "never",
+           auto_approve_requests: is_nil(discovery_route) and session_policies.approval_policy == "never",
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding
+           dynamic_tool_binding: dynamic_tool_binding,
+           discovery_route: discovery_route
          }}
       else
         {:error, reason} ->
@@ -79,17 +87,14 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: thread_id,
           workspace: workspace,
           dynamic_tool_binding: dynamic_tool_binding
-        },
+        } = app_session,
         prompt,
         issue,
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
 
-    tool_executor =
-      Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
-      end)
+    tool_executor = session_tool_executor(app_session, opts, dynamic_tool_binding, issue)
 
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
       {:ok, turn_id} ->
@@ -140,6 +145,16 @@ defmodule SymphonyElixir.Codex.AppServer do
         emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
         {:error, reason}
     end
+  end
+
+  defp session_tool_executor(%{discovery_route: route}, _opts, _binding, _issue) when not is_nil(route) do
+    fn _, _ -> %{"success" => false, "output" => "Discovery tool execution denied"} end
+  end
+
+  defp session_tool_executor(_session, opts, binding, issue) do
+    Keyword.get(opts, :tool_executor, fn tool, arguments ->
+      DynamicTool.execute(tool, arguments, binding, issue: issue)
+    end)
   end
 
   @spec stop_session(session()) :: :ok
@@ -304,41 +319,74 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
-    case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
-      {:error, reason} -> {:error, reason}
+  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, discovery_route) do
+    with :ok <- send_initialize(port),
+         {:ok, overrides} <- discovery_overrides(port, workspace, discovery_route) do
+      start_thread(port, workspace, session_policies, dynamic_tool_binding, overrides)
     end
+  end
+
+  defp discovery_overrides(_port, _workspace, nil), do: {:ok, %{}}
+
+  defp discovery_overrides(port, workspace, route) do
+    send_message(port, %{"method" => "config/read", "id" => 4, "params" => %{"cwd" => workspace, "includeLayers" => false}})
+
+    case await_response(port, 4) do
+      {:ok, %{"config" => config}} -> Session.thread_overrides(config, route)
+      _ -> {:error, :discovery_config_unavailable}
+    end
+  end
+
+  defp session_policies(workspace, worker_host, nil), do: session_policies(workspace, worker_host)
+
+  defp session_policies(_workspace, _worker_host, _route) do
+    {:ok, %{approval_policy: "never", thread_sandbox: "read-only", turn_sandbox_policy: %{"type" => "readOnly"}}}
   end
 
   defp start_thread(
          port,
          workspace,
          %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
-         dynamic_tool_binding
+         dynamic_tool_binding,
+         overrides
        ) do
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
-      "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
-        "cwd" => workspace,
-        "dynamicTools" => dynamic_tool_binding.tool_specs
-      }
+      "params" =>
+        Map.merge(
+          %{
+            "approvalPolicy" => approval_policy,
+            "sandbox" => thread_sandbox,
+            "cwd" => workspace,
+            "dynamicTools" => dynamic_tool_binding.tool_specs
+          },
+          overrides
+        )
     })
 
     case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
+      {:ok, %{"thread" => thread_payload} = response} ->
+        if discovery_selection_valid?(response, overrides) do
+          thread_identifier(thread_payload)
+        else
+          {:error, :discovery_model_selection_unverified}
         end
 
       other ->
         other
     end
   end
+
+  defp discovery_selection_valid?(response, %{"model" => model}) do
+    response["model"] == model and response["approvalPolicy"] == "never" and
+      match?(%{"type" => "readOnly"}, response["sandbox"]) and response["sandbox"]["networkAccess"] != true
+  end
+
+  defp discovery_selection_valid?(_response, _overrides), do: true
+
+  defp thread_identifier(%{"id" => thread_id}), do: {:ok, thread_id}
+  defp thread_identifier(payload), do: {:error, {:invalid_thread_payload, payload}}
 
   defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
     send_message(port, %{
