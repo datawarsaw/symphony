@@ -4,6 +4,9 @@ defmodule SymphonyElixir.WorkspaceProvenanceTest do
   alias SymphonyElixir.RepositoryRouter
   alias SymphonyElixir.Tracker.Issue
 
+  @windows_everyone_sid "*S-1-1-0"
+  @windows_deny_rights "(OI)(CI)(WD,AD,WA,WEA)"
+
   test "captures routed workspace provenance with credential-safe remote evidence" do
     test_root = Path.join(System.tmp_dir!(), "symphony-provenance-#{System.unique_integer([:positive])}")
     workspace_root = Path.join(test_root, "workspaces")
@@ -211,35 +214,82 @@ defmodule SymphonyElixir.WorkspaceProvenanceTest do
   defp readonly_git_metadata!(git_dir) do
     case :os.type() do
       {:win32, _} ->
-        sid = current_user_sid!()
-        {_output, 0} = System.cmd("icacls", [git_dir, "/deny", "*#{sid}:(OI)(CI)(WD,AD,WA,WEA)"])
+        principal = windows_deny_principal()
+        run_acl_command!(["icacls", git_dir, "/deny", "#{principal}:#{@windows_deny_rights}"])
 
       _ ->
-        {_, 0} = System.cmd("chmod", ["-R", "a-w", git_dir])
+        run_acl_command!(["chmod", "-R", "a-w", git_dir])
     end
   end
 
   defp restore_git_metadata_permissions(git_dir) do
     case :os.type() do
       {:win32, _} ->
-        sid = current_user_sid!()
-        System.cmd("icacls", [git_dir, "/remove:d", "*#{sid}"])
+        # Removing an ACE that was never added is a no-op for `icacls /remove:d`,
+        # so removing both the resolved current-user SID and the Everyone fallback
+        # always undoes whichever deny readonly_git_metadata!/1 applied.
+        Enum.each(windows_restore_principals(), fn principal ->
+          run_acl_command!(["icacls", git_dir, "/remove:d", principal])
+        end)
 
       _ ->
         if File.dir?(git_dir) do
-          System.cmd("chmod", ["-R", "u+w", git_dir])
+          run_acl_command!(["chmod", "-R", "u+w", git_dir])
         end
+    end
+
+    :ok
+  end
+
+  # Prefer the current user's SID when the whoami probe succeeds. When the
+  # probe is unsupported or fails (for example under a restricted-token sandbox
+  # where whoami exits non-zero), fall back to the well-known Everyone SID
+  # (S-1-1-0): denying Everyone deterministically denies the current user too,
+  # so the read-only git metadata scenario still exercises the same provenance
+  # checks without weakening them.
+  defp windows_deny_principal do
+    case current_user_sid() do
+      {:ok, sid} -> "*" <> sid
+      {:error, _reason} -> @windows_everyone_sid
     end
   end
 
-  defp current_user_sid! do
-    {output, 0} = System.cmd("whoami", ["/user", "/fo", "csv", "/nh"])
+  defp windows_restore_principals do
+    case current_user_sid() do
+      {:ok, sid} -> ["*" <> sid, @windows_everyone_sid]
+      {:error, _reason} -> [@windows_everyone_sid]
+    end
+  end
 
-    output
-    |> String.trim()
-    |> String.split(",")
-    |> List.last()
-    |> String.trim("\"")
+  defp current_user_sid do
+    case System.cmd("whoami", ["/user", "/fo", "csv", "/nh"], stderr_to_stdout: true) do
+      {output, 0} ->
+        sid =
+          output
+          |> String.trim()
+          |> String.split(",")
+          |> List.last()
+          |> String.trim("\"")
+
+        if String.starts_with?(sid, "S-"),
+          do: {:ok, sid},
+          else: {:error, :sid_probe_unparsable}
+
+      {_output, status} ->
+        {:error, {:sid_probe_exit, status}}
+    end
+  rescue
+    error in ErlangError -> {:error, error}
+  end
+
+  defp run_acl_command!([executable | args]) do
+    case System.cmd(executable, args, stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        flunk("#{executable} #{Enum.join(args, " ")} failed with exit #{status}: #{output}")
+    end
   end
 
   defp git!(workspace, args) do
