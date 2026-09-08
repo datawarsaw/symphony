@@ -7,6 +7,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.RepositoryRouter
   alias SymphonyElixir.TestSupport.FakeSSH
 
+  # Symlink escape coverage runs with a real symlink when the host allows it and
+  # with a directory junction otherwise; only an unavailable prerequisite skips it.
+  @symlink_fixture_skip symlink_fixture_skip_reason()
+
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
       Path.join(
@@ -170,6 +174,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  @tag skip: @symlink_fixture_skip
   test "workspace rejects symlink escapes under the configured root" do
     test_root =
       Path.join(
@@ -184,7 +189,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       File.mkdir_p!(workspace_root)
       File.mkdir_p!(outside_root)
-      File.ln_s!(outside_root, symlink_path)
+      link_dir_fixture!(outside_root, symlink_path)
 
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
@@ -194,10 +199,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:error, {:workspace_outside_root, ^canonical_outside_root, ^canonical_workspace_root}} =
                Workspace.create_for_issue("MT-SYM")
     after
-      File.rm_rf(test_root)
+      remove_dir_link_fixtures!(test_root)
     end
   end
 
+  @tag skip: @symlink_fixture_skip
   test "recorded workspace removal rejects symlink escapes before hooks" do
     test_root =
       Path.join(
@@ -209,12 +215,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       recorded_root = Path.join(test_root, "recorded-workspaces")
       current_root = Path.join(test_root, "current-workspaces")
       outside_root = Path.join(test_root, "outside")
-      recorded_workspace = Path.join(recorded_root, "MT-SYM")
+      # The product reports the expanded recorded path, so keep the fixture path in
+      # that canonical form; otherwise the pin below only holds where Path.expand
+      # does not change separators or drive-letter case.
+      recorded_workspace = Path.expand(Path.join(recorded_root, "MT-SYM"))
       hook_marker = Path.join(test_root, "before-remove-ran")
 
       File.mkdir_p!(recorded_root)
       File.mkdir_p!(outside_root)
-      File.ln_s!(outside_root, recorded_workspace)
+      link_dir_fixture!(outside_root, recorded_workspace)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: current_root,
@@ -230,10 +239,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       refute File.exists?(hook_marker)
       assert File.exists?(outside_root)
     after
-      File.rm_rf(test_root)
+      remove_dir_link_fixtures!(test_root)
     end
   end
 
+  @tag skip: @symlink_fixture_skip
   test "workspace canonicalizes symlinked workspace roots before creating issue directories" do
     test_root =
       Path.join(
@@ -246,7 +256,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       linked_root = Path.join(test_root, "linked-workspaces")
 
       File.mkdir_p!(actual_root)
-      File.ln_s!(actual_root, linked_root)
+      link_dir_fixture!(actual_root, linked_root)
 
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: linked_root)
 
@@ -257,7 +267,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert workspace == canonical_workspace
       assert File.dir?(workspace)
     after
-      File.rm_rf(test_root)
+      remove_dir_link_fixtures!(test_root)
     end
   end
 
