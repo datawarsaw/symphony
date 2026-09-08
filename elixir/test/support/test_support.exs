@@ -1,6 +1,110 @@
 defmodule SymphonyElixir.TestSupport do
   @workflow_prompt "You are an agent for this repository."
 
+  # Application env owned by the harness: every test may change it, and later
+  # tests assume it is back at the value the test environment was configured
+  # with (`config/config.exs`). Deleting it instead of restoring it destroys
+  # shared test state for the rest of the run.
+  @shared_app_env_keys [
+    :workflow_file_path,
+    :server_port_override,
+    :memory_tracker_issues
+  ]
+
+  @baseline_key {__MODULE__, :baseline}
+
+  @doc """
+  Captures the configured application/test baseline once, before any test runs.
+  """
+  @spec capture_baseline!() :: :ok
+  def capture_baseline! do
+    baseline = %{
+      app_env:
+        Map.new(@shared_app_env_keys, fn key ->
+          {key, Application.get_env(:symphony_elixir, key)}
+        end),
+      running_children: running_supervisor_children()
+    }
+
+    :persistent_term.put(@baseline_key, baseline)
+    :ok
+  end
+
+  @doc """
+  Restores the configured application env and the application supervisor shape
+  a test may have taken down. Registered before any fixture work so it runs
+  after both pass and fail.
+  """
+  @spec restore_shared_state() :: :ok
+  def restore_shared_state do
+    restore_shared_app_env()
+    restore_shared_supervisor_children()
+    :ok
+  end
+
+  defp baseline do
+    :persistent_term.get(@baseline_key, %{app_env: %{}, running_children: []})
+  end
+
+  defp restore_shared_app_env do
+    Enum.each(baseline().app_env, &restore_shared_app_env_key/1)
+  end
+
+  defp restore_shared_app_env_key({:workflow_file_path, path}) when is_binary(path) do
+    # Route through Workflow so the shared WorkflowStore reloads the configured
+    # baseline instead of serving the previous test's last-known-good settings.
+    SymphonyElixir.Workflow.set_workflow_file_path(path)
+  end
+
+  defp restore_shared_app_env_key({key, nil}) do
+    Application.delete_env(:symphony_elixir, key)
+  end
+
+  defp restore_shared_app_env_key({key, value}) do
+    Application.put_env(:symphony_elixir, key, value)
+  end
+
+  defp restore_shared_supervisor_children do
+    supervisor = Process.whereis(SymphonyElixir.Supervisor)
+
+    if is_pid(supervisor) do
+      running = running_supervisor_children()
+
+      baseline().running_children
+      |> Enum.reject(&(&1 in running))
+      |> Enum.each(&restart_supervisor_child(supervisor, &1))
+    end
+  end
+
+  defp restart_supervisor_child(supervisor, child_id) do
+    case Supervisor.restart_child(supervisor, child_id) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, {:already_started, _pid}} ->
+        :ok
+
+      {:error, :running} ->
+        :ok
+
+      {:error, reason} ->
+        raise "shared test supervisor child #{inspect(child_id)} not restored: #{inspect(reason)}"
+    end
+  end
+
+  defp running_supervisor_children do
+    if Process.whereis(SymphonyElixir.Supervisor) do
+      SymphonyElixir.Supervisor
+      |> Supervisor.which_children()
+      |> Enum.flat_map(fn
+        {id, pid, _type, _modules} when is_pid(pid) -> [id]
+        _child -> []
+      end)
+    else
+      []
+    end
+  end
+
   defmacro __using__(_opts) do
     quote do
       use ExUnit.Case
@@ -25,6 +129,11 @@ defmodule SymphonyElixir.TestSupport do
         only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
 
       setup do
+        # Register shared-state cleanup before any fixture work: a setup or
+        # fixture failure must not bypass it, and it must run after both pass
+        # and fail so the next test starts from the configured baseline.
+        on_exit(fn -> SymphonyElixir.TestSupport.restore_shared_state() end)
+
         workflow_root =
           Path.join(
             System.tmp_dir!(),
@@ -32,18 +141,13 @@ defmodule SymphonyElixir.TestSupport do
           )
 
         File.mkdir_p!(workflow_root)
+        on_exit(fn -> File.rm_rf(workflow_root) end)
+
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
-
-        on_exit(fn ->
-          Application.delete_env(:symphony_elixir, :workflow_file_path)
-          Application.delete_env(:symphony_elixir, :server_port_override)
-          Application.delete_env(:symphony_elixir, :memory_tracker_issues)
-          File.rm_rf(workflow_root)
-        end)
 
         :ok
       end
