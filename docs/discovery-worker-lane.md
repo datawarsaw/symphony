@@ -39,3 +39,37 @@ For an intentional rerun of unchanged input after an infrastructure repair, an o
 `mix test test/symphony_elixir/discovery_test.exs test/symphony_elixir/discovery_integration_test.exs` covers routing, bounded retry, immutable fallback input, all verdicts, malformed handoffs, inherited integration restrictions, restart/cache behavior, stale/destination binding, default behavior and real orchestrator completion without continuation.
 
 Run the repository's format, lint, full coverage and type gates before delivery. Session setup can also be probed against the installed app-server without a model turn; this proves accepted model/sandbox settings, not successful provider execution or end-to-end issue processing.
+
+## Durable Linear publication
+
+After retention, Symphony rereads and revalidates the contract, verdict, issue identity and
+canonical repository binding before publishing a concise Discovery comment. SPLIT also
+binds its parent identity. Invalid or unbound output is never published; a host warning records
+the issue identity without logging raw output. The worker has no Linear write capability.
+The host publication path creates comments only: it never updates descriptions or lifecycle
+state and never dispatches implementation or Refinement.
+
+The comment summarizes the recommendation, findings, dependencies, acceptance criteria and
+handoff/next action. Sections are bounded and marked when abridged; the full evidence remains
+in the result store. Provider, model, reasoning, fallback and optional wall-clock duration are
+taken from retained host metadata, not model declarations. Missing optional metadata renders
+as unavailable. New receipts retain completion time and duration (including retry/fallback);
+older receipts use their existing file modification time as the result timestamp.
+
+A digest of issue ID, frozen input, output and completion timestamp produces a stable UUID-shaped
+comment ID accepted by Linear's CommentCreateInput. The publisher first looks up that exact ID,
+then creates only if absent. On an ambiguous mutation response it looks up the same ID again.
+A matching comment is success; a conflicting body/issue fails closed. This handles retry,
+restart and concurrent duplicate create attempts without a separate acknowledgement file.
+Publication failure uses normal worker retry and cached evidence, without another provider run.
+Other tracker kinds retain their existing behavior.
+
+Comments are immutable audit history. Every comment identifies its result timestamp and digest
+and explicitly states the authority rule: greatest result timestamp, then lexical Result ID
+for a timestamp tie. A delayed retry of an older result cannot become authoritative merely
+because it was posted later. Do not modify retained timestamps when moving the result store.
+A later run has a new completion timestamp and therefore its own comment. This task introduces
+no automatic state transition or Refinement worker.
+
+API schema reference: https://github.com/linear/linear/blob/master/packages/sdk/src/schema.graphql
+(CommentCreateInput.id, CommentFilter.id, commentCreate).

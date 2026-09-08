@@ -1,8 +1,10 @@
 defmodule SymphonyElixir.Discovery do
   @moduledoc "A bounded read-only Discovery lane. The host retains evidence; workers never write lifecycle state."
+  require Logger
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Config
   alias SymphonyElixir.Discovery.Contract
+  alias SymphonyElixir.Discovery.Publication
   alias SymphonyElixir.Discovery.Session
   alias SymphonyElixir.PathSafety
   alias SymphonyElixir.RepositoryRouter
@@ -42,7 +44,8 @@ defmodule SymphonyElixir.Discovery do
          true <- is_nil(Keyword.get(opts, :worker_host)),
          {:ok, input} <- snapshot(issue),
          {:ok, workspace} <- workspace(input),
-         {:ok, evidence} <- cached_or_execute(issue, workspace, input, recipient, opts) do
+         {:ok, evidence} <- cached_or_execute(issue, workspace, input, recipient, opts),
+         :ok <- publish_retained(issue, input, opts) do
       if is_pid(recipient), do: send(recipient, {:discovery_completed, issue.id, evidence.status})
       :ok
     else
@@ -102,13 +105,17 @@ defmodule SymphonyElixir.Discovery do
         {:ok, evidence}
 
       {:error, :enoent} ->
+        started = System.monotonic_time(:millisecond)
+
         evidence =
           execute(
             input,
             fn route, frozen -> run_session(workspace, issue, route, frozen, recipient) end,
             opts
           )
-        evidence = bind_issue(evidence, issue)
+
+        evidence = evidence |> bind_issue(issue) |> Map.put(:duration_ms, System.monotonic_time(:millisecond) - started)
+        evidence = Map.put(evidence, :completed_at, DateTime.to_iso8601(DateTime.utc_now()))
         persist(issue.id, input, evidence)
 
       error ->
@@ -116,15 +123,52 @@ defmodule SymphonyElixir.Discovery do
     end
   end
 
+  defp publish_retained(issue, input, opts) do
+    if Config.settings!().tracker.kind == "linear" or Keyword.has_key?(opts, :publication_graphql) do
+      with {:ok, evidence} <- read_evidence(issue.id, input),
+           true <- is_binary(evidence.output),
+           {:ok, parsed} <- Contract.parse(evidence.output),
+           true <- parsed.verdict == evidence.status,
+           true <- publication_bound?(parsed, evidence, issue) do
+        Publication.publish(issue.id, input, evidence, parsed, opts)
+      else
+        {:error, :invalid_discovery_evidence} = error ->
+          error
+
+        _ ->
+          Logger.warning("Discovery publication skipped invalid or unbound evidence issue_id=#{issue.id} issue_identifier=#{issue.identifier}")
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp publication_bound?(parsed, evidence, issue) do
+    identity = Contract.section(parsed.brief, "ISSUE")
+    pattern = Regex.compile!("\\A" <> Regex.escape(issue.identifier) <> "(?:[ :\\t]|\\z)")
+
+    with true <- Regex.match?(pattern, identity),
+         {:ok, route} <- RepositoryRouter.resolve(issue, Config.settings!().routing),
+         true <- not is_nil(route),
+         true <- bound_source?(Contract.section(parsed.brief, "DESTINATION / REPO"), route.source_path),
+         %{status: status} <- bind_issue(evidence, issue) do
+      status == parsed.verdict and
+        (status != "SPLIT" or Contract.section(parsed.output, "PARENT ISSUE") == issue.identifier)
+    else
+      _ -> false
+    end
+  end
+
   defp bind_issue(%{status: "READY", output: text} = evidence, issue) do
     text = String.replace(text, "\r\n", "\n")
     pattern = Regex.compile!("^ISSUE\\n\\s*" <> Regex.escape(issue.identifier) <> "(?:[ :\\t]|$)", "m")
-    destination = Regex.run(~r/^REPO: (.+)$/m, text, capture: :all_but_first)
+    destination = Regex.scan(~r/^REPO: (.+)$/m, text, capture: :all_but_first)
 
     with true <- length(Regex.scan(pattern, text)) == 2,
-         [repo] <- destination,
+         [[repo]] <- destination,
          {:ok, route} <- RepositoryRouter.resolve(issue, Config.settings!().routing),
-         true <- not is_nil(route) and Path.expand(String.trim(repo)) == Path.expand(route.source_path) do
+         true <- not is_nil(route) and bound_source?(repo, route.source_path) do
       evidence
     else
       _ -> %{evidence | status: "INVALID"}
@@ -132,6 +176,26 @@ defmodule SymphonyElixir.Discovery do
   end
 
   defp bind_issue(evidence, _issue), do: evidence
+
+  defp bound_source?(declared, source_path) when is_binary(declared) and is_binary(source_path) do
+    normalized = normalize_repo_path(declared)
+
+    with {:ok, expected} <- PathSafety.canonicalize(source_path),
+         true <- not String.contains?(normalized, "..") do
+      token = normalize_repo_path(expected)
+
+      normalized == token or
+        Regex.match?(Regex.compile!(~S(\A[a-z0-9_-]+ \x28\x60) <> Regex.escape(token) <> ~S(\x60, elixir app\x29\z)), normalized)
+    else
+      _ -> false
+    end
+  end
+
+  defp normalize_repo_path(value) do
+    value
+    |> String.replace("\\", "/")
+    |> String.downcase()
+  end
 
   defp run_session(workspace, issue, route, input, recipient) do
     key = make_ref()
@@ -176,6 +240,7 @@ defmodule SymphonyElixir.Discovery do
     send(recipient, {:codex_worker_update, issue_id, message})
     :ok
   end
+
   defp forward_update(_collect_result, _recipient, _issue, _message), do: :ok
 
   defp technical({:error, error}), do: Session.technical_failure(error)
@@ -223,9 +288,12 @@ defmodule SymphonyElixir.Discovery do
   defp read_evidence(issue_id, input) do
     with :ok <- safe_path(evidence_path(issue_id, input)),
          {:ok, body} <- File.read(evidence_path(issue_id, input)),
-         {:ok, %{"input_sha256" => hash, "status" => status, "output" => output}} <- Jason.decode(body),
-         true <- hash == digest(input) do
-      {:ok, %{status: status, output: output}}
+         {:ok, %{"input_sha256" => hash, "status" => status, "output" => output} = fields} <- Jason.decode(body),
+         true <- hash == digest(input),
+         {:ok, stat} <- File.stat(evidence_path(issue_id, input), time: :posix) do
+      metadata = Map.new([:provider, :model, :reasoning, :lane, :fallback_reason, :duration_ms, :completed_at], &{&1, fields[Atom.to_string(&1)]})
+      completed_at = metadata.completed_at || DateTime.to_iso8601(DateTime.from_unix!(stat.mtime))
+      {:ok, Map.merge(metadata, %{status: status, output: output, completed_at: completed_at})}
     else
       {:error, :enoent} = error -> error
       _ -> {:error, :invalid_discovery_evidence}

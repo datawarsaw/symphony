@@ -107,7 +107,9 @@ defmodule SymphonyElixir.Discovery.Contract do
     occurrences(text, heading) == 1 and body != "" and not Regex.match?(~r/<[^>]+>/, body)
   end
 
-  defp section(text, heading) do
+  @doc false
+  @spec section(String.t(), String.t()) :: String.t()
+  def section(text, heading) do
     boundaries = (@brief ++ @handoff ++ ["PARENT ISSUE", "WHY SPLIT", "PARENT COMPLETION CONDITION"]) |> Enum.uniq() |> Enum.map_join("|", &Regex.escape/1)
 
     pattern =
