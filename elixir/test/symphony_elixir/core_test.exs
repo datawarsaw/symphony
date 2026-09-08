@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.TestSupport.FakeSSH
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -1735,33 +1737,15 @@ defmodule SymphonyElixir.CoreTest do
 
     try do
       trace_file = Path.join(test_root, "ssh.trace")
-      fake_ssh = Path.join(test_root, "ssh")
 
       File.mkdir_p!(test_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
 
-      File.write!(fake_ssh, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
-      printf 'ARGV:%s\\n' "$*" >> "$trace_file"
-
-      case "$*" in
-        *worker-a*"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\n' 'worker-a prepare failed' >&2
-          exit 75
-          ;;
-        *worker-b*"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
-          exit 0
-          ;;
-        *)
-          exit 0
-          ;;
-      esac
-      """)
-
-      File.chmod!(fake_ssh, 0o755)
+      FakeSSH.install!(test_root, :marker,
+        trace_file: trace_file,
+        output_line: "__SYMPHONY_WORKSPACE__\t1\t/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER",
+        failure: %{match: "worker-a", stderr: "worker-a prepare failed", exit_code: 75}
+      )
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "~/.symphony-remote-workspaces",

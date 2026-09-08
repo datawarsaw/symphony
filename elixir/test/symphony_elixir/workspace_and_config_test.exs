@@ -5,6 +5,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
   alias SymphonyElixir.RepositoryRouter
+  alias SymphonyElixir.TestSupport.FakeSSH
 
   test "workspace bootstrap can be implemented in after_create hook" do
     test_root =
@@ -1860,29 +1861,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     try do
       trace_file = Path.join(test_root, "ssh.trace")
-      fake_ssh = Path.join(test_root, "ssh")
       workspace_root = "~/.symphony-remote-workspaces"
       workspace_path = "/remote/home/.symphony-remote-workspaces/MT-SSH-WS"
 
       File.mkdir_p!(test_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
 
-      File.write!(fake_ssh, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
-      printf 'ARGV:%s\\n' "$*" >> "$trace_file"
-
-      case "$*" in
-        *"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{workspace_path}'
-          ;;
-      esac
-
-      exit 0
-      """)
-
-      File.chmod!(fake_ssh, 0o755)
+      FakeSSH.install!(test_root, :marker,
+        trace_file: trace_file,
+        output_line: "__SYMPHONY_WORKSPACE__\t1\t#{workspace_path}"
+      )
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,

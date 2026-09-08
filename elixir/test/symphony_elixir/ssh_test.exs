@@ -2,6 +2,7 @@ defmodule SymphonyElixir.SSHTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.SSH
+  alias SymphonyElixir.TestSupport.FakeSSH
 
   test "run/3 keeps bracketed IPv6 host:port targets intact" do
     test_root = Path.join(System.tmp_dir!(), "symphony-ssh-ipv6-test-#{System.unique_integer([:positive])}")
@@ -114,12 +115,7 @@ defmodule SymphonyElixir.SSHTest do
       File.rm_rf(test_root)
     end)
 
-    install_fake_ssh!(test_root, trace_file, """
-    #!/bin/sh
-    printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
-    printf 'ready\\n'
-    exit 0
-    """)
+    install_fake_ssh!(test_root, trace_file, stdout: "ready")
 
     System.delete_env("SYMPHONY_SSH_CONFIG")
 
@@ -142,12 +138,7 @@ defmodule SymphonyElixir.SSHTest do
       File.rm_rf(test_root)
     end)
 
-    install_fake_ssh!(test_root, trace_file, """
-    #!/bin/sh
-    printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
-    printf 'ready\\n'
-    exit 0
-    """)
+    install_fake_ssh!(test_root, trace_file, stdout: "ready")
 
     assert {:ok, port} = SSH.start_port("localhost:2222", "printf ok", line: 256)
     assert is_port(port)
@@ -162,24 +153,8 @@ defmodule SymphonyElixir.SSHTest do
              "bash -lc 'printf '\"'\"'hello'\"'\"''"
   end
 
-  defp install_fake_ssh!(test_root, trace_file, script \\ nil) do
-    fake_bin_dir = Path.join(test_root, "bin")
-    fake_ssh = Path.join(fake_bin_dir, "ssh")
-
-    File.mkdir_p!(fake_bin_dir)
-
-    File.write!(
-      fake_ssh,
-      script ||
-        """
-        #!/bin/sh
-        printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
-        exit 0
-        """
-    )
-
-    File.chmod!(fake_ssh, 0o755)
-    System.put_env("PATH", fake_bin_dir <> ":" <> (System.get_env("PATH") || ""))
+  defp install_fake_ssh!(test_root, trace_file, opts \\ []) do
+    FakeSSH.install!(Path.join(test_root, "bin"), :trace, Keyword.put(opts, :trace_file, trace_file))
   end
 
   defp wait_for_trace!(trace_file, attempts \\ 20)
