@@ -136,6 +136,63 @@ defmodule SymphonyElixir.SourceSyncTest do
     end)
   end
 
+  test "routed workspace reuse accepts a workspace created from the selected repository" do
+    with_source_fixture("reuse-same-repo", fn fixture ->
+      configure_workspace_workflow!(fixture)
+      issue = %Issue{id: "reuse-same", identifier: "MIC-167-SAME-REPO", labels: ["repo:symphony-runtime"]}
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      File.write!(Path.join(workspace, "notes.md"), "keep me\n")
+
+      assert {:ok, ^workspace} = Workspace.create_for_issue(issue)
+      assert File.read!(Path.join(workspace, "notes.md")) == "keep me\n"
+      assert git_common_dir(workspace) == git_common_dir(fixture.source_repo)
+    end)
+  end
+
+  test "routed workspace reuse rejects a workspace created from another repository" do
+    first_root = test_root_path("reuse-other-repo-a")
+    second_root = test_root_path("reuse-other-repo-b")
+
+    try do
+      first = setup_source_fixture!(first_root)
+      second = setup_source_fixture!(second_root)
+      configure_workspace_workflow!(first)
+      issue = %Issue{id: "reuse-other", identifier: "MIC-167-OTHER-REPO", labels: ["repo:symphony-runtime"]}
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert String.trim(File.read!(Path.join(workspace, "README.md"))) == "initial content"
+      assert {"symphony/MIC-167-OTHER-REPO\n", 0} = System.cmd("git", ["-C", workspace, "branch", "--show-current"])
+
+      configure_workspace_workflow!(second, workspace_root: first.workspace_root)
+
+      assert {:error,
+              {:workspace_repository_mismatch, "symphony-runtime", {:git_common_dir, _actual, _expected}}} =
+               Workspace.create_for_issue(issue)
+
+      assert String.trim(File.read!(Path.join(workspace, "README.md"))) == "initial content"
+      assert {"symphony/MIC-167-OTHER-REPO\n", 0} = System.cmd("git", ["-C", workspace, "branch", "--show-current"])
+    after
+      File.rm_rf(first_root)
+      File.rm_rf(second_root)
+    end
+  end
+
+  test "routed workspace reuse rejects a reused path that is not a git repository" do
+    with_source_fixture("reuse-non-git", fn fixture ->
+      configure_workspace_workflow!(fixture)
+      issue = %Issue{id: "reuse-non-git", identifier: "MIC-167-NON-GIT", labels: ["repo:symphony-runtime"]}
+      workspace = Path.join(fixture.workspace_root, Workspace.workspace_key(issue))
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "stale.txt"), "stale\n")
+
+      assert {:error, {:workspace_repository_mismatch, "symphony-runtime", :workspace_not_a_git_repository}} =
+               Workspace.create_for_issue(issue)
+
+      assert File.read!(Path.join(workspace, "stale.txt")) == "stale\n"
+    end)
+  end
+
   defp with_source_fixture(name, fun) do
     test_root = test_root_path(name)
 
@@ -228,9 +285,9 @@ defmodule SymphonyElixir.SourceSyncTest do
     :ok
   end
 
-  defp configure_workspace_workflow!(fixture) do
+  defp configure_workspace_workflow!(fixture, opts \\ []) do
     write_workflow_file!(Workflow.workflow_file_path(),
-      workspace_root: fixture.workspace_root,
+      workspace_root: Keyword.get(opts, :workspace_root, fixture.workspace_root),
       routing: %{
         target_label_prefix: "repo:",
         default_branch: "main",
@@ -250,6 +307,21 @@ defmodule SymphonyElixir.SourceSyncTest do
   defp get_head_sha(repo_path) do
     {sha, 0} = System.cmd("git", ["-c", "safe.directory=#{repo_path}", "-C", repo_path, "rev-parse", "HEAD"])
     String.trim(sha)
+  end
+
+  defp git_common_dir(repo_path) do
+    {output, 0} =
+      System.cmd("git", [
+        "-c",
+        "safe.directory=#{repo_path}",
+        "-C",
+        repo_path,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir"
+      ])
+
+    output |> String.trim() |> String.replace("\\", "/") |> String.downcase()
   end
 
   defp get_remote_head_sha(repo_path, branch) do

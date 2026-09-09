@@ -688,6 +688,34 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              RepositoryRouter.resolve(%Issue{labels: ["repo:wup", "repo:symphony-runtime"]}, routing)
   end
 
+  test "repository routing rejects issue metadata that injects a filesystem path or Git URL" do
+    routing = %Schema.Routing{
+      targets: %{"symphony-runtime" => %{"source_path" => "/sources/symphony"}}
+    }
+
+    injected_labels = [
+      "repo:/etc/passwd",
+      "repo:../../etc",
+      "repo:C:/Windows/System32",
+      "repo:https://evil.example/attacker.git",
+      "repo:git@evil.example:attacker.git",
+      "repo:file:///etc/passwd"
+    ]
+
+    for label <- injected_labels do
+      assert {:error, {:unsupported_repository_target, target}} =
+               RepositoryRouter.resolve(%Issue{labels: [label]}, routing)
+
+      assert String.downcase(target) == String.downcase(String.replace_prefix(label, "repo:", ""))
+    end
+
+    assert {:error, {:ambiguous_repository_target, _targets}} =
+             RepositoryRouter.resolve(
+               %Issue{labels: ["repo:symphony-runtime", "repo:/etc/passwd"]},
+               routing
+             )
+  end
+
   test "linear client normalizes blockers from inverse relations" do
     raw_issue = %{
       "id" => "issue-1",
