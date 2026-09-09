@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.Codex.WorkerEnvironment
   alias SymphonyElixir.Config
   alias SymphonyElixir.Discovery.Session
   alias SymphonyElixir.PathSafety
@@ -210,21 +211,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding))],
-            cd: String.to_charlist(workspace),
-            env: tracker_secret_port_env(dynamic_tool_binding),
-            line: @port_line_bytes
-          ]
-        )
+      with {:ok, worker_environment} <- WorkerEnvironment.prepare(workspace) do
+        port =
+          Port.open(
+            {:spawn_executable, String.to_charlist(executable)},
+            [
+              :binary,
+              :exit_status,
+              :stderr_to_stdout,
+              args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, worker_environment))],
+              cd: String.to_charlist(workspace),
+              env: worker_environment ++ tracker_secret_port_env(dynamic_tool_binding),
+              line: @port_line_bytes
+            ]
+          )
 
-      {:ok, port}
+        {:ok, port}
+      end
     end
   end
 
@@ -233,13 +236,25 @@ defmodule SymphonyElixir.Codex.AppServer do
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
-  defp local_launch_command(dynamic_tool_binding) do
+  defp local_launch_command(dynamic_tool_binding, worker_environment) do
     [
+      worker_environment_export_command(worker_environment),
       tracker_secret_unset_command(dynamic_tool_binding),
       "exec #{Config.settings!().codex.command}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
+  end
+
+  # Applied after Bash profile loading so a host profile cannot point the worker
+  # back at ambient build, dependency or temporary directories.
+  defp worker_environment_export_command([]), do: nil
+
+  defp worker_environment_export_command(worker_environment) do
+    "export " <>
+      Enum.map_join(worker_environment, " ", fn {name, value} ->
+        "#{name}=#{shell_escape(to_string(value))}"
+      end)
   end
 
   defp remote_launch_command(workspace, dynamic_tool_binding) when is_binary(workspace) do

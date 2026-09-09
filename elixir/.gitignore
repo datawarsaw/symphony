@@ -1,6 +1,17 @@
 # The directory Mix will write compiled artifacts to.
 /_build/
 
+# Workspace-local Windows worker build, dependency, Mix/Hex home, cache, and
+# temporary directories (see SymphonyElixir.Codex.WorkerEnvironment).
+/.mix_build/
+/.mix_deps/
+/.hex/
+/.mix/
+/.tmp/
+/.elixir_make/
+/.rebar_cache/
+/.rebar_config/
+
 # If you run "mix test --cover", coverage assets end up here.
 /cover/
 

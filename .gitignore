@@ -1,0 +1,9 @@
+# Workspace-local Windows worker build, package, and temporary state.
+/.mix_build/
+/.mix_deps/
+/.hex/
+/.mix/
+/.tmp/
+/.elixir_make/
+/.rebar_cache/
+/.rebar_config/
