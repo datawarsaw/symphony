@@ -1448,6 +1448,9 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
+          model: Map.get(metadata, :model),
+          reasoning_effort: Map.get(metadata, :reasoning_effort),
+          route_source: Map.get(metadata, :route_source),
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
@@ -1547,6 +1550,9 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        model: model_for_update(Map.get(running_entry, :model), update),
+        reasoning_effort: reasoning_effort_for_update(Map.get(running_entry, :reasoning_effort), update),
+        route_source: route_source_for_update(Map.get(running_entry, :route_source), update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
@@ -1578,6 +1584,15 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp model_for_update(_existing, %{model: model}) when is_binary(model), do: model
+  defp model_for_update(existing, _update), do: existing
+
+  defp reasoning_effort_for_update(_existing, %{reasoning_effort: effort}) when is_binary(effort), do: effort
+  defp reasoning_effort_for_update(existing, _update), do: existing
+
+  defp route_source_for_update(_existing, %{route_source: source}) when not is_nil(source), do: source
+  defp route_source_for_update(existing, _update), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,

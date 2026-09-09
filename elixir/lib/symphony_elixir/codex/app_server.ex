@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   require Logger
   alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.Codex.WorkerEnvironment
+  alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Config
   alias SymphonyElixir.Discovery.Session
   alias SymphonyElixir.PathSafety
@@ -17,6 +18,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @type session :: %{
+          optional(:model) => String.t() | nil,
+          optional(:reasoning_effort) => String.t() | nil,
+          optional(:model_source) => atom() | nil,
+          optional(:reasoning_source) => atom() | nil,
+          optional(:route_source) => atom() | nil,
           optional(:discovery_route) => map() | nil,
           port: port(),
           metadata: map(),
@@ -47,18 +53,22 @@ defmodule SymphonyElixir.Codex.AppServer do
     dynamic_tool_binding = DynamicTool.bind()
     discovery_route = Keyword.get(opts, :discovery_route)
     dynamic_tool_binding = if discovery_route, do: Map.put(dynamic_tool_binding, :tool_specs, []), else: dynamic_tool_binding
+    issue = Keyword.get(opts, :issue)
+    worker_route = if is_nil(discovery_route), do: WorkerRouting.resolve(opts, issue), else: nil
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, discovery_route),
-           {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding, discovery_route) do
+           {:ok, thread_id, evidence} <-
+             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding, discovery_route, worker_route) do
+        session_metadata = Map.merge(metadata, evidence)
+
         {:ok,
          %{
            port: port,
-           metadata: metadata,
+           metadata: session_metadata,
            approval_policy: session_policies.approval_policy,
            auto_approve_requests: is_nil(discovery_route) and session_policies.approval_policy == "never",
            thread_sandbox: session_policies.thread_sandbox,
@@ -67,7 +77,12 @@ defmodule SymphonyElixir.Codex.AppServer do
            workspace: expanded_workspace,
            worker_host: worker_host,
            dynamic_tool_binding: dynamic_tool_binding,
-           discovery_route: discovery_route
+           discovery_route: discovery_route,
+           model: evidence[:model],
+           reasoning_effort: evidence[:reasoning_effort],
+           model_source: evidence[:model_source],
+           reasoning_source: evidence[:reasoning_source],
+           route_source: evidence[:route_source]
          }}
       else
         {:error, reason} ->
@@ -100,7 +115,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
-        Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
+        Logger.info(
+          "Codex session started for #{issue_context(issue)} session_id=#{session_id} model=#{app_session[:model]} reasoning_effort=#{app_session[:reasoning_effort]} route_source=#{app_session[:route_source]}"
+        )
 
         emit_message(
           on_message,
@@ -108,7 +125,12 @@ defmodule SymphonyElixir.Codex.AppServer do
           %{
             session_id: session_id,
             thread_id: thread_id,
-            turn_id: turn_id
+            turn_id: turn_id,
+            model: app_session[:model],
+            reasoning_effort: app_session[:reasoning_effort],
+            model_source: app_session[:model_source],
+            reasoning_source: app_session[:reasoning_source],
+            route_source: app_session[:route_source]
           },
           metadata
         )
@@ -122,7 +144,12 @@ defmodule SymphonyElixir.Codex.AppServer do
                result: result,
                session_id: session_id,
                thread_id: thread_id,
-               turn_id: turn_id
+               turn_id: turn_id,
+               model: app_session[:model],
+               reasoning_effort: app_session[:reasoning_effort],
+               model_source: app_session[:model_source],
+               reasoning_source: app_session[:reasoning_source],
+               route_source: app_session[:route_source]
              }}
 
           {:error, reason} ->
@@ -331,14 +358,20 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, discovery_route) do
+  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, discovery_route, worker_route) do
     with :ok <- send_initialize(port),
-         {:ok, overrides} <- discovery_overrides(port, workspace, discovery_route) do
-      start_thread(port, workspace, session_policies, dynamic_tool_binding, overrides)
+         {:ok, overrides} <- route_overrides(port, workspace, discovery_route, worker_route) do
+      start_thread(port, workspace, session_policies, dynamic_tool_binding, overrides, discovery_route, worker_route)
     end
   end
 
-  defp discovery_overrides(_port, _workspace, nil), do: {:ok, %{}}
+  defp route_overrides(port, workspace, route, _worker_route) when not is_nil(route) do
+    discovery_overrides(port, workspace, route)
+  end
+
+  defp route_overrides(_port, _workspace, nil, worker_route) do
+    {:ok, WorkerRouting.thread_overrides(worker_route)}
+  end
 
   defp discovery_overrides(port, workspace, route) do
     send_message(port, %{"method" => "config/read", "id" => 4, "params" => %{"cwd" => workspace, "includeLayers" => false}})
@@ -360,7 +393,9 @@ defmodule SymphonyElixir.Codex.AppServer do
          workspace,
          %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
          dynamic_tool_binding,
-         overrides
+         overrides,
+         discovery_route,
+         worker_route
        ) do
     send_message(port, %{
       "method" => "thread/start",
@@ -379,10 +414,39 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload} = response} ->
-        if discovery_selection_valid?(response, overrides) do
-          thread_identifier(thread_payload)
-        else
-          {:error, :discovery_model_selection_unverified}
+        cond do
+          not is_nil(discovery_route) ->
+            if discovery_selection_valid?(response, overrides) do
+              case thread_identifier(thread_payload) do
+                {:ok, thread_id} ->
+                  evidence = %{
+                    model: discovery_route.model,
+                    reasoning_effort: discovery_route.reasoning,
+                    model_source: :discovery,
+                    reasoning_source: :discovery,
+                    route_source: :discovery
+                  }
+                  {:ok, thread_id, evidence}
+
+                other ->
+                  other
+              end
+            else
+              {:error, :discovery_model_selection_unverified}
+            end
+
+          true ->
+            with {:ok, selection} <- WorkerRouting.validate_selection(response, worker_route),
+                 {:ok, thread_id} <- thread_identifier(thread_payload) do
+              evidence =
+                Map.merge(selection, %{
+                  model_source: worker_route.model_source,
+                  reasoning_source: worker_route.reasoning_source,
+                  route_source: worker_route.route_source
+                })
+
+              {:ok, thread_id, evidence}
+            end
         end
 
       other ->
