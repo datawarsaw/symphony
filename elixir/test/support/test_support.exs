@@ -126,7 +126,15 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restore_env: 2,
+          stop_default_http_server: 0,
+          link_dir_fixture!: 2,
+          symlink_fixture_skip_reason: 0,
+          remove_dir_link_fixtures!: 1
+        ]
 
       setup do
         # Register shared-state cleanup before any fixture work: a setup or
@@ -153,6 +161,230 @@ defmodule SymphonyElixir.TestSupport do
       end
     end
   end
+
+  # Symlink fixtures (MIC-208).
+  #
+  # A host without SeCreateSymbolicLinkPrivilege - an unprivileged account,
+  # Developer Mode disabled, or a restricted sandbox token - cannot create a
+  # symlink at all: File.ln_s/2 returns :eperm even for a valid, non-existing
+  # link path. That is a missing host capability, not a product security
+  # failure, so the fixture must not be reported as one.
+  #
+  # A directory junction is a reparse point that OTP reports as
+  # %File.Stat{type: :symlink} and that :file.read_link_all/1 resolves to its
+  # target, so PathSafety.canonicalize/1 walks it through exactly the same code
+  # path as a real symlink, while creating one needs no privilege. The escape
+  # assertions therefore keep executing against the real product check instead
+  # of being skipped on Windows.
+  #
+  # Only capability errors fall back or skip. Any other File.ln_s/2 error means
+  # the fixture itself is broken and is raised.
+  @symlink_capability_errors [:eperm, :eacces, :enotsup]
+
+  @doc """
+  Creates the directory link a symlink-escape fixture depends on.
+
+  Returns `:symlink` when the host created a real symlink, `:junction` when
+  symlink creation was denied and a Windows directory junction was used
+  instead. Raises when the fixture cannot be created for any other reason.
+  """
+  def link_dir_fixture!(target, link) when is_binary(target) and is_binary(link) do
+    case create_dir_link(target, link) do
+      {:ok, strategy} ->
+        strategy
+
+      {:error, :capability_unavailable, detail} ->
+        raise "symlink fixture prerequisite unavailable for #{inspect(link)} -> #{inspect(target)}: #{detail}"
+
+      {:error, :fixture_error, detail} ->
+        raise "symlink fixture setup failed for #{inspect(link)} -> #{inspect(target)}: #{detail}"
+    end
+  end
+
+  @doc """
+  `false` when this host can build the symlink fixture, otherwise the exact
+  reason to use as an ExUnit `@tag skip:` value.
+
+  Only the prerequisite-dependent case is skipped, and the reason names the
+  capability that is missing.
+  """
+  def symlink_fixture_skip_reason do
+    case symlink_fixture_capability() do
+      {:ok, _strategy} ->
+        false
+
+      {:error, :capability_unavailable, detail} ->
+        "host cannot create the symlink fixture prerequisite (#{detail}); product symlink guard not exercised"
+
+      {:error, :fixture_error, detail} ->
+        raise "symlink fixture probe failed: #{detail}"
+    end
+  end
+
+  @doc """
+  Probes the host once per test run for the link strategy a symlink fixture can use.
+  """
+  def symlink_fixture_capability do
+    key = {__MODULE__, :symlink_fixture_capability}
+
+    case :persistent_term.get(key, :unset) do
+      :unset ->
+        capability = probe_symlink_fixture()
+        :persistent_term.put(key, capability)
+        capability
+
+      capability ->
+        capability
+    end
+  end
+
+  @doc """
+  Removes the directory links under `root`, then the fixture tree itself.
+
+  `File.rm_rf/1` recurses *through* a Windows directory junction, deletes the
+  link target and leaves the dangling reparse point behind, so a plain
+  `File.rm_rf/1` both destroys the fixture's outside directory early and leaves
+  residue that collides with the next run of the same test. Unlinking every
+  reparse point first (which `File.rm_rf/1` does handle) keeps cleanup exact for
+  real symlinks and junctions alike.
+  """
+  def remove_dir_link_fixtures!(root) do
+    root
+    |> dir_link_paths()
+    |> Enum.each(&remove_reparse_point/1)
+
+    File.rm_rf(root)
+  end
+
+  defp remove_reparse_point(path) do
+    # File.rm_rf/1 cannot unlink a directory reparse point whose target is gone
+    # (:eperm from DeleteFile); rmdir removes the link itself, so try that first
+    # and fall back for file symlinks.
+    case File.rmdir(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, _reason} -> File.rm_rf(path)
+    end
+  end
+
+  defp dir_link_paths(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :symlink}} ->
+        [path]
+
+      {:ok, %File.Stat{type: :directory}} ->
+        case File.ls(path) do
+          {:ok, entries} -> Enum.flat_map(entries, &dir_link_paths(Path.join(path, &1)))
+          {:error, _reason} -> []
+        end
+
+      _other ->
+        []
+    end
+  end
+
+  defp probe_symlink_fixture do
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-symlink-capability-#{System.unique_integer([:positive])}"
+      )
+
+    target = Path.join(base, "target")
+    link = Path.join(base, "link")
+
+    try do
+      File.mkdir_p!(target)
+
+      case create_dir_link(target, link) do
+        {:ok, strategy} -> {:ok, strategy}
+        {:error, _class, detail} -> {:error, :capability_unavailable, detail}
+      end
+    rescue
+      error -> {:error, :capability_unavailable, "fixture probe failed: #{Exception.message(error)}"}
+    after
+      remove_dir_link_fixtures!(base)
+    end
+  end
+
+  defp create_dir_link(target, link) do
+    with :ok <- check_link_target(target),
+         :ok <- check_link_absent(link) do
+      case File.ln_s(target, link) do
+        :ok ->
+          {:ok, :symlink}
+
+        {:error, reason} when reason in @symlink_capability_errors ->
+          create_dir_junction(target, link, reason)
+
+        {:error, reason} ->
+          {:error, :fixture_error, "File.ln_s/2 failed: #{describe_errno(reason)}"}
+      end
+    end
+  end
+
+  defp check_link_target(target) do
+    if File.dir?(target) do
+      :ok
+    else
+      {:error, :fixture_error, "fixture target #{inspect(target)} is not an existing directory"}
+    end
+  end
+
+  defp check_link_absent(link) do
+    case File.lstat(link) do
+      {:error, :enoent} ->
+        :ok
+
+      {:ok, _stat} ->
+        {:error, :fixture_error, "fixture link path #{inspect(link)} already exists"}
+
+      {:error, reason} ->
+        {:error, :fixture_error, "cannot stat fixture link path #{inspect(link)}: #{describe_errno(reason)}"}
+    end
+  end
+
+  defp create_dir_junction(target, link, symlink_reason) do
+    if windows?() do
+      {output, status} =
+        System.shell("mklink /J \"#{windows_path(link)}\" \"#{windows_path(target)}\"",
+          stderr_to_stdout: true
+        )
+
+      cond do
+        status == 0 and junction_link?(link, target) ->
+          {:ok, :junction}
+
+        status == 0 ->
+          {:error, :fixture_error, "mklink /J reported success but #{inspect(link)} is not a reparse point Erlang resolves as a symlink"}
+
+        true ->
+          {:error, :capability_unavailable,
+           "File.ln_s/2 denied symlink creation (#{describe_errno(symlink_reason)}) and the directory-junction " <>
+             "fallback failed (mklink /J exit #{status}: #{String.trim(to_string(output))})"}
+      end
+    else
+      {:error, :capability_unavailable, "File.ln_s/2 denied symlink creation (#{describe_errno(symlink_reason)}) and directory junctions are Windows-only"}
+    end
+  end
+
+  defp junction_link?(link, target) do
+    with {:ok, %File.Stat{type: :symlink}} <- File.lstat(link),
+         {:ok, resolved} <- :file.read_link_all(String.to_charlist(link)) do
+      String.downcase(Path.expand(IO.chardata_to_string(resolved))) ==
+        String.downcase(Path.expand(target))
+    else
+      _other -> false
+    end
+  end
+
+  defp windows?, do: match?({:win32, _}, :os.type())
+
+  # mklink is a cmd built-in; give it native separators even when the fixture
+  # built the path with Path.join/Path.expand.
+  defp windows_path(path), do: String.replace(path, "/", "\\")
+
+  defp describe_errno(reason), do: "#{reason} (#{:file.format_error(reason)})"
 
   def write_workflow_file!(path, overrides \\ []) do
     workflow = workflow_content(overrides)

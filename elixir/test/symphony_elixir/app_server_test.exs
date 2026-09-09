@@ -3,6 +3,10 @@ defmodule SymphonyElixir.AppServerTest do
 
   alias SymphonyElixir.TestSupport.FakeSSH
 
+  # Symlink escape coverage runs with a real symlink when the host allows it and
+  # with a directory junction otherwise; only an unavailable prerequisite skips it.
+  @symlink_fixture_skip symlink_fixture_skip_reason()
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -41,6 +45,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  @tag skip: @symlink_fixture_skip
   test "app server rejects symlink escape cwd paths under the workspace root" do
     test_root =
       Path.join(
@@ -51,11 +56,14 @@ defmodule SymphonyElixir.AppServerTest do
     try do
       workspace_root = Path.join(test_root, "workspaces")
       outside_workspace = Path.join(test_root, "outside")
-      symlink_workspace = Path.join(workspace_root, "MT-1000")
+      # The guard reports the expanded cwd, so keep the fixture path in that
+      # canonical form; otherwise the pin below only holds where Path.expand does
+      # not change separators or drive-letter case.
+      symlink_workspace = Path.expand(Path.join(workspace_root, "MT-1000"))
 
       File.mkdir_p!(workspace_root)
       File.mkdir_p!(outside_workspace)
-      File.ln_s!(outside_workspace, symlink_workspace)
+      link_dir_fixture!(outside_workspace, symlink_workspace)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root
@@ -74,7 +82,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert {:error, {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _root}} =
                AppServer.run(symlink_workspace, "guard", issue)
     after
-      File.rm_rf(test_root)
+      remove_dir_link_fixtures!(test_root)
     end
   end
 
