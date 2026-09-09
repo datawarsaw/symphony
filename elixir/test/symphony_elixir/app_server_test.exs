@@ -4,11 +4,90 @@ defmodule SymphonyElixir.AppServerTest do
   alias SymphonyElixir.Codex.WorkerEnvironment
   alias SymphonyElixir.TestSupport.FakeSSH
 
-  # Symlink escape coverage runs with a real symlink when the host allows it and
-  # with a directory junction otherwise; only an unavailable prerequisite skips it.
-  @symlink_fixture_skip symlink_fixture_skip_reason()
+ # Symlink escape coverage runs with a real symlink when the host allows it and
+ # with a directory junction otherwise; only an unavailable prerequisite skips it.
+ @symlink_fixture_skip symlink_fixture_skip_reason()
 
-  test "app server rejects the workspace root and paths outside workspace root" do
+ test "local shell resolution failure is returned before app-server initialization" do
+   root = Path.join(System.tmp_dir!(), "symphony-shell-#{System.unique_integer([:positive])}")
+   workspace = Path.join(root, "issue")
+   missing_shell = Path.join(root, "missing-bash.exe")
+   File.mkdir_p!(workspace)
+
+   try do
+     write_workflow_file!(Workflow.workflow_file_path(),
+       workspace_root: root,
+       codex_shell_executable: missing_shell
+     )
+
+     assert {:error, {:local_shell_unusable, ^missing_shell, _}} =
+              AppServer.start_session(workspace)
+   after
+     File.rm_rf(root)
+   end
+ end
+
+ test "local launch reaches app-server startup even when PATH has WSL launcher first" do
+   test_root =
+     Path.join(
+       System.tmp_dir!(),
+       "symphony-elixir-app-server-wsl-path-#{System.unique_integer([:positive])}"
+     )
+
+   previous_path = System.get_env("PATH")
+
+   on_exit(fn ->
+     restore_env("PATH", previous_path)
+   end)
+
+   try do
+     System.put_env("PATH", "C:\\Windows\\System32;" <> (previous_path || ""))
+
+     workspace_root = Path.join(test_root, "workspaces")
+     workspace = Path.join(workspace_root, "MT-WSL-PATH")
+     codex_binary = Path.join(test_root, "fake-codex")
+
+     File.mkdir_p!(workspace)
+
+     File.write!(codex_binary, """
+     #!/bin/sh
+     count=0
+     while IFS= read -r line; do
+       count=$((count + 1))
+       case "$count" in
+         1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+         2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-wsl-path"}}}' ;;
+         3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-wsl-path"}}}' ;;
+         4) printf '%s\\n' '{"method":"turn/completed"}'; exit 0 ;;
+         *) exit 0 ;;
+       esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{String.replace(codex_binary, "\\", "/")} app-server"
+    )
+
+    issue = %Issue{
+       id: "issue-wsl-path",
+       identifier: "MT-WSL-PATH",
+       title: "Run with WSL first on PATH",
+       description: "Validate Git Bash selection over WSL launcher",
+       state: "In Progress",
+       url: "https://example.org/issues/MT-WSL-PATH",
+       labels: ["backend"]
+     }
+
+     assert {:ok, _result} = AppServer.run(workspace, "Run worker", issue)
+   after
+     File.rm_rf(test_root)
+   end
+ end
+
+ test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
         System.tmp_dir!(),

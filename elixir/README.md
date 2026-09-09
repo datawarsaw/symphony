@@ -145,6 +145,8 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+  # Optional local shell override. On Windows, the default launcher prefers Git Bash.
+  # shell_executable: C:/Program Files/Git/bin/bash.exe
 ---
 
 You are working on an issue from the configured tracker {{ issue.identifier }}.
@@ -167,6 +169,10 @@ Notes:
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
+- `codex.shell_executable` optionally selects the local shell used to launch Codex. On Windows,
+  Symphony automatically prefers Git Bash and will not fall back to `C:\\Windows\\System32\\bash.exe`
+  (the WSL launcher) unless explicitly configured and usable. Set this to an absolute shell path
+  when your Git installation is nonstandard.
 - Local Windows workers receive absolute workspace-rooted BEAM paths before Codex starts:
   `MIX_BUILD_PATH=.mix_build`, `MIX_DEPS_PATH=.mix_deps`, `HEX_HOME=.hex`, `MIX_HOME=.mix`,
   `TMPDIR`/`TEMP`/`TMP=.tmp`, `ELIXIR_MAKE_CACHE_DIR=.elixir_make`, `REBAR_CACHE_DIR=.rebar_cache`

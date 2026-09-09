@@ -205,31 +205,28 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil, dynamic_tool_binding) do
-    executable = System.find_executable("bash")
+ defp start_port(workspace, nil, dynamic_tool_binding) do
+   with {:ok, executable} <- SymphonyElixir.Codex.LocalShell.resolve(Config.settings!().codex.shell_executable),
+        {:ok, worker_environment} <- WorkerEnvironment.prepare(workspace) do
+       port =
+         Port.open(
+           {:spawn_executable, String.to_charlist(executable)},
+           [
+             :binary,
+             :exit_status,
+             :stderr_to_stdout,
+             args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, worker_environment))],
+             cd: String.to_charlist(workspace),
+             env: worker_environment ++ tracker_secret_port_env(dynamic_tool_binding),
+             line: @port_line_bytes
+           ]
+         )
 
-    if is_nil(executable) do
-      {:error, :bash_not_found}
-    else
-      with {:ok, worker_environment} <- WorkerEnvironment.prepare(workspace) do
-        port =
-          Port.open(
-            {:spawn_executable, String.to_charlist(executable)},
-            [
-              :binary,
-              :exit_status,
-              :stderr_to_stdout,
-              args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, worker_environment))],
-              cd: String.to_charlist(workspace),
-              env: worker_environment ++ tracker_secret_port_env(dynamic_tool_binding),
-              line: @port_line_bytes
-            ]
-          )
-
-        {:ok, port}
-      end
-    end
-  end
+       {:ok, port}
+   end
+ rescue
+   error -> {:error, {:local_shell_start_failed, Exception.message(error)}}
+ end
 
   defp start_port(workspace, worker_host, dynamic_tool_binding) when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace, dynamic_tool_binding)

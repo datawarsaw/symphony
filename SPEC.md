@@ -474,8 +474,15 @@ fields locally if they want stricter startup checks.
 
 - `command` (string shell command)
   - Default: `codex app-server`
-  - The runtime launches this command via `bash -lc` in the workspace directory.
+  - The runtime launches this command through the selected local shell with `-lc` in the workspace
+    directory.
   - The launched process MUST speak a compatible app-server protocol over stdio.
+- `shell_executable` (optional string local shell executable)
+  - When supplied, use this executable for local app-server launches.
+  - On Windows, an implementation SHOULD prefer a verified Git Bash installation when this field
+    is omitted. It MUST NOT silently select `C:\\Windows\\System32\\bash.exe` without validating a
+    usable WSL distribution, and it SHOULD report a shell-resolution failure before a downstream
+    app-server pipe error.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
 - `thread_sandbox` (Codex `SandboxMode` value)
@@ -625,6 +632,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
+- `codex.shell_executable`: optional local shell executable override
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
@@ -968,13 +976,15 @@ Protocol source of truth:
 Subprocess launch parameters:
 
 - Command: `codex.command`
-- Invocation: `bash -lc <codex.command>`
+- Invocation: `<selected-shell> -lc <codex.command>`
 - Working directory: workspace path
 - Transport/framing: the protocol transport required by the targeted Codex app-server version
 
 Notes:
 
-- The default command is `codex app-server`.
+- The default command is `codex app-server`. On Windows, the default local shell resolver prefers
+  Git Bash; it must fail with a shell-resolution diagnostic when no usable POSIX-compatible shell
+  is available.
 - The Elixir implementation gives local Windows workers absolute workspace-local build,
   dependency, Mix/Hex home, native artifact cache, and temporary directories before launching
   Codex, and reports the environment variable and path when setup fails. This does not change TLS
