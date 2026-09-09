@@ -36,7 +36,8 @@ defmodule SymphonyElixir.Workspace do
            issue_context = Map.put(issue_context, :repository_route, route),
            {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
+           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
+           :ok <- verify_reused_workspace_repository(workspace, route, created?, worker_host) do
         case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
           :ok ->
             {:ok, workspace, route}
@@ -820,6 +821,79 @@ defmodule SymphonyElixir.Workspace do
   defp sync_source_baseline(%RepositoryRouter.Route{}, _issue_context, worker_host)
        when is_binary(worker_host),
        do: :ok
+
+  # A reused workspace is trusted only after its Git repository identity matches the
+  # selected route's source repository. A freshly created workspace is prepared from that
+  # source by the after_create hook, so it needs no re-verification. Unrouted issues keep
+  # their historical reuse behavior.
+  defp verify_reused_workspace_repository(_workspace, _route, true, _worker_host), do: :ok
+  defp verify_reused_workspace_repository(_workspace, nil, _created?, _worker_host), do: :ok
+
+  defp verify_reused_workspace_repository(workspace, %RepositoryRouter.Route{} = route, false, nil) do
+    case local_git_common_dir(workspace) do
+      {:ok, workspace_common_dir} ->
+        case local_git_common_dir(route.source_path) do
+          {:ok, source_common_dir} ->
+            if normalize_git_dir(workspace_common_dir) == normalize_git_dir(source_common_dir) do
+              :ok
+            else
+              {:error,
+               {:workspace_repository_mismatch, route.target, {:git_common_dir, workspace_common_dir, source_common_dir}}}
+            end
+
+          {:error, :git_read_failed} ->
+            {:error, {:workspace_repository_mismatch, route.target, :source_not_a_git_repository}}
+        end
+
+      {:error, :git_read_failed} ->
+        {:error, {:workspace_repository_mismatch, route.target, :workspace_not_a_git_repository}}
+    end
+  end
+
+  # Remote worker hosts keep their historical reuse behavior: the local Git identity probe
+  # cannot read a remote filesystem, and the configured worker fleet does not use remote
+  # reuse. Tightening this requires a remote identity probe and is tracked separately.
+  defp verify_reused_workspace_repository(_workspace, %RepositoryRouter.Route{}, false, worker_host)
+       when is_binary(worker_host),
+       do: :ok
+
+  defp local_git_common_dir(repo_path) when is_binary(repo_path) do
+    case System.cmd(
+           "git",
+           [
+             "-c",
+             "safe.directory=#{repo_path}",
+             "-C",
+             repo_path,
+             "rev-parse",
+             "--path-format=absolute",
+             "--git-common-dir"
+           ],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        case String.trim(output) do
+          "" ->
+            {:error, :git_read_failed}
+
+          common_dir ->
+            case PathSafety.canonicalize(common_dir) do
+              {:ok, canonical_common_dir} -> {:ok, canonical_common_dir}
+              {:error, _reason} -> {:error, :git_read_failed}
+            end
+        end
+
+      {_output, _status} ->
+        {:error, :git_read_failed}
+    end
+  end
+
+  defp normalize_git_dir(path) when is_binary(path) do
+    case :os.type() do
+      {:win32, _} -> path |> String.replace("\\", "/") |> String.downcase()
+      _ -> path
+    end
+  end
 
   defp repository_route_environment(%{
          repository_route: %RepositoryRouter.Route{} = route,
