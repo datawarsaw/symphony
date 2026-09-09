@@ -42,6 +42,9 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+On Windows, the reference implementation automatically prefers Git Bash for local Codex launches,
+so it does not depend on `PATH` ordering that can select the WSL `bash.exe` launcher.
+
 ---
 
 ## License

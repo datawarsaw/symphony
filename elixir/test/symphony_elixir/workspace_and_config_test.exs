@@ -1269,10 +1269,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert normalized_config_workspace_root == normalized_expected_workspace_root
     assert config.worker.max_concurrent_agents_per_host == nil
-    assert config.agent.max_concurrent_agents == 10
-    assert config.codex.command == "codex app-server"
+   assert config.agent.max_concurrent_agents == 10
+   assert config.codex.command == "codex app-server"
+   assert config.codex.shell_executable == nil
 
-    assert config.codex.approval_policy == %{
+   assert config.codex.approval_policy == %{
              "reject" => %{
                "sandbox_approval" => true,
                "rules" => true,
@@ -1311,10 +1312,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
     )
 
-    assert Config.settings!().codex.command ==
-             "codex --config 'model=\"gpt-5.5\"' app-server"
+   assert Config.settings!().codex.command ==
+            "codex --config 'model=\"gpt-5.5\"' app-server"
 
-    explicit_root =
+   write_workflow_file!(Workflow.workflow_file_path(),
+     codex_shell_executable: "C:/Program Files/Git/bin/bash.exe"
+   )
+
+   assert Config.settings!().codex.shell_executable == "C:/Program Files/Git/bin/bash.exe"
+
+   explicit_root =
       Path.join(
         System.tmp_dir!(),
         "symphony-elixir-explicit-sandbox-root-#{System.unique_integer([:positive])}"
@@ -1365,11 +1372,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.read_timeout_ms"
 
-    write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: "bad")
-    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "codex.stall_timeout_ms"
+   write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: "bad")
+   assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+   assert message =~ "codex.stall_timeout_ms"
 
-    write_workflow_file!(Workflow.workflow_file_path(),
+   write_workflow_file!(Workflow.workflow_file_path(), codex_shell_executable: 123)
+   assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+   assert message =~ "codex.shell_executable"
+
+   write_workflow_file!(Workflow.workflow_file_path(), codex_shell_executable: "   ")
+   assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+   assert message =~ "codex.shell_executable"
+
+   write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},
       tracker_terminal_states: %{done: true},
       poll_interval_ms: %{bad: true},

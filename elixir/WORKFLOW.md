@@ -73,6 +73,8 @@ discovery:
   skill_path: C:/AI/code-skills/discovery-gate/SKILL.md
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
+  # Optional local shell override; Windows otherwise automatically prefers Git Bash.
+  # shell_executable: C:/Program Files/Git/bin/bash.exe
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
