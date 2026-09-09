@@ -72,7 +72,9 @@ discovery:
   enabled: false
   skill_path: C:/AI/code-skills/discovery-gate/SKILL.md
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
+  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-6-astra"' --config model_reasoning_effort=medium app-server
+  default_model: gpt-6-astra
+  default_reasoning_effort: medium
   # Optional local shell override; Windows otherwise automatically prefers Git Bash.
   # shell_executable: C:/Program Files/Git/bin/bash.exe
   approval_policy: never

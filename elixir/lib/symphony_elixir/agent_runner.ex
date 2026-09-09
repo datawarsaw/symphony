@@ -111,7 +111,9 @@ defmodule SymphonyElixir.AgentRunner do
       max_turns: Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     }
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    session_opts = [worker_host: worker_host, issue: issue] ++ opts
+
+    with {:ok, session} <- AppServer.start_session(workspace, session_opts) do
       try do
         do_run_codex_turns(session, issue, 1, context)
       after
@@ -139,7 +141,9 @@ defmodule SymphonyElixir.AgentRunner do
              issue,
              on_message: codex_message_handler(codex_update_recipient, issue)
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      Logger.info(
+        "Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} model=#{turn_session[:model]} reasoning_effort=#{turn_session[:reasoning_effort]} route_source=#{turn_session[:route_source]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}"
+      )
 
       case continue_with_issue?(issue, issue_state_fetcher) do
         {:continue, refreshed_issue} when turn_number < max_turns ->

@@ -231,7 +231,7 @@ hooks:
   after_create: |
     git clone --depth 1 "$SOURCE_REPO_URL" .
 codex:
-  command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
+  command: "$CODEX_BIN --config 'model=\"gpt-6-astra\"' --config model_reasoning_effort=medium app-server"
 ```
 
 For a multi-repository workflow, configure explicit local sources and use the exported route
