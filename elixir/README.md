@@ -167,6 +167,17 @@ Notes:
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
+- Local Windows workers receive absolute workspace-rooted BEAM paths before Codex starts:
+  `MIX_BUILD_PATH=.mix_build`, `MIX_DEPS_PATH=.mix_deps`, `HEX_HOME=.hex`, `MIX_HOME=.mix`,
+  `TMPDIR`/`TEMP`/`TMP=.tmp`, `ELIXIR_MAKE_CACHE_DIR=.elixir_make`, `REBAR_CACHE_DIR=.rebar_cache`
+  and `REBAR_GLOBAL_CONFIG_DIR=.rebar_config`, each rooted at the issue workspace. Symphony
+  creates and checks these directories, then applies the values after Bash profile loading so a
+  host profile cannot point the worker back at ambient build, dependency or temporary directories.
+  Absolute paths keep dependency subprocesses inside the workspace when their working directory
+  changes. Setup failures report the environment variable, path, and filesystem reason. Linux,
+  macOS, and SSH workers keep their existing environment. TLS verification and the configured
+  sandbox policy are unchanged; an installation that needs a custom trusted CA bundle should
+  provide `HEX_CACERTS_PATH` rather than disabling verification.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex

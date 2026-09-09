@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Codex.WorkerEnvironment
   alias SymphonyElixir.TestSupport.FakeSSH
 
   # Symlink escape coverage runs with a real symlink when the host allows it and
@@ -1439,6 +1440,7 @@ defmodule SymphonyElixir.AppServerTest do
       export LINEAR_API_KEY='profile-canonical-secret-that-must-not-reach-child'
       export #{custom_secret_env}='profile-custom-secret-that-must-not-reach-child'
       export #{profile_marker_env}=1
+      export MIX_BUILD_PATH='profile-build-path'
       """)
 
       System.put_env("LINEAR_API_KEY", "canonical-secret-that-must-not-reach-child")
@@ -1452,6 +1454,7 @@ defmodule SymphonyElixir.AppServerTest do
       printf 'PROFILE_LOADED:%s\n' "$#{profile_marker_env}" >> "$trace_file"
       printf 'CANONICAL_SECRET:%s\n' "$LINEAR_API_KEY" >> "$trace_file"
       printf 'CUSTOM_SECRET:%s\n' "$#{custom_secret_env}" >> "$trace_file"
+      printf 'MIX_BUILD_PATH:%s\n' "$MIX_BUILD_PATH" >> "$trace_file"
       count=0
 
       while IFS= read -r line; do
@@ -1501,6 +1504,140 @@ defmodule SymphonyElixir.AppServerTest do
       assert File.read!(trace_file) =~ "CANONICAL_SECRET:\n"
       assert File.read!(trace_file) =~ "CUSTOM_SECRET:\n"
       refute File.read!(trace_file) =~ "secret-that-must-not-reach-child"
+      # Non-Windows workers keep their ambient environment: a Bash profile value
+      # survives. The Windows workspace-rooted override is covered separately.
+      assert File.read!(trace_file) =~ "MIX_BUILD_PATH:profile-build-path\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  @tag skip: if(:os.type() == {:win32, :nt}, do: false, else: "Windows-only worker environment")
+  test "app server gives local Windows workers workspace-rooted BEAM paths" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-worker-environment-#{System.unique_integer([:positive])}"
+      )
+
+    previous_home = System.get_env("HOME")
+    previous_trace = System.get_env("SYMP_TEST_WORKER_ENV_TRACE")
+
+    on_exit(fn ->
+      restore_env("HOME", previous_home)
+      restore_env("SYMP_TEST_WORKER_ENV_TRACE", previous_trace)
+    end)
+
+    try do
+      bash_home = Path.join(test_root, "bash-home")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-WORKER-ENV")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "worker-environment.trace")
+
+      File.mkdir_p!(bash_home)
+      File.mkdir_p!(workspace)
+
+      # A host profile must not be able to point the worker back at ambient paths.
+      File.write!(Path.join(bash_home, ".bash_profile"), """
+      export MIX_BUILD_PATH='profile-build-path'
+      export TMPDIR='profile-temp-path'
+      """)
+
+      System.put_env("HOME", bash_home)
+      System.put_env("SYMP_TEST_WORKER_ENV_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="$SYMP_TEST_WORKER_ENV_TRACE"
+
+      for name in MIX_BUILD_PATH MIX_DEPS_PATH HEX_HOME MIX_HOME ELIXIR_MAKE_CACHE_DIR REBAR_CACHE_DIR REBAR_GLOBAL_CONFIG_DIR TMPDIR TEMP TMP; do
+        printf '%s:%s\\n' "$name" "$(printenv "$name")" >> "$trace_file"
+      done
+
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-worker-env"}}}' ;;
+          3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-worker-env"}}}' ;;
+          4) printf '%s\\n' '{"method":"turn/completed"}'; exit 0 ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      # The launcher runs the configured command through `bash -lc`, so the
+      # command path must be bash-compatible on Windows.
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{String.replace(codex_binary, "\\", "/")} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-worker-environment",
+        identifier: "MT-WORKER-ENV",
+        title: "Root BEAM paths in the workspace",
+        description: "Ensure Windows workers keep Mix/Hex/temp state inside the issue workspace",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-WORKER-ENV",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Root BEAM paths", issue)
+      assert {:ok, worker_environment} = WorkerEnvironment.prepare(workspace)
+
+      for {name, value} <- worker_environment do
+        assert File.read!(trace_file) =~ "#{name}:#{value}\n"
+      end
+
+      refute File.read!(trace_file) =~ "profile-build-path"
+      refute File.read!(trace_file) =~ "profile-temp-path"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  @tag skip: if(:os.type() == {:win32, :nt}, do: false, else: "Windows-only worker environment")
+  test "app server reports the workspace BEAM path that failed for a Windows worker" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-worker-environment-failure-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-WORKER-ENV-FAIL")
+      collision = Path.join(workspace, ".mix_build")
+
+      File.mkdir_p!(workspace)
+      File.write!(collision, "not a directory")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root
+      )
+
+      issue = %Issue{
+        id: "issue-worker-environment-failure",
+        identifier: "MT-WORKER-ENV-FAIL",
+        title: "Report the failing BEAM path",
+        description: "Ensure setup failures name the environment variable and path",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-WORKER-ENV-FAIL",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:workspace_beam_environment_failed, "MIX_BUILD_PATH", path, reason}} =
+               AppServer.run(workspace, "Root BEAM paths", issue)
+
+      assert Path.basename(path) == ".mix_build"
+      assert reason in [:eexist, :enotdir]
     after
       File.rm_rf(test_root)
     end

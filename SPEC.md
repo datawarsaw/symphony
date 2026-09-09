@@ -975,6 +975,10 @@ Subprocess launch parameters:
 Notes:
 
 - The default command is `codex app-server`.
+- The Elixir implementation gives local Windows workers absolute workspace-local build,
+  dependency, Mix/Hex home, native artifact cache, and temporary directories before launching
+  Codex, and reports the environment variable and path when setup fails. This does not change TLS
+  verification or the configured sandbox policy.
 - Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
   using fields supported by the targeted Codex app-server version.
 
