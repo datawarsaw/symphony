@@ -17,14 +17,14 @@ defmodule SymphonyElixir.Workspace do
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
     case create_for_issue_with_route(issue_or_identifier, worker_host) do
-      {:ok, workspace, _route} -> {:ok, workspace}
+      {:ok, workspace, _route, _workspace_root} -> {:ok, workspace}
       {:error, _reason} = error -> error
     end
   end
 
   @doc false
   @spec create_for_issue_with_route(map() | String.t() | nil, worker_host()) ::
-          {:ok, Path.t(), RepositoryRouter.Route.t() | nil} | {:error, term()}
+          {:ok, Path.t(), RepositoryRouter.Route.t() | nil, Path.t() | nil} | {:error, term()}
   def create_for_issue_with_route(issue_or_identifier, worker_host \\ nil) do
     issue_context = issue_context(issue_or_identifier)
 
@@ -36,11 +36,12 @@ defmodule SymphonyElixir.Workspace do
            issue_context = Map.put(issue_context, :repository_route, route),
            {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
+           {:ok, workspace, created?, recorded_root} <-
+             ensure_workspace(workspace, worker_host, creation_workspace_root(worker_host)),
            :ok <- verify_reused_workspace_repository(workspace, route, created?, worker_host) do
         case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
           :ok ->
-            {:ok, workspace, route}
+            {:ok, workspace, route, recorded_root}
 
           {:error, _reason} = error ->
             cleanup_failed_new_workspace(workspace, created?, worker_host)
@@ -54,25 +55,43 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, nil) do
+  # The trusted deletion boundary for a workspace is the root it was created under,
+  # captured here at creation time. Remote roots are resolved by the prepare script
+  # because the recorded workspace path is that host's canonical `pwd -P` output,
+  # which the control host cannot reproduce for `~`-relative or relative roots.
+  defp creation_workspace_root(nil), do: Config.local_workspace_root()
+
+  defp creation_workspace_root(worker_host) when is_binary(worker_host) do
+    Config.settings!().workspace.root
+  end
+
+  defp ensure_workspace(workspace, nil, workspace_root) do
     cond do
       File.dir?(workspace) ->
-        {:ok, workspace, false}
+        {:ok, workspace, false, workspace_root}
 
       File.exists?(workspace) ->
         File.rm_rf!(workspace)
-        create_workspace(workspace)
+        create_workspace(workspace, workspace_root)
 
       true ->
-        create_workspace(workspace)
+        create_workspace(workspace, workspace_root)
     end
   end
 
-  defp ensure_workspace(workspace, worker_host) when is_binary(worker_host) do
+  defp ensure_workspace(workspace, worker_host, workspace_root) when is_binary(worker_host) do
+    root_assign =
+      if is_binary(workspace_root) do
+        remote_shell_assign("workspace_root", workspace_root)
+      else
+        "workspace_root=''"
+      end
+
     script =
       [
         "set -eu",
         remote_shell_assign("workspace", workspace),
+        root_assign,
         "if [ -d \"$workspace\" ]; then",
         "  created=0",
         "elif [ -e \"$workspace\" ]; then",
@@ -84,7 +103,8 @@ defmodule SymphonyElixir.Workspace do
         "  created=1",
         "fi",
         "cd \"$workspace\"",
-        "printf '%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$created\" \"$(pwd -P)\""
+        "resolved_workspace_root=$(cd \"$workspace_root\" 2>/dev/null && pwd -P) || resolved_workspace_root=\"$workspace_root\"",
+        "printf '%s\\t%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$created\" \"$(pwd -P)\" \"$resolved_workspace_root\""
       ]
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n")
@@ -101,10 +121,10 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp create_workspace(workspace) do
+  defp create_workspace(workspace, workspace_root) do
     File.rm_rf!(workspace)
     File.mkdir_p!(workspace)
-    {:ok, workspace, true}
+    {:ok, workspace, true, workspace_root}
   end
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
@@ -151,9 +171,19 @@ defmodule SymphonyElixir.Workspace do
 
   @doc false
   @spec remove_recorded(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove_recorded(workspace, nil) when is_binary(workspace) do
+  def remove_recorded(workspace, worker_host), do: remove_recorded(workspace, worker_host, nil)
+
+  # Recorded cleanup is the only removal path that acts on a path stored outside the
+  # caller's control, so it must prove containment in the workspace root that was active
+  # when the workspace was created. `recorded_root` is that root; when it is unavailable
+  # the current configured root is the boundary instead. Nothing touches the workspace -
+  # no `before_remove` hook and no recursive deletion - until containment holds.
+  @doc false
+  @spec remove_recorded(Path.t(), worker_host(), Path.t() | nil) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded(workspace, nil, recorded_root) when is_binary(workspace) do
     if Path.type(workspace) == :absolute do
-      case validate_recorded_workspace_path(workspace) do
+      case validate_local_workspace_path(workspace, trusted_local_workspace_root(recorded_root)) do
         :ok ->
           remove_local_workspace(workspace)
 
@@ -165,11 +195,18 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  def remove_recorded(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
-    remove(workspace, worker_host)
+  def remove_recorded(workspace, worker_host, recorded_root)
+      when is_binary(workspace) and is_binary(worker_host) do
+    case validate_remote_workspace_path(workspace, trusted_remote_workspace_root(recorded_root)) do
+      :ok ->
+        remove(workspace, worker_host)
+
+      {:error, reason} ->
+        {:error, reason, ""}
+    end
   end
 
-  def remove_recorded(workspace, _worker_host) do
+  def remove_recorded(workspace, _worker_host, _recorded_root) do
     {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
   end
 
@@ -677,8 +714,33 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp validate_recorded_workspace_path(workspace) when is_binary(workspace) do
-    validate_local_workspace_path(workspace, Path.dirname(workspace))
+  # Trusted deletion boundary for recorded cleanup: the root the workspace was created
+  # under whenever that root was recorded, otherwise the current configured root. The
+  # recorded root is preferred because WORKFLOW.md may have moved the active root since
+  # the workspace was created, and that move must not silently retarget deletion.
+  defp trusted_local_workspace_root(recorded_root) when is_binary(recorded_root) do
+    case String.trim(recorded_root) do
+      "" -> Config.local_workspace_root()
+      root -> root
+    end
+  end
+
+  defp trusted_local_workspace_root(_recorded_root), do: Config.local_workspace_root()
+
+  defp trusted_remote_workspace_root(recorded_root) when is_binary(recorded_root) do
+    case String.trim(recorded_root) do
+      "" -> configured_remote_workspace_root()
+      root -> root
+    end
+  end
+
+  defp trusted_remote_workspace_root(_recorded_root), do: configured_remote_workspace_root()
+
+  defp configured_remote_workspace_root do
+    case Config.settings!().workspace.root do
+      root when is_binary(root) -> root
+      _ -> nil
+    end
   end
 
   defp validate_local_workspace_path(workspace, workspace_root)
@@ -710,6 +772,79 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  # Remote containment is decided on the path strings themselves. The recorded workspace
+  # and the recorded root are both the worker host's canonical `pwd -P` output, and this
+  # control host cannot resolve another machine's filesystem, so comparing the
+  # already-canonical remote paths is the honest test. Shell escaping is not containment:
+  # anything that cannot be proven to sit strictly inside the trusted root is rejected
+  # before the hook or `rm -rf` command is built. A `~`-relative trusted root is rejected
+  # for the same reason: matching the root's tail segments against an unresolved home
+  # directory would accept paths that are not provably inside it. Roots recorded by the
+  # prepare script are already `pwd -P` output, so this only fails closed for metadata
+  # that never carried a resolved root.
+  defp validate_remote_workspace_path(workspace, workspace_root)
+       when is_binary(workspace) and is_binary(workspace_root) do
+    cond do
+      String.trim(workspace) == "" ->
+        {:error, {:workspace_path_unreadable, workspace, :empty}}
+
+      String.contains?(workspace, ["\n", "\r", <<0>>]) ->
+        {:error, {:workspace_path_unreadable, workspace, :invalid_characters}}
+
+      not absolute_posix_path?(workspace) ->
+        {:error, {:workspace_path_unreadable, workspace, :not_absolute}}
+
+      not absolute_posix_path?(workspace_root) ->
+        {:error, {:workspace_path_unreadable, workspace_root, :not_absolute}}
+
+      true ->
+        remote_containment_result(normalize_posix_path(workspace), normalize_posix_path(workspace_root))
+    end
+  end
+
+  defp validate_remote_workspace_path(workspace, _workspace_root) when is_binary(workspace) do
+    {:error, {:workspace_path_unreadable, workspace, :invalid}}
+  end
+
+  defp remote_containment_result(workspace, workspace_root) do
+    root_prefix = if String.ends_with?(workspace_root, "/"), do: workspace_root, else: workspace_root <> "/"
+
+    cond do
+      workspace == workspace_root ->
+        {:error, {:workspace_equals_root, workspace, workspace_root}}
+
+      String.starts_with?(workspace, root_prefix) ->
+        :ok
+
+      true ->
+        {:error, {:workspace_outside_root, workspace, workspace_root}}
+    end
+  end
+
+  defp absolute_posix_path?(path) when is_binary(path) do
+    String.starts_with?(path, "/")
+  end
+
+  defp normalize_posix_path(path) when is_binary(path) do
+    path_without_base = String.trim_leading(path, "/")
+
+    segments =
+      path_without_base
+      |> String.split("/", trim: true)
+      |> Enum.reduce([], fn
+        ".", segments -> segments
+        "..", [] -> []
+        "..", [_dropped | rest] -> rest
+        segment, segments -> [segment | segments]
+      end)
+      |> Enum.reverse()
+
+    case segments do
+      [] -> "/"
+      segs -> "/" <> Enum.join(segs, "/")
+    end
+  end
+
   defp remote_shell_assign(variable_name, raw_path)
        when is_binary(variable_name) and is_binary(raw_path) do
     [
@@ -727,9 +862,13 @@ defmodule SymphonyElixir.Workspace do
 
     payload =
       Enum.find_value(lines, fn line ->
-        case String.split(line, "\t", parts: 3) do
+        case String.split(line, "\t") do
           [@remote_workspace_marker, created, path] when created in ["0", "1"] and path != "" ->
-            {created == "1", path}
+            {created == "1", path, nil}
+
+          [@remote_workspace_marker, created, path, root]
+          when created in ["0", "1"] and path != "" ->
+            {created == "1", path, normalize_recorded_root(root)}
 
           _ ->
             nil
@@ -737,11 +876,20 @@ defmodule SymphonyElixir.Workspace do
       end)
 
     case payload do
-      {created?, workspace} when is_boolean(created?) and is_binary(workspace) ->
-        {:ok, workspace, created?}
+      {created?, workspace, recorded_root} when is_boolean(created?) and is_binary(workspace) ->
+        {:ok, workspace, created?, recorded_root}
 
       _ ->
         {:error, {:workspace_prepare_failed, :invalid_output, output}}
+    end
+  end
+
+  # The prepare script reports the trusted root it resolved on the worker host. An older
+  # or truncated marker line leaves it empty, which callers treat as "no recorded root".
+  defp normalize_recorded_root(root) when is_binary(root) do
+    case String.trim(root) do
+      "" -> nil
+      trimmed -> trimmed
     end
   end
 

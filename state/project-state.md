@@ -91,3 +91,58 @@ No task-specific Linear issue ID was supplied or confidently identified for this
 Detailed run evidence is retained at
 `C:/AI/reviews/symphony-discovery-20260907-01a07d63`.
 See `docs/discovery-worker-lane.md` for configuration, lifecycle and evidence recovery.
+
+
+## MIC-221 recorded-workspace deletion boundary candidate — 2026-09-11
+
+Branch: `symphony/MIC-221`, base `3121a51c3787cba2b59cdea9e881875555649b29` ("MIC-225 use Bearer
+auth for GitLab requests"). Uncommitted implementation candidate in the issue worktree
+`C:/AI/symphony-workspaces/MIC-221`; the live runtime and the shared source checkout are unchanged.
+
+- Recorded-workspace cleanup now fails closed against an independently trusted deletion boundary
+  instead of `Path.dirname(workspace)`. A recorded path `W` may run `before_remove` and recursive
+  deletion only when it is strictly contained within trusted root `R`, where `R` is the root recorded
+  when `W` was created, or the current configured root when no recorded root exists.
+  `workspace == root` and out-of-root paths are rejected.
+- `Workspace.create_for_issue_with_route/2` returns the resolved creation root; the remote prepare
+  script reports a canonicalized (`pwd -P`) root as a fourth TAB field; the recorded root travels
+  through AgentRunner worker runtime metadata and Orchestrator running/blocked/retry state into
+  `Workspace.remove_recorded/3`. This is a metadata-only addition to existing lifecycle state.
+- Local validation canonicalizes root and workspace, rejects equality, requires a strict
+  `root <> "/"` prefix, and retains symlink/junction/reparse escape protection
+  (`:workspace_symlink_escape`). Remote validation is lexical over POSIX path strings (empty,
+  control-character and non-absolute paths rejected) and never treats shell escaping as containment.
+  Validation precedes hook execution and `File.rm_rf`/`rm -rf`.
+- Deliberate hardening: a recorded or configured root that is not an absolute, resolved path fails
+  closed to `{:workspace_outside_root, ...}` rather than falling back to prefix/substring trust.
+  The prepare script resolves a `~` root with `pwd -P`, so this only rejects metadata that lacks a
+  resolved root.
+- Unchanged and intentional: cleanup of old-root workspaces after a configuration reload,
+  current-root cleanup, workspace reuse, canonicalization, Windows junction safety, SSH support,
+  retry semantics beyond metadata propagation, Human Acceptance and review/delivery policy.
+  `Workspace.remove/2`'s remote clause remains implicitly bound to the current configured root.
+
+Verified on this candidate (Windows, Elixir 1.19.5 / OTP 28, unstaged worktree):
+
+- `mix compile --warnings-as-errors` passes (only the benign Phoenix LiveView `:eperm`
+  `node_modules` symlink warning).
+- `mix specs.check` passes.
+- `mix test test/symphony_elixir/workspace_and_config_test.exs` gives 65 tests, 2 failures. Both are
+  the pre-existing Windows baseline failures for this file (baseline 61 tests, the same 2: `:1627`
+  env-backed `$VAR` path expansion and `:14` after_create clone path mangling).
+- `mix test test/symphony_elixir/core_test.exs:629 test/symphony_elixir/core_test.exs:552` gives 2
+  tests, 0 failures (old-root terminal cleanup and cross-root proofs).
+- `mix test test/symphony_elixir/ssh_test.exs` gives 8 tests, 0 failures.
+- `mix test test/symphony_elixir/core_test.exs` gives 52 tests, 7 failures. An untouched-HEAD copy
+  of the same tree on this host produces the identical 52 tests and the identical 7 failing test
+  names (`workspace_hook_failed` Git-Bash `cp` path mangling, and MIC-164 `:epipe`); the
+  only difference is a one-line offset from this candidate's single added test line.
+- `mix format --check-formatted` on the touched files still reports only pre-existing unstaged
+  deviations that are byte-identical to HEAD's changed-line text set, so this candidate adds no
+  new formatter deviation.
+- `git diff --check` passes.
+
+No commit, push, PR, merge or deployment was performed; nothing in this entry is a deployed runtime
+change. The uncommitted diff (5 Elixir files, +429/-34) remains for independent review. Windows
+launcher failures remain MIC-164; Elixir test logs are retained under `%TEMP%/mic221-h-*.log` and
+`%TEMP%/mic221-head-corefull.log`.

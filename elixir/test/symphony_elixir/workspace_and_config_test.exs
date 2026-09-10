@@ -234,12 +234,171 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                SymphonyElixir.PathSafety.canonicalize(recorded_root)
 
       assert {:error, {:workspace_symlink_escape, ^recorded_workspace, ^canonical_recorded_root}, ""} =
-               Workspace.remove_recorded(recorded_workspace, nil)
+               Workspace.remove_recorded(recorded_workspace, nil, recorded_root)
 
       refute File.exists?(hook_marker)
       assert File.exists?(outside_root)
     after
       remove_dir_link_fixtures!(test_root)
+    end
+  end
+
+  test "recorded workspace removal enforces trusted root containment for local workspaces" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-local-containment-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      trusted_root = Path.join(test_root, "trusted-root")
+      outside_dir = Path.join(test_root, "outside")
+      sibling_dir = Path.join(test_root, "sibling")
+      hook_marker = Path.join(test_root, "before-remove.log") |> String.replace("\\", "/")
+
+      File.mkdir_p!(trusted_root)
+      File.mkdir_p!(outside_dir)
+      File.mkdir_p!(sibling_dir)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: trusted_root,
+        hook_before_remove: "echo ran > #{hook_marker}"
+      )
+
+      assert {:ok, canonical_trusted_root} =
+               SymphonyElixir.PathSafety.canonicalize(trusted_root)
+
+      # 1. Arbitrary path outside trusted root is rejected; hook does not run; path not deleted
+      arbitrary_path = Path.expand(outside_dir)
+      assert {:ok, canonical_outside} = SymphonyElixir.PathSafety.canonicalize(arbitrary_path)
+
+      assert {:error, {:workspace_outside_root, ^canonical_outside, ^canonical_trusted_root}, ""} =
+               Workspace.remove_recorded(arbitrary_path, nil, trusted_root)
+
+      refute File.exists?(hook_marker)
+      assert File.exists?(outside_dir)
+
+      # 2. Parent/sibling escape is rejected; hook does not run; path not deleted
+      sibling_escape = Path.expand(Path.join(trusted_root, "../sibling"))
+      assert {:ok, canonical_sibling} = SymphonyElixir.PathSafety.canonicalize(sibling_escape)
+
+      assert {:error, {:workspace_outside_root, ^canonical_sibling, ^canonical_trusted_root}, ""} =
+               Workspace.remove_recorded(sibling_escape, nil, trusted_root)
+
+      refute File.exists?(hook_marker)
+      assert File.exists?(sibling_dir)
+
+      # 2b. A sibling that merely extends the root name is rejected; hook does not run; path not deleted
+      cousin_dir = Path.join(test_root, "trusted-root-cousin")
+      File.mkdir_p!(cousin_dir)
+      cousin = Path.expand(cousin_dir)
+      assert {:ok, canonical_cousin} = SymphonyElixir.PathSafety.canonicalize(cousin)
+
+      assert {:error, {:workspace_outside_root, ^canonical_cousin, ^canonical_trusted_root}, ""} =
+               Workspace.remove_recorded(cousin, nil, trusted_root)
+
+      refute File.exists?(hook_marker)
+      assert File.exists?(cousin_dir)
+
+      # 3. Workspace equal to trusted root is rejected; hook does not run; root not deleted
+      assert {:error, {:workspace_equals_root, ^canonical_trusted_root, ^canonical_trusted_root}, ""} =
+               Workspace.remove_recorded(trusted_root, nil, trusted_root)
+
+      refute File.exists?(hook_marker)
+      assert File.dir?(trusted_root)
+
+      # 4. Valid workspace inside trusted root succeeds and deletes
+      valid_workspace = Path.join(trusted_root, "MT-VALID")
+      File.mkdir_p!(valid_workspace)
+      assert {:ok, _} = Workspace.remove_recorded(valid_workspace, nil, trusted_root)
+      refute File.exists?(valid_workspace)
+      assert File.exists?(hook_marker)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "recorded workspace removal enforces trusted root containment over SSH before hooks and deletion" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-remote-containment-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+    end)
+
+    try do
+      trace_file = Path.join(test_root, "ssh.trace")
+      remote_host = "worker-01:2200"
+      trusted_root = "/remote/workspaces"
+
+      File.mkdir_p!(test_root)
+      System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+
+      FakeSSH.install!(test_root, :trace, trace_file: trace_file)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: trusted_root,
+        worker_ssh_hosts: [remote_host],
+        hook_before_remove: "echo before-remove-remote"
+      )
+
+      # 1. Arbitrary path outside trusted root is rejected before hook and rm -rf
+      assert {:error, {:workspace_outside_root, "/etc/passwd", ^trusted_root}, ""} =
+               Workspace.remove_recorded("/etc/passwd", remote_host, trusted_root)
+
+      refute File.exists?(trace_file)
+
+      # 2. Parent/sibling escape is rejected before hook and rm -rf
+      assert {:error, {:workspace_outside_root, "/remote/outside", ^trusted_root}, ""} =
+               Workspace.remove_recorded("/remote/workspaces/../outside", remote_host, trusted_root)
+
+      refute File.exists?(trace_file)
+
+      # 3. Workspace equal to trusted root is rejected before hook and rm -rf
+      assert {:error, {:workspace_equals_root, ^trusted_root, ^trusted_root}, ""} =
+               Workspace.remove_recorded(trusted_root, remote_host, trusted_root)
+
+      refute File.exists?(trace_file)
+
+      # 3b. A path that merely extends the root name is rejected before hook and rm -rf
+      assert {:error, {:workspace_outside_root, "/remote/workspaces-evil/MT-X", ^trusted_root}, ""} =
+               Workspace.remove_recorded("/remote/workspaces-evil/MT-X", remote_host, trusted_root)
+
+      refute File.exists?(trace_file)
+
+      # 3c. A tilde-relative recorded root cannot prove containment, so cleanup fails closed
+      assert {:error, {:workspace_path_unreadable, "~/.symphony-remote-workspaces", :not_absolute}, ""} =
+               Workspace.remove_recorded(
+                 "/remote/home/.symphony-remote-workspaces/MT-SSH-WS",
+                 remote_host,
+                 "~/.symphony-remote-workspaces"
+               )
+
+      refute File.exists?(trace_file)
+
+      # 4. Valid remote workspace strictly contained in trusted root executes hook and rm -rf
+      valid_workspace = "/remote/workspaces/MT-SSH-OK"
+      assert {:ok, []} = Workspace.remove_recorded(valid_workspace, remote_host, trusted_root)
+
+      # 5. Without a recorded root the current configured root is the boundary
+      fallback_workspace = "/remote/workspaces/MT-SSH-FALLBACK"
+      assert {:ok, []} = Workspace.remove_recorded(fallback_workspace, remote_host, nil)
+      assert {:ok, []} = Workspace.remove_recorded(fallback_workspace, remote_host)
+
+      trace = File.read!(trace_file)
+      assert trace =~ "echo before-remove-remote"
+      assert trace =~ "rm -rf"
+      assert trace =~ valid_workspace
+      assert trace =~ fallback_workspace
+    after
+      File.rm_rf(test_root)
     end
   end
 
@@ -1950,6 +2109,76 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ "echo before-remove"
       assert trace =~ "rm -rf"
       assert trace =~ workspace_path
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "recorded removal preserves old-root cleanup after the configured root moves" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-recorded-old-root-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      old_root = Path.join(test_root, "old-workspaces")
+      new_root = Path.join(test_root, "new-workspaces")
+      hook_marker = Path.join(test_root, "hook-ran") |> String.replace("\\", "/")
+
+      File.mkdir_p!(old_root)
+      File.mkdir_p!(new_root)
+
+      old_workspace = Path.join(old_root, "MT-OLD")
+      File.mkdir_p!(old_workspace)
+
+      # The configured root moves after the workspace was recorded; the recorded
+      # root stays the trusted boundary, so cleanup still succeeds.
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: new_root,
+        hook_before_remove: "echo ran > #{hook_marker}"
+      )
+
+      assert {:ok, _} = Workspace.remove_recorded(old_workspace, nil, old_root)
+      refute File.exists?(old_workspace)
+      assert File.exists?(hook_marker)
+      assert File.dir?(new_root)
+
+      # Without a recorded root the current configured root is the boundary.
+      current_workspace = Path.join(new_root, "MT-CURRENT")
+      File.mkdir_p!(current_workspace)
+
+      assert {:ok, _} = Workspace.remove_recorded(current_workspace, nil, nil)
+      refute File.exists?(current_workspace)
+
+      arity_workspace = Path.join(new_root, "MT-ARITY")
+      File.mkdir_p!(arity_workspace)
+
+      assert {:ok, _} = Workspace.remove_recorded(arity_workspace, nil)
+      refute File.exists?(arity_workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace creation captures the trusted root used by recorded removal" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-recorded-capture-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      configured_root = Path.join(test_root, "workspaces")
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: configured_root)
+
+      assert {:ok, workspace, _route, recorded_root} =
+               Workspace.create_for_issue_with_route("MT-CAPTURE")
+
+      assert recorded_root == Config.local_workspace_root()
+      assert {:ok, _} = Workspace.remove_recorded(workspace, nil, recorded_root)
+      refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
