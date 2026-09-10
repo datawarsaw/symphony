@@ -49,8 +49,8 @@ defmodule SymphonyElixir.AgentRunner do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
     case Workspace.create_for_issue_with_route(issue, worker_host) do
-      {:ok, workspace, route} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+      {:ok, workspace, route, workspace_root} ->
+        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, workspace_root)
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host, route),
@@ -81,21 +81,22 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace, workspace_root)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
     send(
       recipient,
       {:worker_runtime_info, issue_id,
        %{
          worker_host: worker_host,
-         workspace_path: workspace
+         workspace_path: workspace,
+         workspace_root: workspace_root
        }}
     )
 
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _workspace_root), do: :ok
 
   defp log_workspace_provenance(issue, provenance) do
     Logger.info("Workspace provenance captured for #{issue_context(issue)} evidence=#{Jason.encode!(provenance)}")

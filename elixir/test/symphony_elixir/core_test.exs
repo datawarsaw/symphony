@@ -665,6 +665,7 @@ defmodule SymphonyElixir.CoreTest do
             identifier: issue_identifier,
             issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
             workspace_path: old_workspace,
+            workspace_root: old_root,
             started_at: DateTime.utc_now()
           }
         },
