@@ -1703,19 +1703,46 @@ API design notes:
 
 ### 14.3 Partial State Recovery (Restart)
 
-Current design is intentionally in-memory for scheduler state.
-Restart recovery means the service can resume useful operation by polling tracker state and reusing
-preserved workspaces. It does not mean retry timers, running sessions, or live worker state survive
-process restart.
+Current design is intentionally in-memory for scheduler state without durable database or ETS/DETS
+persistence. Restart recovery means the service recovers workspace ownership semantics, discovers
+surviving work for active issues, and deterministically resumes it rather than silently treating it as
+an unmarked first attempt.
 
-After restart:
+#### 14.3.1 Authority Hierarchy and Classification
 
-- No retry timers are restored from prior process memory.
-- No running sessions are assumed recoverable.
-- Service recovers by:
-  - startup terminal workspace cleanup
-  - fresh polling of active issues
-  - re-dispatching eligible work
+The authority hierarchy after runtime restart is:
+1. Tracker lifecycle eligibility and repository routing (active, routable candidates).
+2. Deterministic workspace path presence on the local host.
+3. Local workspace Git repository identity matching the routed source repository (`--git-common-dir`).
+
+During startup (and before worker spawn on initial dispatch cycles), active candidates are classified:
+- **Fresh**: Deterministic workspace does not exist on disk. Dispatched as a standard first attempt.
+- **Resume**: Workspace exists on disk and its Git common-dir matches the routed source repository.
+  Dispatched as a continuation/resumption with `resumed: true`.
+- **Mismatch**: Workspace exists on disk but its Git common-dir does not match the routed source.
+  Fails closed immediately: marked blocked in orchestrator state, excluded from dispatch, and its directory
+  remains untouched on disk (never deleted).
+
+#### 14.3.2 Dispatch and Prompt Framing
+
+- Resumed issues preserve dirty workspaces byte-for-byte; the `after_create` setup hook is not re-run.
+- Resumed issues receive explicit resumption guidance framing in the first prompt turn (`resumed: true`),
+  instructing the agent to inspect existing workspace state, branch, and workpad before making changes.
+- Retry attempts are not fabricated to produce continuation prompts (`attempt` remains `nil`).
+- Live orchestration retries retain their existing attempt count and backoff behavior.
+
+#### 14.3.3 Terminal Cleanup and Orphan Workspaces
+
+- Startup ordering is strictly preserved: terminal workspace cleanup executes ahead of active dispatch.
+- Terminal cleanup only removes workspaces belonging to terminal issues; active issue workspaces are never deleted.
+- Surviving directories in the workspace root unrecognized by active candidates are logged as unowned orphans
+  and are never automatically deleted.
+
+#### 14.3.4 Operational Boundaries
+
+Restart reconciliation recovers workspace ownership semantics and local dispatch framing under the bounded
+assumption that no previous worker process survives to overlap the new dispatch. Fencing against surviving OS-level
+worker processes is owned separately (MIC-223) and is not provided by this reconciliation layer.
 
 ### 14.4 Operator Intervention Points
 

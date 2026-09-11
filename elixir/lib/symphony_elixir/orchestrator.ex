@@ -39,6 +39,9 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      resumed_issues: MapSet.new(),
+      orphaned_workspaces: [],
+      startup_reconciled: false,
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -70,6 +73,7 @@ defmodule SymphonyElixir.Orchestrator do
         }
 
         run_terminal_workspace_cleanup()
+        state = run_startup_reconciliation(state)
         state = schedule_tick(state, 0)
 
         {:ok, state}
@@ -273,6 +277,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch(%State{} = state) do
     state =
       state
+      |> ensure_startup_reconciled()
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
 
@@ -422,6 +427,44 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec run_startup_reconciliation_for_test(term()) :: term()
+  def run_startup_reconciliation_for_test(%State{} = state) do
+    run_startup_reconciliation(state)
+  end
+
+  @doc false
+  @spec orphaned_workspaces_for_test(term()) :: [Path.t()]
+  def orphaned_workspaces_for_test(%State{orphaned_workspaces: orphans}), do: orphans
+
+  @doc false
+  @spec resumed_issues_for_test(term()) :: MapSet.t()
+  def resumed_issues_for_test(%State{resumed_issues: resumed_issues}), do: resumed_issues
+
+  @doc false
+  @spec dispatch_issue_for_test(term(), Issue.t()) :: term()
+  def dispatch_issue_for_test(%State{} = state, %Issue{} = issue) do
+    do_dispatch_issue(state, issue, nil, nil)
+  end
+
+  @doc false
+  @spec release_issue_claim_for_test(term(), String.t()) :: term()
+  def release_issue_claim_for_test(%State{} = state, issue_id) do
+    release_issue_claim(state, issue_id)
+  end
+
+  @spec orphaned_workspaces() :: [Path.t()] | :unavailable
+  def orphaned_workspaces, do: orphaned_workspaces(__MODULE__)
+
+  @spec orphaned_workspaces(GenServer.server()) :: [Path.t()] | :unavailable
+  def orphaned_workspaces(server) do
+    if Process.whereis(server) do
+      GenServer.call(server, :orphaned_workspaces)
+    else
+      :unavailable
+    end
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -976,18 +1019,36 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        case Workspace.classify_candidate(issue, worker_host) do
+          {:error, {:workspace_repository_mismatch, target, details}} ->
+            error = "workspace repository identity mismatch for target #{target}: #{inspect(details)}"
+            Logger.error("Dispatch failed closed for #{issue_context(issue)}: #{error}")
+            block_reconciliation_mismatch(state, issue, error)
+
+          {:ok, :resume, _workspace, _route} ->
+            resumed? = MapSet.member?(state.resumed_issues, issue.id) or is_nil(attempt)
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, resumed?)
+
+          {:ok, :fresh, _workspace, _route} ->
+            state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, false)
+
+          _ ->
+            state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, false)
+        end
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, resumed?) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host, resumed: resumed?)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
-        Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+        resumed_log = if resumed?, do: " (resumed)", else: ""
+        Logger.info("Dispatching issue to agent#{resumed_log}: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
         running =
           Map.put(state.running, issue.id, %{
@@ -999,6 +1060,7 @@ defmodule SymphonyElixir.Orchestrator do
             workspace_path: nil,
             workspace_root: nil,
             session_id: nil,
+            resumed: resumed?,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -1018,12 +1080,15 @@ defmodule SymphonyElixir.Orchestrator do
           state
           | running: running,
             claimed: MapSet.put(state.claimed, issue.id),
+            resumed_issues: MapSet.delete(state.resumed_issues, issue.id),
             retry_attempts: Map.delete(state.retry_attempts, issue.id)
         }
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+
+        state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
 
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
@@ -1172,16 +1237,21 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(identifier, worker_host \\ nil)
 
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
-    case Map.get(metadata, :workspace_path) do
-      workspace_path when is_binary(workspace_path) and workspace_path != "" ->
-        Workspace.remove_recorded(
-          workspace_path,
-          Map.get(metadata, :worker_host),
-          Map.get(metadata, :workspace_root)
-        )
+    if Map.get(metadata, :reconciliation_mismatch) == true do
+      Logger.warning("Preserving reconciliation-mismatch workspace #{inspect(Map.get(metadata, :workspace_path))} for #{inspect(Map.get(metadata, :identifier))}; skipping recorded cleanup")
+      :ok
+    else
+      case Map.get(metadata, :workspace_path) do
+        workspace_path when is_binary(workspace_path) and workspace_path != "" ->
+          Workspace.remove_recorded(
+            workspace_path,
+            Map.get(metadata, :worker_host),
+            Map.get(metadata, :workspace_root)
+          )
 
-      _ ->
-        cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
+        _ ->
+          cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
+      end
     end
   end
 
@@ -1209,6 +1279,115 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+    end
+  end
+
+  defp ensure_startup_reconciled(%State{startup_reconciled: true} = state), do: state
+  defp ensure_startup_reconciled(%State{} = state), do: run_startup_reconciliation(state)
+
+  defp run_startup_reconciliation(%State{} = state) do
+    case Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+      {:ok, active_issues} ->
+        state = reconcile_startup_candidates(state, active_issues)
+        orphans = scan_orphaned_workspaces(active_issues)
+        %{state | orphaned_workspaces: orphans, startup_reconciled: true}
+
+      {:error, reason} ->
+        Logger.warning("Skipping startup active issue reconciliation; failed to fetch active issues: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp reconcile_startup_candidates(state, active_issues) do
+    Enum.reduce(active_issues, state, fn issue, state_acc ->
+      reconcile_startup_candidate(state_acc, issue)
+    end)
+  end
+
+  defp reconcile_startup_candidate(state, %Issue{} = issue) do
+    if candidate_routable?(issue) do
+      case Workspace.classify_candidate(issue) do
+        {:ok, :resume, workspace, _route} ->
+          Logger.info("Startup reconciliation identified resumable workspace for #{issue_context(issue)} workspace=#{workspace}")
+          %{state | resumed_issues: MapSet.put(state.resumed_issues, issue.id)}
+
+        {:ok, :fresh, _workspace, _route} ->
+          state
+
+        {:error, {:workspace_repository_mismatch, target, details}} ->
+          error = "workspace repository identity mismatch for target #{target}: #{inspect(details)}"
+          Logger.error("Startup reconciliation failed closed for #{issue_context(issue)}: #{error}")
+          block_reconciliation_mismatch(state, issue, error)
+
+        {:error, reason} ->
+          Logger.warning("Startup reconciliation check failed for #{issue_context(issue)}: #{inspect(reason)}")
+          state
+      end
+    else
+      state
+    end
+  end
+
+  defp candidate_routable?(%Issue{} = issue) do
+    Issue.routable?(issue, Config.settings!().tracker.required_labels) and
+      match?({:ok, _route}, RepositoryRouter.resolve(issue, Config.settings!().routing))
+  end
+
+  defp block_reconciliation_mismatch(state, issue, error) do
+    workspace_path =
+      case Workspace.workspace_path(issue) do
+        {:ok, path} -> path
+        _ -> nil
+      end
+
+    blocked_entry = %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: workspace_path,
+      workspace_root: Config.local_workspace_root(),
+      reconciliation_mismatch: true,
+      session_id: nil,
+      error: error,
+      discovery_result: nil,
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+
+    %{
+      state
+      | blocked: Map.put(state.blocked, issue.id, blocked_entry),
+        claimed: MapSet.put(state.claimed, issue.id),
+        resumed_issues: MapSet.delete(state.resumed_issues, issue.id)
+    }
+  end
+
+  defp scan_orphaned_workspaces(active_issues) do
+    local_workspace_root = Config.local_workspace_root()
+
+    active_workspace_names =
+      active_issues
+      |> Enum.map(&Workspace.workspace_key/1)
+      |> MapSet.new()
+
+    case File.ls(local_workspace_root) do
+      {:ok, entries} ->
+        entries
+        |> Enum.filter(fn entry ->
+          full_path = Path.join(local_workspace_root, entry)
+          File.dir?(full_path) and not MapSet.member?(active_workspace_names, entry)
+        end)
+        |> Enum.map(fn entry ->
+          orphan_path = Path.join(local_workspace_root, entry)
+          Logger.warning("Surviving workspace unrecognized or unowned by active issues: path=#{orphan_path}")
+          orphan_path
+        end)
+
+      _ ->
+        []
     end
   end
 
@@ -1263,6 +1442,7 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
+        resumed_issues: MapSet.delete(state.resumed_issues, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
   end
@@ -1527,6 +1707,10 @@ defmodule SymphonyElixir.Orchestrator do
          poll_interval_ms: state.poll_interval_ms
        }
      }, state}
+  end
+
+  def handle_call(:orphaned_workspaces, _from, state) do
+    {:reply, state.orphaned_workspaces, state}
   end
 
   def handle_call(:request_refresh, _from, state) do

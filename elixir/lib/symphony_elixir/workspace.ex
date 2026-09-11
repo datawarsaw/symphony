@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Workspace do
   @type worker_host :: String.t() | nil
   @type route :: RepositoryRouter.Route.t() | nil
   @type issue_reference :: map() | String.t() | nil
+  @type classification :: :fresh | :resume
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
@@ -232,10 +233,7 @@ defmodule SymphonyElixir.Workspace do
   def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, nil) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
-        case workspace_path_for_issue(workspace_key(issue), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
-        end
+        remove_local_issue_workspace(issue)
 
       worker_hosts ->
         Enum.each(worker_hosts, &remove_issue_workspaces(issue, &1))
@@ -256,10 +254,7 @@ defmodule SymphonyElixir.Workspace do
   def remove_issue_workspaces(identifier, nil) when is_binary(identifier) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
-        case workspace_path_for_issue(workspace_key(identifier), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
-        end
+        remove_local_issue_workspace(identifier)
 
       worker_hosts ->
         Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1))
@@ -269,6 +264,33 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove_issue_workspaces(_identifier, _worker_host), do: :ok
+
+  defp remove_local_issue_workspace(issue_or_identifier) do
+    case classify_candidate(issue_or_identifier, nil) do
+      {:ok, :resume, workspace, _route} ->
+        remove(workspace, nil)
+        :ok
+
+      {:ok, :fresh, _workspace, _route} ->
+        :ok
+
+      {:error, {:workspace_repository_mismatch, target, details}} ->
+        Logger.warning(
+          "Preserving workspace for #{issue_log_context(issue_context(issue_or_identifier))}; " <>
+            "workspace repository identity mismatch for target #{target}: #{inspect(details)}"
+        )
+
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Preserving workspace for #{issue_log_context(issue_context(issue_or_identifier))}; " <>
+            "unable to verify repository identity: #{inspect(reason)}"
+        )
+
+        :ok
+    end
+  end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}
@@ -471,6 +493,38 @@ defmodule SymphonyElixir.Workspace do
         |> ignore_hook_failure()
     end
   end
+
+  @doc false
+  @spec workspace_path(issue_reference(), worker_host()) :: {:ok, Path.t()} | {:error, term()}
+  def workspace_path(issue_or_identifier, worker_host \\ nil) do
+    safe_id = workspace_key(issue_or_identifier)
+    workspace_path_for_issue(safe_id, worker_host)
+  end
+
+  @doc false
+  @spec classify_candidate(issue_reference(), worker_host()) ::
+          {:ok, classification(), Path.t(), route()} | {:error, term()}
+  def classify_candidate(issue_or_identifier, worker_host \\ nil) do
+    with {:ok, route} <- resolve_repository_route(issue_or_identifier),
+         {:ok, workspace} <- workspace_path(issue_or_identifier, worker_host) do
+      case workspace_exists?(workspace, worker_host) do
+        true ->
+          case verify_workspace_git_identity(workspace, route, worker_host) do
+            :ok ->
+              {:ok, :resume, workspace, route}
+
+            {:error, _reason} = error ->
+              error
+          end
+
+        false ->
+          {:ok, :fresh, workspace, route}
+      end
+    end
+  end
+
+  defp workspace_exists?(workspace, nil) when is_binary(workspace), do: File.exists?(workspace)
+  defp workspace_exists?(_workspace, _worker_host), do: false
 
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
     Config.local_workspace_root()
@@ -975,9 +1029,20 @@ defmodule SymphonyElixir.Workspace do
   # source by the after_create hook, so it needs no re-verification. Unrouted issues keep
   # their historical reuse behavior.
   defp verify_reused_workspace_repository(_workspace, _route, true, _worker_host), do: :ok
-  defp verify_reused_workspace_repository(_workspace, nil, _created?, _worker_host), do: :ok
 
-  defp verify_reused_workspace_repository(workspace, %RepositoryRouter.Route{} = route, false, nil) do
+  defp verify_reused_workspace_repository(workspace, route, false, worker_host) do
+    verify_workspace_git_identity(workspace, route, worker_host)
+  end
+
+  @doc false
+  @spec verify_workspace_git_identity(Path.t(), route(), worker_host()) :: :ok | {:error, term()}
+  def verify_workspace_git_identity(_workspace, nil, _worker_host), do: :ok
+  # Remote worker hosts keep their historical reuse behavior: the local Git identity probe
+  # cannot read a remote filesystem, and the configured worker fleet does not use remote
+  # reuse. Tightening this requires a remote identity probe and is tracked separately.
+  def verify_workspace_git_identity(_workspace, _route, worker_host) when is_binary(worker_host), do: :ok
+
+  def verify_workspace_git_identity(workspace, %RepositoryRouter.Route{} = route, nil) do
     case local_git_common_dir(workspace) do
       {:ok, workspace_common_dir} ->
         case local_git_common_dir(route.source_path) do
@@ -997,13 +1062,6 @@ defmodule SymphonyElixir.Workspace do
         {:error, {:workspace_repository_mismatch, route.target, :workspace_not_a_git_repository}}
     end
   end
-
-  # Remote worker hosts keep their historical reuse behavior: the local Git identity probe
-  # cannot read a remote filesystem, and the configured worker fleet does not use remote
-  # reuse. Tightening this requires a remote identity probe and is tracked separately.
-  defp verify_reused_workspace_repository(_workspace, %RepositoryRouter.Route{}, false, worker_host)
-       when is_binary(worker_host),
-       do: :ok
 
   defp local_git_common_dir(repo_path) when is_binary(repo_path) do
     case System.cmd(

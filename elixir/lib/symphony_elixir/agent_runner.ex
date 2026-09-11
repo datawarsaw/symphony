@@ -166,8 +166,16 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  @doc false
+  @spec build_turn_prompt_for_test(Issue.t(), keyword(), map(), pos_integer(), pos_integer()) :: String.t()
+  def build_turn_prompt_for_test(issue, opts, provenance, turn_number, max_turns) do
+    build_turn_prompt(issue, opts, provenance, turn_number, max_turns)
+  end
+
   defp build_turn_prompt(issue, opts, provenance, 1, _max_turns) do
-    workspace_provenance_prompt(provenance) <> PromptBuilder.build_prompt(issue, opts)
+    workspace_provenance_prompt(provenance) <>
+      resumption_guidance_prompt(opts) <>
+      PromptBuilder.build_prompt(issue, opts)
   end
 
   defp build_turn_prompt(_issue, _opts, _provenance, turn_number, max_turns) do
@@ -180,6 +188,21 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+  end
+
+  defp resumption_guidance_prompt(opts) do
+    if Keyword.get(opts, :resumed, false) do
+      """
+      Resumption guidance:
+
+      - This issue was interrupted by a runtime restart and is resuming in its existing workspace.
+      - Inspect the existing workspace state, branch, commit history, and workpad before making changes.
+      - Resume progress from the current workspace state instead of starting over.
+
+      """
+    else
+      ""
+    end
   end
 
   defp workspace_provenance_prompt(provenance) do
