@@ -146,3 +146,58 @@ No commit, push, PR, merge or deployment was performed; nothing in this entry is
 change. The uncommitted diff (5 Elixir files, +429/-34) remains for independent review. Windows
 launcher failures remain MIC-164; Elixir test logs are retained under `%TEMP%/mic221-h-*.log` and
 `%TEMP%/mic221-head-corefull.log`.
+
+## MIC-224 implementation candidate — 2026-09-11
+
+Branch: `symphony/MIC-224`, based on `6fb3963` in the isolated worktree
+`C:/AI/symphony-workspaces/MIC-224`. This is an uncommitted implementation candidate,
+not a deployed runtime change.
+
+- Startup reconciliation and resumption ownership for active issues after a runtime restart.
+- Authority hierarchy after restart:
+  1. Tracker lifecycle eligibility and route resolution (`RepositoryRouter`).
+  2. Deterministic workspace path presence on local filesystem (`Workspace.workspace_path`).
+  3. Git repository identity matching routed source (`git rev-parse --git-common-dir`).
+- Matching surviving workspaces are classified `:resume`, dispatched with `resumed: true`, receive
+  continuation/resumption framing in the prompt, and preserve dirty working trees byte-for-byte.
+- Mismatched workspaces fail closed: marked blocked in Orchestrator state (`state.blocked`),
+  excluded from dispatch, and directories remain untouched on disk.
+- Unowned surviving workspaces are logged as orphans and never automatically deleted.
+- Terminal cleanup remains ordered ahead of active dispatch and never deletes active issue workspaces.
+- Retry attempts are not fabricated (`attempt` remains `nil`).
+- Bounded contract assumption: recovers workspace ownership semantics under the assumption that no
+  old OS-level worker process overlaps the new dispatch (worker fencing owned by MIC-223).
+- 10 focused restart/reconciliation tests added in `test/symphony_elixir/restart_reconciliation_test.exs`
+  verifying all required recovery and fail-closed behaviors.
+- One focused retry-metadata test was added to `test/symphony_elixir/orchestrator_status_test.exs` proving retry metadata keeps the MIC-221 `workspace_root` alongside the MIC-224 resumption state.
+
+Integration with delivered MIC-221 (review candidate, 2026-09-11):
+
+- The MIC-224 review candidate is integrated onto the MIC-221 recorded-workspace deletion boundary
+  (c540a299a8e99586d9417e9778ad44a25d2fd01d, locally identical to origin/symphony/MIC-221).
+  The MIC-224 implementation itself was based on 6fb3963.
+- MIC-221 workspace_root and MIC-224 resumed coexist: running entries carry both, retry metadata
+  keeps workspace_root, and a reconciliation mismatch blocks the issue without deleting the
+  surviving workspace. The mismatch block records no workspace_root, so a later recorded cleanup
+  for that issue falls back to the currently configured root as the trust boundary instead of the
+  creation-time root.
+- Workspace.verify_reused_workspace_repository/4 now delegates to the shared
+  Workspace.verify_workspace_git_identity/3 that reconciliation classification uses; the MIC-221
+  remove_recorded/3 trusted deletion boundary is unchanged.
+
+Validated for the MIC-221 + MIC-224 integration (Windows, Elixir 1.19.5 / OTP 28, unstaged worktree):
+
+- `mix compile --warnings-as-errors` passes (exit 0, no warnings emitted).
+- `mix specs.check` passes (`specs.check: all public functions have @spec or exemption`).
+- `mix test test/symphony_elixir/restart_reconciliation_test.exs --warnings-as-errors` gives 10 tests, 0 failures.
+- `mix test test/symphony_elixir/orchestrator_status_test.exs --seed 424242` gives 44 tests, 11 failures; a pristine `c540a299` baseline on this host produces the identical 11 failing test names, all `default CA trust store not available` raised from `run_terminal_workspace_cleanup/0` inside `Orchestrator.init/1` in this offline sandbox. The candidate adds one passing test relative to that baseline.
+- `mix test test/symphony_elixir/workspace_and_config_test.exs --seed 424242` gives 65 tests, 11 failures with a failure-name set identical to the `c540a299` baseline at the same seed (pre-existing Windows and sandbox failures: Git-Bash path mangling at `:14`, `$VAR` expansion at `:1627`, and cascading `Supervisor` liveness failures after the app process dies mid-suite).
+- `mix test test/symphony_elixir/core_test.exs --seed 424242` gives 52 tests, 11 failures, identical count and failure names to the `c540a299` baseline at the same seed.
+- `mix test test/symphony_elixir/core_test.exs:629 test/symphony_elixir/core_test.exs:552` gives 2 tests, 0 failures (MIC-221 old-root terminal cleanup and cross-root proofs).
+- `mix test test/symphony_elixir/source_sync_test.exs --seed 424242` gives 14 tests, 7 failures, identical to the `c540a299` baseline at the same seed.
+- `mix test test/symphony_elixir/workspace_provenance_test.exs` gives 6 tests, 0 failures.
+- `mix test test/symphony_elixir/implementation_review_test.exs` gives 3 tests, 0 failures.
+- `mix test test/symphony_elixir/ssh_test.exs` gives 8 tests, 0 failures.
+- `git diff --check` and `git diff --cached --check` pass.
+
+Baseline comparison ran in a separate clone of the same repository bundle checked out at `c540a299`, with the same TEMP override and the same seed. The integration introduces no new failure on this host.

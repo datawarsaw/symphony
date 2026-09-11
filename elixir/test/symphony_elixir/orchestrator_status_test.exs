@@ -972,6 +972,68 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert remaining_ms <= 10_500
   end
 
+  test "orchestrator retry metadata preserves the MIC-221 workspace root" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue_id = "issue-retry-workspace-root"
+    orchestrator_name = Module.concat(__MODULE__, :RetryWorkspaceRootOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    ref = make_ref()
+    started_at = DateTime.utc_now()
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-RETRY-ROOT",
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-RETRY-ROOT",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-RETRY-ROOT",
+        dispatchable: true
+      },
+      worker_host: "dm-dev2",
+      workspace_path: "/workspaces/MT-RETRY-ROOT",
+      workspace_root: "/workspaces-root",
+      session_id: "thread-retry-turn-retry",
+      last_codex_message: nil,
+      last_codex_timestamp: started_at,
+      last_codex_event: nil,
+      started_at: started_at
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.blocked, issue_id)
+
+    assert %{
+             attempt: 1,
+             identifier: "MT-RETRY-ROOT",
+             worker_host: "dm-dev2",
+             workspace_path: "/workspaces/MT-RETRY-ROOT",
+             workspace_root: "/workspaces-root"
+           } = state.retry_attempts[issue_id]
+  end
+
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -1011,6 +1073,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       },
       worker_host: "dm-dev2",
       workspace_path: "/workspaces/MT-MCP",
+      workspace_root: "/workspaces-root",
       session_id: "thread-mcp-turn-mcp",
       last_codex_message: %{
         event: :notification,
@@ -1043,7 +1106,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              identifier: "MT-MCP",
              error: "codex MCP elicitation requires operator input",
              worker_host: "dm-dev2",
-             workspace_path: "/workspaces/MT-MCP"
+             workspace_path: "/workspaces/MT-MCP",
+             workspace_root: "/workspaces-root"
            } = state.blocked[issue_id]
 
     assert %{
