@@ -42,13 +42,51 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     %{issue: issue, ready: String.replace(@ready, "C:/repo/symphony", source)}
   end
 
+  defp digest(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
+
+  defp evidence_path(issue) do
+    {:ok, input} = Discovery.snapshot(issue)
+    Path.join([Config.local_workspace_root(), ".discovery-results", digest(issue.id), digest(input) <> ".json"])
+  end
+
+  defp retained_receipt(issue) do
+    path = evidence_path(issue)
+    assert File.regular?(path), "expected retained Discovery evidence at #{path}"
+    path |> File.read!() |> Jason.decode!()
+  end
+
   defp retain(issue, status, output) do
     {:ok, input} = Discovery.snapshot(issue)
-    digest = fn text -> :crypto.hash(:sha256, text) |> Base.encode16(case: :lower) end
-    path = Path.join([Config.local_workspace_root(), ".discovery-results", digest.(issue.id), digest.(input) <> ".json"])
+    path = evidence_path(issue)
     File.mkdir_p!(Path.dirname(path))
-    File.write!(path, Jason.encode!(%{input_sha256: digest.(input), status: status, output: output, provider: "xai", model: "xai/grok-4.6", reasoning: "medium", lane: "primary"}))
+    File.write!(path, Jason.encode!(%{input_sha256: digest(input), status: status, output: output, provider: "xai", model: "xai/grok-4.6", reasoning: "medium", lane: "primary"}))
     path
+  end
+
+  # Rewrites the workflow codex command between polls. The command is not part of the
+  # cache key, so the frozen issue input stays byte-identical.
+  defp point_codex_command_at(command) do
+    path = Workflow.workflow_file_path()
+    workflow = Regex.replace(~r/^  command:.*$/m, File.read!(path), fn _ -> "  command: " <> Jason.encode!(command) end)
+    File.write!(path, workflow)
+    WorkflowStore.force_reload()
+  end
+
+  defp discovery_command(issue) do
+    python = System.find_executable("python") || System.find_executable("python3")
+    assert is_binary(python), "Python is required for the deterministic protocol peer"
+    script = Path.expand("../fixtures/discovery_app_server.py", __DIR__)
+    fixture = Path.expand("../fixtures/discovery-ready.txt", __DIR__)
+    {:ok, route} = SymphonyElixir.RepositoryRouter.resolve(issue, Config.settings!().routing)
+    Enum.map_join([python, "-u", script, fixture, route.source_path], " ", &shell_quote/1)
+  end
+
+  # A provider peer that swallows the handshake and dies without answering records a
+  # deterministic infrastructure failure instead of a semantic verdict.
+  defp technical_failure_command do
+    python = System.find_executable("python") || System.find_executable("python3")
+    assert is_binary(python), "Python is required for the deterministic protocol peer"
+    Enum.map_join([python, "-u", "-c", "import sys; sys.stdin.readline(); sys.exit(3)"], " ", &shell_quote/1)
   end
 
   test "snapshot is stable across the Discovery to Todo state change and includes only task context", %{issue: issue} do
@@ -69,6 +107,51 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     {:ok, handed_off} = Discovery.implementation_issue(%{issue | state: "Todo"})
     assert String.starts_with?(handed_off.description, "TODO HANDOFF")
     refute handed_off.description =~ "DISCOVERY BRIEF"
+  end
+
+  test "persisted TECHNICAL_FAILURE is forensic evidence, never a terminal cache hit", %{issue: issue} do
+    # The provider peer dies mid-handshake, so the first poll records an infra failure.
+    point_codex_command_at(technical_failure_command())
+
+    assert :ok = Discovery.run(issue, self())
+    assert_receive {:discovery_completed, "discovery-issue", "TECHNICAL_FAILURE"}, 5_000
+    assert retained_receipt(issue)["status"] == "TECHNICAL_FAILURE"
+
+    # The provider recovers between polls while the frozen input stays unchanged, so a
+    # cached failure would be returned forever: the lane must re-enter execution.
+    point_codex_command_at(discovery_command(issue))
+
+    assert :ok = Discovery.run(issue, self())
+    assert_receive {:discovery_completed, "discovery-issue", "READY"}, 5_000
+    assert retained_receipt(issue)["status"] == "READY"
+  end
+
+  test "retained READY stays a cache hit without re-entering execution", %{issue: issue} do
+    point_codex_command_at(discovery_command(issue))
+
+    assert :ok = Discovery.run(issue, self())
+    assert_receive {:discovery_completed, "discovery-issue", "READY"}, 5_000
+    retained = retained_receipt(issue)
+    assert retained["status"] == "READY"
+
+    # The provider is unreachable now, so any execution would replace the retained
+    # verdict instead of returning it.
+    point_codex_command_at("must-not-launch-discovery-cache")
+
+    assert :ok = Discovery.run(issue, self())
+    assert_receive {:discovery_completed, "discovery-issue", "READY"}, 5_000
+    assert retained_receipt(issue) == retained
+  end
+
+  test "retained deterministic verdicts stay a cache hit without re-entering execution", %{issue: issue} do
+    path = retain(issue, "NEEDS_RESEARCH", "Preserved NEEDS_RESEARCH evidence")
+    retained = path |> File.read!() |> Jason.decode!()
+
+    # The configured command cannot launch, so executing again would replace this
+    # verdict with a technical failure.
+    assert :ok = Discovery.run(issue, self())
+    assert_receive {:discovery_completed, "discovery-issue", "NEEDS_RESEARCH"}, 5_000
+    assert path |> File.read!() |> Jason.decode!() == retained
   end
 
   test "non-ready, malformed, stale and wrong-repository handoffs cannot enter implementation", %{issue: issue, ready: ready} do

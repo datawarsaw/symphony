@@ -101,26 +101,39 @@ defmodule SymphonyElixir.Discovery do
 
   defp cached_or_execute(issue, workspace, input, recipient, opts) do
     case read_evidence(issue.id, input) do
+      # A READY handoff or a deterministic semantic verdict is authoritative for the
+      # same (issue_id, input_sha256) and stays a cache hit. A persisted technical
+      # failure is kept for forensics but is never authoritative semantics: the next
+      # execution re-enters the lane and replaces it instead of returning it as the
+      # Discovery result. How often that happens stays with the caller - this function
+      # never retries or recurses on its own.
+      {:ok, %{status: "TECHNICAL_FAILURE"}} ->
+        execute_and_persist(issue, workspace, input, recipient, opts)
+
       {:ok, evidence} ->
         {:ok, evidence}
 
       {:error, :enoent} ->
-        started = System.monotonic_time(:millisecond)
-
-        evidence =
-          execute(
-            input,
-            fn route, frozen -> run_session(workspace, issue, route, frozen, recipient) end,
-            opts
-          )
-
-        evidence = evidence |> bind_issue(issue) |> Map.put(:duration_ms, System.monotonic_time(:millisecond) - started)
-        evidence = Map.put(evidence, :completed_at, DateTime.to_iso8601(DateTime.utc_now()))
-        persist(issue.id, input, evidence)
+        execute_and_persist(issue, workspace, input, recipient, opts)
 
       error ->
         error
     end
+  end
+
+  defp execute_and_persist(issue, workspace, input, recipient, opts) do
+    started = System.monotonic_time(:millisecond)
+
+    evidence =
+      execute(
+        input,
+        fn route, frozen -> run_session(workspace, issue, route, frozen, recipient) end,
+        opts
+      )
+
+    evidence = evidence |> bind_issue(issue) |> Map.put(:duration_ms, System.monotonic_time(:millisecond) - started)
+    evidence = Map.put(evidence, :completed_at, DateTime.to_iso8601(DateTime.utc_now()))
+    persist(issue.id, input, evidence)
   end
 
   defp publish_retained(issue, input, opts) do
