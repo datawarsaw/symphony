@@ -443,6 +443,18 @@ defmodule SymphonyElixir.Orchestrator do
   @spec resumed_issues_for_test(term()) :: MapSet.t()
   def resumed_issues_for_test(%State{resumed_issues: resumed_issues}), do: resumed_issues
 
+  @doc false
+  @spec dispatch_issue_for_test(term(), Issue.t()) :: term()
+  def dispatch_issue_for_test(%State{} = state, %Issue{} = issue) do
+    do_dispatch_issue(state, issue, nil, nil)
+  end
+
+  @doc false
+  @spec release_issue_claim_for_test(term(), String.t()) :: term()
+  def release_issue_claim_for_test(%State{} = state, issue_id) do
+    release_issue_claim(state, issue_id)
+  end
+
   @spec orphaned_workspaces() :: [Path.t()] | :unavailable
   def orphaned_workspaces, do: orphaned_workspaces(__MODULE__)
 
@@ -1007,18 +1019,23 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        resumed? =
-          MapSet.member?(state.resumed_issues, issue.id) or
-            (is_nil(attempt) and match?({:ok, :resume, _, _}, Workspace.classify_candidate(issue, worker_host)))
-
         case Workspace.classify_candidate(issue, worker_host) do
           {:error, {:workspace_repository_mismatch, target, details}} ->
             error = "workspace repository identity mismatch for target #{target}: #{inspect(details)}"
             Logger.error("Dispatch failed closed for #{issue_context(issue)}: #{error}")
             block_reconciliation_mismatch(state, issue, error)
 
-          _ ->
+          {:ok, :resume, _workspace, _route} ->
+            resumed? = MapSet.member?(state.resumed_issues, issue.id) or is_nil(attempt)
             spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, resumed?)
+
+          {:ok, :fresh, _workspace, _route} ->
+            state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, false)
+
+          _ ->
+            state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, false)
         end
     end
   end
@@ -1070,6 +1087,8 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
+
+        state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
 
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
@@ -1423,6 +1442,7 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
+        resumed_issues: MapSet.delete(state.resumed_issues, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
   end

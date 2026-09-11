@@ -233,10 +233,7 @@ defmodule SymphonyElixir.Workspace do
   def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, nil) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
-        case workspace_path_for_issue(workspace_key(issue), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
-        end
+        remove_local_issue_workspace(issue)
 
       worker_hosts ->
         Enum.each(worker_hosts, &remove_issue_workspaces(issue, &1))
@@ -257,10 +254,7 @@ defmodule SymphonyElixir.Workspace do
   def remove_issue_workspaces(identifier, nil) when is_binary(identifier) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
-        case workspace_path_for_issue(workspace_key(identifier), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
-        end
+        remove_local_issue_workspace(identifier)
 
       worker_hosts ->
         Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1))
@@ -270,6 +264,33 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove_issue_workspaces(_identifier, _worker_host), do: :ok
+
+  defp remove_local_issue_workspace(issue_or_identifier) do
+    case classify_candidate(issue_or_identifier, nil) do
+      {:ok, :resume, workspace, _route} ->
+        remove(workspace, nil)
+        :ok
+
+      {:ok, :fresh, _workspace, _route} ->
+        :ok
+
+      {:error, {:workspace_repository_mismatch, target, details}} ->
+        Logger.warning(
+          "Preserving workspace for #{issue_log_context(issue_context(issue_or_identifier))}; " <>
+            "workspace repository identity mismatch for target #{target}: #{inspect(details)}"
+        )
+
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Preserving workspace for #{issue_log_context(issue_context(issue_or_identifier))}; " <>
+            "unable to verify repository identity: #{inspect(reason)}"
+        )
+
+        :ok
+    end
+  end
 
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}
@@ -502,7 +523,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp workspace_exists?(workspace, nil) when is_binary(workspace), do: File.dir?(workspace)
+  defp workspace_exists?(workspace, nil) when is_binary(workspace), do: File.exists?(workspace)
   defp workspace_exists?(_workspace, _worker_host), do: false
 
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do

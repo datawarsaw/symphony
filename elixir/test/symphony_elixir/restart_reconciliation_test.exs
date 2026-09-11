@@ -644,6 +644,166 @@ defmodule SymphonyElixir.RestartReconciliationTest do
         File.rm_rf(test_root)
       end
     end
+
+    test "12. reconciliation mismatch survives orchestrator restart when issue becomes terminal" do
+      test_root = test_root_path("mismatch-restart-terminal")
+
+      try do
+        fixture_a = setup_source_fixture!(Path.join(test_root, "repo_a"))
+        fixture_b = setup_source_fixture!(Path.join(test_root, "repo_b"))
+
+        shared_root = Path.join(test_root, "shared_workspaces")
+        File.mkdir_p!(shared_root)
+
+        hook_marker = Path.join(test_root, "before_remove_marker")
+        hook_marker_posix = String.replace(hook_marker, "\\", "/")
+        File.rm_rf(hook_marker)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          tracker_kind: "memory",
+          workspace_root: shared_root,
+          tracker_active_states: ["In Progress"],
+          tracker_terminal_states: ["Closed"],
+          hook_before_remove: "echo hook_ran > \"" <> hook_marker_posix <> "\"",
+          routing: %{
+            target_label_prefix: "repo:",
+            default_branch: "main",
+            targets: %{
+              "symphony-runtime" => %{source_path: fixture_a.source_repo, remote: fixture_a.remote_repo}
+            }
+          }
+        )
+
+        issue = %Issue{
+          id: "issue-mismatch-restart",
+          identifier: "MT-107",
+          title: "Mismatch restart preservation",
+          state: "In Progress",
+          labels: ["repo:symphony-runtime"],
+          dispatchable: true
+        }
+
+        mismatched_ws = Path.join(shared_root, Workspace.workspace_key(issue))
+        git!(["-C", fixture_b.source_repo, "worktree", "add", mismatched_ws, "-b", "symphony/MT-107"])
+        sentinel = Path.join(mismatched_ws, "critical_workpad.md")
+        File.write!(sentinel, "must survive restart and terminal transition\n")
+
+        Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+        # Phase A: Start Orchestrator with issue active
+        orch_name_1 = Module.concat(__MODULE__, "TestRestartOrch1_#{System.unique_integer([:positive])}")
+        task_sup_name_1 = Module.concat(__MODULE__, "TestRestartTaskSup1_#{System.unique_integer([:positive])}")
+
+        {:ok, task_sup_1} = Task.Supervisor.start_link(name: task_sup_name_1)
+
+        assert {:ok, orch_pid_1} =
+                 Orchestrator.start_link(name: orch_name_1, task_supervisor: task_sup_name_1)
+
+        snapshot_1 = Orchestrator.snapshot(orch_name_1, 1_000)
+        assert length(snapshot_1.blocked) == 1
+        assert hd(snapshot_1.blocked).issue_id == issue.id
+        assert snapshot_1.running == []
+        assert File.dir?(mismatched_ws)
+        assert File.read!(sentinel) == "must survive restart and terminal transition\n"
+        refute File.exists?(hook_marker)
+
+        # Stop the orchestrator
+        GenServer.stop(orch_pid_1)
+        GenServer.stop(task_sup_1)
+
+        # Phase B: Issue becomes terminal in Tracker while Symphony is stopped
+        closed_issue = %Issue{issue | state: "Closed", dispatchable: false}
+        Application.put_env(:symphony_elixir, :memory_tracker_issues, [closed_issue])
+
+        # Start a fresh Orchestrator process with configured root unchanged
+        orch_name_2 = Module.concat(__MODULE__, "TestRestartOrch2_#{System.unique_integer([:positive])}")
+        task_sup_name_2 = Module.concat(__MODULE__, "TestRestartTaskSup2_#{System.unique_integer([:positive])}")
+
+        {:ok, task_sup_2} = Task.Supervisor.start_link(name: task_sup_name_2)
+
+        on_exit(fn ->
+          try do
+            if pid = Process.whereis(orch_name_2), do: GenServer.stop(pid)
+          catch
+            :exit, _ -> :ok
+          end
+
+          try do
+            if Process.alive?(task_sup_2), do: GenServer.stop(task_sup_2)
+          catch
+            :exit, _ -> :ok
+          end
+        end)
+
+        assert {:ok, orch_pid_2} =
+                 Orchestrator.start_link(name: orch_name_2, task_supervisor: task_sup_name_2)
+
+        # Assert post-restart invariant:
+        # Workspace and sentinel must still exist, before_remove marker must NOT exist
+        assert File.dir?(mismatched_ws)
+        assert File.read!(sentinel) == "must survive restart and terminal transition\n"
+        refute File.exists?(hook_marker)
+
+        GenServer.stop(orch_pid_2)
+      after
+        File.rm_rf(test_root)
+      end
+    end
+
+    test "13. resumed_issues membership cannot leak across claims or override fresh workspace classification" do
+      test_root = test_root_path("resumed-leak-guard")
+
+      try do
+        fixture = setup_source_fixture!(test_root)
+        configure_workspace_workflow!(fixture)
+
+        issue = %Issue{
+          id: "issue-fresh-leak",
+          identifier: "MT-108",
+          title: "Fresh issue with leaked resumed marker",
+          state: "In Progress",
+          labels: ["repo:symphony-runtime"],
+          dispatchable: true
+        }
+
+        # Workspace does NOT exist on disk -> candidate is fresh
+        assert {:ok, :fresh, _workspace, %Route{target: "symphony-runtime"}} =
+                 Workspace.classify_candidate(issue)
+
+        task_sup_name = Module.concat(__MODULE__, "TestLeakTaskSup_#{System.unique_integer([:positive])}")
+        {:ok, task_sup} = Task.Supervisor.start_link(name: task_sup_name)
+
+        on_exit(fn ->
+          try do
+            if Process.alive?(task_sup), do: GenServer.stop(task_sup)
+          catch
+            :exit, _ -> :ok
+          end
+        end)
+
+        state = %Orchestrator.State{
+          task_supervisor: task_sup_name,
+          resumed_issues: MapSet.new([issue.id])
+        }
+
+        # Dispatch fresh issue whose ID was erroneously present in state.resumed_issues
+        state = Orchestrator.dispatch_issue_for_test(state, issue)
+
+        # 1. Leaked resumed_issues entry was purged
+        refute MapSet.member?(state.resumed_issues, issue.id)
+
+        # 2. Running entry was dispatched as fresh, NOT resumed
+        assert Map.has_key?(state.running, issue.id)
+        assert state.running[issue.id].resumed == false
+
+        # 3. release_issue_claim clears resumed_issues
+        state_with_leak = %{state | resumed_issues: MapSet.put(state.resumed_issues, "leaked-issue-id")}
+        state_cleared = Orchestrator.release_issue_claim_for_test(state_with_leak, "leaked-issue-id")
+        refute MapSet.member?(state_cleared.resumed_issues, "leaked-issue-id")
+      after
+        File.rm_rf(test_root)
+      end
+    end
   end
 
   defp test_root_path(name) do
