@@ -2,6 +2,7 @@ defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Codex.WorkerEnvironment
+  alias SymphonyElixir.DispatchRouter
   alias SymphonyElixir.TestSupport.FakeSSH
 
  # Symlink escape coverage runs with a real symlink when the host allows it and
@@ -1817,6 +1818,94 @@ defmodule SymphonyElixir.AppServerTest do
                  false
                end
              end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server consumes a pre-materialized fallback selection without changing session lifecycle" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-fallback-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-FALLBACK")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "thread-start.trace")
+
+      File.mkdir_p!(workspace)
+
+      fallback_model = "gpt-5.6-terra"
+      fallback_reasoning = "high"
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        echo "$line" >> "#{trace_file}"
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-fallback","model":"#{fallback_model}","reasoningEffort":"#{fallback_reasoning}"}}}' ;;
+          3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-fallback"}}}' ;;
+          4) printf '%s\\n' '{"method":"turn/completed"}'; exit 0 ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{String.replace(codex_binary, "\\", "/")} app-server",
+        codex_fallback_enabled: true,
+        codex_fallback_model: fallback_model,
+        codex_fallback_reasoning_effort: fallback_reasoning
+      )
+
+      issue = %Issue{
+        id: "issue-fallback",
+        identifier: "MT-FALLBACK",
+        title: "Consume a pre-materialized fallback selection",
+        description: "Validate the DispatchRouter fallback seam end to end",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-FALLBACK",
+        labels: ["backend"]
+      }
+
+      selection = DispatchRouter.materialize(:fallback, issue)
+      assert %DispatchRouter.Selection{route: :fallback, model: ^fallback_model} = selection
+
+      assert {:ok, result} =
+               AppServer.run(workspace, "Run fallback worker", issue, dispatch_selection: selection)
+
+      assert result.thread_id == "thread-fallback"
+      assert result.turn_id == "turn-fallback"
+      assert result.session_id == "thread-fallback-turn-fallback"
+      assert result.model == fallback_model
+      assert result.reasoning_effort == fallback_reasoning
+      assert result.model_source == :explicit_override
+      assert result.reasoning_source == :explicit_override
+      assert result.route_source == :explicit_override
+
+      thread_start =
+        File.read!(trace_file)
+        |> String.split("\n", trim: true)
+        |> Enum.find(&String.contains?(&1, "\"thread/start\""))
+
+      payload = Jason.decode!(thread_start)
+
+      # PathSafety canonicalizes the local workspace (drive-letter case and
+      # separators on Windows), so compare the sent cwd in normalized form.
+      assert payload["params"]["cwd"] |> String.replace("\\", "/") |> String.downcase() ==
+               workspace |> String.replace("\\", "/") |> String.downcase()
+
+      assert payload["params"]["model"] == fallback_model
+      assert payload["params"]["config"]["model_reasoning_effort"] == fallback_reasoning
     after
       File.rm_rf(test_root)
     end

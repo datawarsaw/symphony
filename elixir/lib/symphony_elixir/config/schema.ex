@@ -218,6 +218,39 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    defmodule Fallback do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:enabled, :boolean, default: false)
+        field(:model, :string)
+        field(:reasoning_effort, :string, default: "medium")
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(attrs, [:enabled, :model, :reasoning_effort], empty_values: [])
+        |> validate_change(:model, fn :model, model ->
+          if model != "" and String.trim(model) == "" do
+            [model: "can't be blank"]
+          else
+            []
+          end
+        end)
+        |> validate_change(:reasoning_effort, fn :reasoning_effort, effort ->
+          if effort != "" and String.trim(effort) == "" do
+            [reasoning_effort: "can't be blank"]
+          else
+            []
+          end
+        end)
+      end
+    end
+
    @primary_key false
   embedded_schema do
     field(:command, :string, default: "codex app-server")
@@ -240,6 +273,8 @@ defmodule SymphonyElixir.Config.Schema do
      field(:turn_timeout_ms, :integer, default: 3_600_000)
      field(:read_timeout_ms, :integer, default: 5_000)
      field(:stall_timeout_ms, :integer, default: 300_000)
+
+    embeds_one(:fallback, Fallback, on_replace: :update, defaults_to_struct: true)
    end
 
    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -293,6 +328,7 @@ defmodule SymphonyElixir.Config.Schema do
      |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    |> cast_embed(:fallback, with: &Fallback.changeset/2)
     end
   end
 
