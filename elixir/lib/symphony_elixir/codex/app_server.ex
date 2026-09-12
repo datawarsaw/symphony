@@ -190,6 +190,67 @@ defmodule SymphonyElixir.Codex.AppServer do
     stop_port(port)
   end
 
+  @doc """
+  Exposes structured protocol/transport failure information for a Codex
+  session error without owning retry policy.
+
+  Only surfaces provider reset timing when the runtime reliably provides it
+  (explicit numeric reset/retry-after fields); otherwise returns nil.
+  """
+  @spec failure_info({:error, term()} | term()) :: map()
+  def failure_info({:error, reason}), do: describe_reason(reason)
+  def failure_info(reason), do: describe_reason(reason)
+
+  @spec describe_reason(term()) :: map()
+  defp describe_reason({kind, payload}) when is_atom(kind) and is_map(payload) do
+    %{
+      kind: kind,
+      message: extract_message(payload),
+      http_status: extract_http_status(payload),
+      reset_after_ms: extract_reset_after_ms(payload),
+      raw: %{kind: kind, payload: payload}
+    }
+  end
+
+  defp describe_reason({kind, detail}) when is_atom(kind) do
+    %{kind: kind, message: inspect(detail), http_status: nil, reset_after_ms: nil, raw: detail}
+  end
+
+  defp describe_reason(reason) when is_atom(reason) do
+    %{kind: reason, message: Atom.to_string(reason), http_status: nil, reset_after_ms: nil, raw: reason}
+  end
+
+  defp describe_reason(reason) when is_binary(reason) do
+    %{kind: :unknown, message: reason, http_status: nil, reset_after_ms: nil, raw: reason}
+  end
+
+  defp describe_reason(reason) do
+    %{kind: :unknown, message: inspect(reason), http_status: nil, reset_after_ms: nil, raw: reason}
+  end
+
+  @spec extract_message(map()) :: String.t()
+  defp extract_message(payload) do
+    cond do
+      is_binary(Map.get(payload, "message")) -> Map.get(payload, "message")
+      is_binary(Map.get(payload, "error")) -> inspect(Map.get(payload, "error"))
+      is_binary(Map.get(payload, :message)) -> Map.get(payload, :message)
+      true -> inspect(payload)
+    end
+  end
+
+  @spec extract_http_status(map()) :: pos_integer() | nil
+  defp extract_http_status(%{"status" => status}) when is_integer(status) and status > 0, do: status
+  defp extract_http_status(%{status: status}) when is_integer(status) and status > 0, do: status
+  defp extract_http_status(%{"http_status" => status}) when is_integer(status) and status > 0, do: status
+  defp extract_http_status(_payload), do: nil
+
+  @spec extract_reset_after_ms(map()) :: non_neg_integer() | nil
+  defp extract_reset_after_ms(%{"reset_after_ms" => ms}) when is_integer(ms) and ms >= 0, do: ms
+  defp extract_reset_after_ms(%{reset_after_ms: ms}) when is_integer(ms) and ms >= 0, do: ms
+  defp extract_reset_after_ms(%{"retry_after_ms" => ms}) when is_integer(ms) and ms >= 0, do: ms
+  defp extract_reset_after_ms(%{retry_after_ms: ms}) when is_integer(ms) and ms >= 0, do: ms
+  defp extract_reset_after_ms(_payload), do: nil
+
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
     expanded_root = Config.local_workspace_root()

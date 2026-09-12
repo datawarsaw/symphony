@@ -8,7 +8,8 @@ defmodule SymphonyElixir.TestSupport do
   @shared_app_env_keys [
     :workflow_file_path,
     :server_port_override,
-    :memory_tracker_issues
+    :memory_tracker_issues,
+    :retry_store_root
   ]
 
   @baseline_key {__MODULE__, :baseline}
@@ -155,6 +156,20 @@ defmodule SymphonyElixir.TestSupport do
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+
+        # MIC-195 Slice A: Orchestrators resolve RetryStore's root from the
+        # `:retry_store_root` app env on every record read/write, so one env
+        # override isolates test-started instances and the application-level
+        # one alike. A unique root per test keeps durable retry records out
+        # of the shared default workspace root in both directions; the
+        # restore_shared_state callback registered above re-asserts the
+        # configured baseline after this one removes the directory.
+        retry_store_root =
+          Path.join(System.tmp_dir!(), "symphony-elixir-retries-#{System.unique_integer([:positive])}")
+
+        Application.put_env(:symphony_elixir, :retry_store_root, retry_store_root)
+        on_exit(fn -> File.rm_rf(retry_store_root) end)
+
         stop_default_http_server()
 
         :ok

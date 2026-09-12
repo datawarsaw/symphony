@@ -17,5 +17,12 @@ config :symphony_elixir, SymphonyElixirWeb.Endpoint,
 
 if config_env() == :test do
   config :symphony_elixir,
-    workflow_file_path: Path.expand("../test/fixtures/startup_workflow.md", __DIR__)
+    workflow_file_path: Path.expand("../test/fixtures/startup_workflow.md", __DIR__),
+    # The application-level Orchestrator boots (and recovers durable retry
+    # records) before any test setup runs, so the test VM starts with its own
+    # per-run retry store root; TestSupport narrows this to a per-test root
+    # while each test executes. The default workspace root must never hold
+    # durable retry records during tests.
+    retry_store_root:
+      Path.join(System.tmp_dir!(), "symphony-elixir-retries-run-#{System.unique_integer([:positive])}")
 end
