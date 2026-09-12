@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
 
   alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.{FailureClass, RetryPolicy, RetryStore, WorkerFence}
+  alias SymphonyElixir.{DispatchRouter, FailureClass, RetryPolicy, RetryStore, WorkerFence}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -1058,8 +1058,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, resumed?) do
+    # MIC-195 C0: the route intent is decided here (only :primary exists before
+    # Slice C); DispatchRouter materializes the selection, AgentRunner forwards
+    # it, and AppServer consumes it without re-resolving routing policy.
+    dispatch_opts = [attempt: attempt, worker_host: worker_host, resumed: resumed?]
+    dispatch_selection = DispatchRouter.materialize(:primary, issue, dispatch_opts)
+
+    Logger.info(
+      "Dispatch route materialized for #{issue_context(issue)} intent=primary model=#{dispatch_selection.model} " <>
+        "reasoning_effort=#{dispatch_selection.reasoning_effort} route_source=#{dispatch_selection.route_source} " <>
+        "pinned=#{dispatch_selection.pinned} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
+    )
+
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host, resumed: resumed?)
+           AgentRunner.run(issue, recipient, dispatch_opts ++ [dispatch_selection: dispatch_selection])
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)

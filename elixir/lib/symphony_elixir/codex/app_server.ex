@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   alias SymphonyElixir.Codex.WorkerEnvironment
   alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Config
+  alias SymphonyElixir.DispatchRouter
   alias SymphonyElixir.Discovery.Session
   alias SymphonyElixir.PathSafety
   alias SymphonyElixir.SSH
@@ -54,7 +55,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     discovery_route = Keyword.get(opts, :discovery_route)
     dynamic_tool_binding = if discovery_route, do: Map.put(dynamic_tool_binding, :tool_specs, []), else: dynamic_tool_binding
     issue = Keyword.get(opts, :issue)
-    worker_route = if is_nil(discovery_route), do: WorkerRouting.resolve(opts, issue), else: nil
+    worker_route = worker_route_for(opts, issue, discovery_route)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
@@ -432,6 +433,18 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp route_overrides(_port, _workspace, nil, worker_route) do
     {:ok, WorkerRouting.thread_overrides(worker_route)}
+  end
+
+  # Discovery routes resolve through Discovery.Session; implementation workers
+  # use the selection materialized by DispatchRouter at dispatch time, and fall
+  # back to WorkerRouting resolution for callers that predate the seam.
+  defp worker_route_for(_opts, _issue, discovery_route) when not is_nil(discovery_route), do: nil
+
+  defp worker_route_for(opts, issue, nil) do
+    case Keyword.get(opts, :dispatch_selection) do
+      %DispatchRouter.Selection{} = selection -> DispatchRouter.worker_route(selection)
+      _ -> WorkerRouting.resolve(opts, issue)
+    end
   end
 
   defp discovery_overrides(port, workspace, route) do
