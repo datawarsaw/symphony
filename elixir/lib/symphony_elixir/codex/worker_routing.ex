@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Codex.WorkerRouting do
 
   @default_model "gpt-6-astra"
   @default_reasoning_effort "medium"
+  @valid_reasoning_efforts ["minimal", "low", "medium", "high", "xhigh"]
 
   @type route_source :: :default | :explicit_override
 
@@ -93,6 +94,38 @@ defmodule SymphonyElixir.Codex.WorkerRouting do
   end
 
   def validate_selection(_other, _route), do: {:error, :invalid_thread_start_response}
+
+  @doc """
+  Lists the reasoning efforts a materialized route selection may carry.
+  """
+  @spec valid_reasoning_efforts() :: [String.t(), ...]
+  def valid_reasoning_efforts, do: @valid_reasoning_efforts
+
+  @doc """
+  Lower-level validation for an already-resolved model/reasoning pair.
+
+  `SymphonyElixir.DispatchRouter` calls this when materializing an explicit
+  route against configured values: the model must be present and nonblank,
+  and the reasoning effort must be one of the supported codex efforts. This
+  is selection validation, not route resolution — it never reads dispatch
+  opts or issue labels, and it never decides between routes.
+  """
+  @spec validate_route_selection(term()) ::
+          {:ok, selection_evidence()} | {:error, {:invalid_route_selection, term()}}
+  def validate_route_selection(%{model: model, reasoning_effort: reasoning_effort}) do
+    cond do
+      not nonblank_string?(model) ->
+        {:error, {:invalid_route_selection, :missing_model}}
+
+      reasoning_effort not in @valid_reasoning_efforts ->
+        {:error, {:invalid_route_selection, {:invalid_reasoning_effort, reasoning_effort}}}
+
+      true ->
+        {:ok, %{model: model, reasoning_effort: reasoning_effort}}
+    end
+  end
+
+  def validate_route_selection(_other), do: {:error, {:invalid_route_selection, :missing_model}}
 
   @spec parse_model_from_command(String.t() | nil) :: String.t() | nil
   def parse_model_from_command(command) when is_binary(command) do
