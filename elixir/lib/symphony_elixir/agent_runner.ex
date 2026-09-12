@@ -10,12 +10,45 @@ defmodule SymphonyElixir.AgentRunner do
 
   @type worker_host :: String.t() | nil
 
+  defmodule FailureError do
+    @moduledoc """
+    Structured failure raised when an agent run fails.
+
+    Carries the canonical MIC-195 failure class so the orchestrator can make
+    retry/park decisions without parsing error strings.
+    """
+
+    defexception [:message, :failure_class, :failure_info, :reason]
+
+    @impl true
+    def exception(opts) when is_list(opts) do
+      %__MODULE__{
+        message: Keyword.get(opts, :message, "agent run failed"),
+        failure_class: Keyword.get(opts, :failure_class, :transient_worker_failure),
+        failure_info: Keyword.get(opts, :failure_info, %{}),
+        reason: Keyword.get(opts, :reason)
+      }
+    end
+  end
+
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:continue, Issue.t()} | {:done, Issue.t()} | {:error, term()}
   def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher)
       when is_function(issue_state_fetcher, 1) do
     continue_with_issue?(issue, issue_state_fetcher)
+  end
+
+  @doc """
+  Classifies a complete failed attempt into the canonical MIC-195 failure class.
+  """
+  @spec classify_failure(term()) :: atom()
+  def classify_failure(reason),
+    do: classify_failure(reason, AppServer.failure_info({:error, reason}))
+
+  @spec classify_failure(term(), map()) :: atom()
+  def classify_failure(reason, info) when is_map(info) do
+    SymphonyElixir.FailureClass.classify(%{reason: reason, info: info})
   end
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
@@ -31,7 +64,13 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        info = AppServer.failure_info({:error, reason})
+        class = classify_failure(reason, info)
+        raise FailureError,
+          message: "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}",
+          failure_class: class,
+          failure_info: info,
+          reason: reason
     end
   end
 

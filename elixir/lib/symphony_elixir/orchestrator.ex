@@ -5,13 +5,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   use GenServer
   require Logger
-  import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{FailureClass, RetryPolicy, RetryStore, WorkerFence}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
-  @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -39,6 +38,8 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      parked: %{},
+      retry_history: %{},
       resumed_issues: MapSet.new(),
       orphaned_workspaces: [],
       startup_reconciled: false,
@@ -74,6 +75,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         run_terminal_workspace_cleanup()
         state = run_startup_reconciliation(state)
+        state = recover_retry_records(state)
         state = schedule_tick(state, 0)
 
         {:ok, state}
@@ -260,18 +262,32 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
-    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+    {decision, class, history, state} = note_failure(state, issue_id, reason)
+    error = "agent exited: #{inspect(reason)}"
+    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)} failure_class=#{FailureClass.to_name(class)}")
 
-    next_attempt = next_retry_attempt_from_running(running_entry)
-
-    schedule_issue_retry(state, issue_id, next_attempt, %{
+    metadata = %{
       identifier: running_entry.identifier,
       issue_url: running_entry.issue.url,
-      error: "agent exited: #{inspect(reason)}",
+      error: error,
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
-      workspace_root: Map.get(running_entry, :workspace_root)
-    })
+      workspace_root: Map.get(running_entry, :workspace_root),
+      failure_class: FailureClass.to_name(class),
+      attempt_count: Map.get(history, :attempt_count, 1),
+      identical_failure_count: Map.get(history, :identical_failure_count, 1),
+      first_failure_at: Map.get(history, :first_failure_at_dt),
+      reset_in_ms: FailureClass.reset_in_ms(reason)
+    }
+
+    case decision do
+      {:park, stop_reason} ->
+        park_issue(state, issue_id, running_entry, Map.put(metadata, :stop_reason, stop_reason))
+
+      :retry ->
+        next_attempt = next_retry_attempt_from_running(running_entry)
+        schedule_issue_retry(state, issue_id, next_attempt, metadata)
+    end
   end
 
   defp maybe_dispatch(%State{} = state) do
@@ -895,6 +911,7 @@ defmodule SymphonyElixir.Orchestrator do
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
+      !Map.has_key?(state.parked, issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -1120,10 +1137,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
   defp complete_issue(%State{} = state, issue_id) do
+    delete_retry_record_best_effort(issue_id)
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        parked: Map.delete(state.parked, issue_id),
+        retry_history: Map.delete(state.retry_history, issue_id)
     }
   end
 
@@ -1152,7 +1172,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
 
-    %{
+    new_state = %{
       state
       | retry_attempts:
           Map.put(state.retry_attempts, issue_id, %{
@@ -1168,6 +1188,9 @@ defmodule SymphonyElixir.Orchestrator do
             workspace_root: workspace_root
           })
     }
+
+    persist_failure_retry_record(new_state, issue_id, next_attempt, delay_ms, metadata)
+    new_state
   end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
@@ -1199,13 +1222,33 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
 
-        {:noreply,
-         schedule_issue_retry(
-           state,
-           issue_id,
-           attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
-         )}
+        {decision, class, history, state} = note_failure(state, issue_id, {:retry_poll_failed, reason})
+
+        case decision do
+          {:park, stop_reason} ->
+            park_metadata =
+              metadata
+              |> Map.merge(%{
+                failure_class: FailureClass.to_name(class),
+                stop_reason: stop_reason,
+                error: "retry poll failed: #{inspect(reason)}",
+                attempt_count: Map.get(history, :attempt_count, 1),
+                identical_failure_count: Map.get(history, :identical_failure_count, 1),
+                first_failure_at: Map.get(history, :first_failure_at_dt),
+                reset_in_ms: nil
+              })
+
+            {:noreply, park_issue(state, issue_id, nil, park_metadata)}
+
+          :retry ->
+            {:noreply,
+             schedule_issue_retry(
+               state,
+               issue_id,
+               attempt + 1,
+               Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+             )}
+        end
     end
   end
 
@@ -1438,26 +1481,27 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
+    delete_retry_record_best_effort(issue_id)
     %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
         resumed_issues: MapSet.delete(state.resumed_issues, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        parked: Map.delete(state.parked, issue_id),
+        retry_history: Map.delete(state.retry_history, issue_id)
     }
   end
 
+  # The continuation check delay is scheduling state, not failure policy.
+  # Failure backoff (exponential schedule, cap, provider reset floor) is owned
+  # by RetryPolicy.backoff_delay/3 — the single production authority.
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] == :continuation and attempt == 1 do
       @continuation_retry_delay_ms
     else
-      failure_retry_delay(attempt)
+      RetryPolicy.backoff_delay(attempt, Config.settings!().agent.max_retry_backoff_ms, metadata[:reset_in_ms])
     end
-  end
-
-  defp failure_retry_delay(attempt) do
-    max_delay_power = min(attempt - 1, 10)
-    min(@failure_retry_base_ms * (1 <<< max_delay_power), Config.settings!().agent.max_retry_backoff_ms)
   end
 
   defp normalize_retry_attempt(attempt) when is_integer(attempt) and attempt > 0, do: attempt
@@ -1469,6 +1513,299 @@ defmodule SymphonyElixir.Orchestrator do
       _ -> nil
     end
   end
+
+  @doc false
+  @spec note_failure_for_test(term(), String.t(), term()) :: term()
+  def note_failure_for_test(%State{} = state, issue_id, reason) when is_binary(issue_id) do
+    note_failure(state, issue_id, reason)
+  end
+
+  @doc false
+  @spec parked_for_test(term()) :: map()
+  def parked_for_test(%State{parked: parked}), do: parked
+
+  @doc false
+  @spec retry_history_for_test(term()) :: map()
+  def retry_history_for_test(%State{retry_history: history}), do: history
+
+  @doc false
+  @spec recover_retry_records_for_test(term()) :: term()
+  def recover_retry_records_for_test(%State{} = state), do: recover_retry_records(state)
+
+  @doc false
+  @spec handle_failure_for_test(term(), String.t(), map(), String.t(), term()) :: term()
+  def handle_failure_for_test(%State{} = state, issue_id, running_entry, session_id, reason) do
+    retry_agent_down(state, issue_id, running_entry, session_id, reason)
+  end
+
+  @spec note_failure(term(), String.t(), term()) ::
+          {:retry | {:park, atom()}, atom(), map(), term()}
+  defp note_failure(%State{} = state, issue_id, reason) do
+    class = AgentRunner.classify_failure(reason)
+    now_ms = System.monotonic_time(:millisecond)
+    now_dt = DateTime.utc_now()
+
+    {decision, history} =
+      case RetryPolicy.evaluate(%{
+             failure_class: class,
+             history: Map.get(state.retry_history, issue_id),
+             now_ms: now_ms
+           }) do
+        {:retry, history} -> {:retry, history}
+        {:park, stop_reason, history} -> {{:park, stop_reason}, history}
+      end
+
+    history =
+      history
+      |> Map.put_new(:first_failure_at_dt, DateTime.to_iso8601(now_dt))
+      |> Map.put(:last_failure_at_dt, DateTime.to_iso8601(now_dt))
+
+    {decision, class, history, %{state | retry_history: Map.put(state.retry_history, issue_id, history)}}
+  end
+
+  @spec park_issue(term(), String.t(), map() | nil, map()) :: term()
+  defp park_issue(%State{} = state, issue_id, running_entry, metadata) when is_map(metadata) do
+    history = Map.get(state.retry_history, issue_id, %{})
+    now_dt = DateTime.utc_now()
+    runtime = running_entry || %{}
+    class_name = metadata[:failure_class] || "TRANSIENT_WORKER_FAILURE"
+    stop_reason = metadata[:stop_reason] || :max_attempts
+
+    Logger.warning("Parking issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id} failure_class=#{class_name} stop_reason=#{inspect(stop_reason)}")
+
+    entry = %{
+      issue_id: issue_id,
+      identifier: metadata[:identifier] || issue_id,
+      issue_url: metadata[:issue_url],
+      failure_class: class_name,
+      stop_reason: stop_reason,
+      attempt_count: metadata[:attempt_count] || Map.get(history, :attempt_count, 1),
+      identical_failure_count: metadata[:identical_failure_count] || Map.get(history, :identical_failure_count, 1),
+      first_failure_at: metadata[:first_failure_at] || Map.get(history, :first_failure_at_dt) || DateTime.to_iso8601(now_dt),
+      last_failure_at: DateTime.to_iso8601(now_dt),
+      error: metadata[:error],
+      worker_host: metadata[:worker_host] || Map.get(runtime, :worker_host),
+      workspace_path: metadata[:workspace_path] || Map.get(runtime, :workspace_path),
+      workspace_root: metadata[:workspace_root] || Map.get(runtime, :workspace_root),
+      parked_at: DateTime.to_iso8601(now_dt)
+    }
+
+    state = cancel_retry_timer(state, issue_id)
+    write_retry_record_best_effort(issue_id, entry, "parked")
+
+    %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
+  end
+
+  @spec cancel_retry_timer(term(), String.t()) :: term()
+  defp cancel_retry_timer(%State{} = state, issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{timer_ref: ref} when is_reference(ref) -> Process.cancel_timer(ref)
+      _ -> :ok
+    end
+
+    %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
+  end
+
+  @spec persist_failure_retry_record(term(), String.t(), integer() | nil, integer(), map()) :: :ok
+  defp persist_failure_retry_record(_state, issue_id, attempt, delay_ms, metadata) do
+    if is_binary(metadata[:failure_class]) do
+      now_dt = DateTime.utc_now()
+      entry = %{
+        issue_id: issue_id,
+        identifier: metadata[:identifier] || issue_id,
+        issue_url: metadata[:issue_url],
+        failure_class: metadata[:failure_class],
+        stop_reason: nil,
+        attempt_count: metadata[:attempt_count] || attempt || 1,
+        identical_failure_count: metadata[:identical_failure_count] || 1,
+        first_failure_at: metadata[:first_failure_at] || DateTime.to_iso8601(now_dt),
+        last_failure_at: DateTime.to_iso8601(now_dt),
+        error: metadata[:error],
+        worker_host: metadata[:worker_host],
+        workspace_path: metadata[:workspace_path],
+        workspace_root: metadata[:workspace_root],
+        next_retry_in_ms: delay_ms
+      }
+
+      write_retry_record_best_effort(issue_id, entry, "retrying")
+    else
+      :ok
+    end
+  end
+
+  @spec write_retry_record_best_effort(String.t(), map(), String.t()) :: :ok
+  defp write_retry_record_best_effort(issue_id, entry, status) do
+    root = retry_store_root()
+
+    record =
+      RetryStore.build_record(%{
+        issue_id: issue_id,
+        identifier: entry.identifier || issue_id,
+        status: status,
+        failure_class: entry.failure_class || "TRANSIENT_WORKER_FAILURE",
+        attempt_count: entry.attempt_count || 1,
+        identical_failure_count: entry.identical_failure_count || 1,
+        first_failure_at: entry.first_failure_at,
+        last_failure_at: entry.last_failure_at,
+        next_retry_at: next_retry_at_iso(entry),
+        last_error: entry.error || "",
+        worker_host: entry.worker_host || "",
+        workspace_path: entry.workspace_path || "",
+        workspace_root: entry.workspace_root || root
+      })
+
+    try do
+      RetryStore.write_record(root, record)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+  end
+
+  @spec next_retry_at_iso(map()) :: String.t() | nil
+  defp next_retry_at_iso(%{next_retry_in_ms: delay_ms}) when is_integer(delay_ms) and delay_ms >= 0 do
+    DateTime.utc_now() |> DateTime.add(delay_ms, :millisecond) |> DateTime.to_iso8601()
+  end
+  defp next_retry_at_iso(_entry), do: nil
+
+  @spec delete_retry_record_best_effort(String.t()) :: :ok
+  defp delete_retry_record_best_effort(issue_id) do
+    try do
+      RetryStore.delete_record(retry_store_root(), issue_id)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+  end
+
+  @spec retry_store_root() :: String.t()
+  defp retry_store_root do
+    Application.get_env(:symphony_elixir, :retry_store_root) || Config.local_workspace_root()
+  end
+
+  @spec recover_retry_records(term()) :: term()
+  defp recover_retry_records(%State{} = state) do
+    root = retry_store_root()
+
+    Enum.reduce(RetryStore.list_records(root), state, fn {file_id, result}, acc ->
+      case result do
+        {:ok, record} -> recover_retry_record(acc, record, root)
+        {:error, reason} ->
+          Logger.warning("Ignoring corrupt retry record file_id=#{file_id}: #{inspect(reason)}; preserving workspaces")
+          acc
+      end
+    end)
+  end
+
+  @spec recover_retry_record(term(), map(), String.t()) :: term()
+  defp recover_retry_record(%State{} = state, record, root) do
+    with issue_id when is_binary(issue_id) <- Map.get(record, "issue_id"),
+         status when status in ["retrying", "parked"] <- Map.get(record, "status"),
+         class_name when is_binary(class_name) <- Map.get(record, "failure_class"),
+         {:ok, class} <- FailureClass.from_name(class_name),
+         count when is_integer(count) <- Map.get(record, "attempt_count"),
+         {:ok, first_dt} <- parse_record_time(Map.get(record, "first_failure_at")) do
+      recover_valid_retry_record(state, record, root, issue_id, status, class, count, first_dt)
+    else
+      _ ->
+        issue_id = Map.get(record, "issue_id")
+        Logger.warning("Ambiguous retry record #{inspect(issue_id)}; failing closed with claim and no timer")
+        if is_binary(issue_id), do: %{state | claimed: MapSet.put(state.claimed, issue_id)}, else: state
+    end
+  end
+
+  @spec parse_record_time(term()) :: {:ok, DateTime.t()} | :error
+  defp parse_record_time(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} -> {:ok, dt}
+      _ -> :error
+    end
+  end
+  defp parse_record_time(_value), do: :error
+
+  @spec recover_valid_retry_record(term(), map(), String.t(), String.t(), String.t(), atom(), integer(), DateTime.t()) :: term()
+  defp recover_valid_retry_record(state, record, root, issue_id, status, class, count, first_dt) do
+    now_dt = DateTime.utc_now()
+    now_ms = System.monotonic_time(:millisecond)
+    age_ms = max(0, DateTime.diff(now_dt, first_dt, :millisecond))
+    identical = Map.get(record, "identical_failure_count", 1)
+    identical = if is_integer(identical), do: identical, else: 1
+    class_name = FailureClass.to_name(class)
+
+    history = %{
+      attempt_count: count,
+      identical_failure_count: identical,
+      first_failure_at_ms: now_ms - age_ms,
+      last_failure_at_ms: now_ms,
+      last_failure_class: class,
+      first_failure_at_dt: Map.get(record, "first_failure_at"),
+      last_failure_at_dt: Map.get(record, "last_failure_at")
+    }
+
+    base_entry = %{
+      issue_id: issue_id,
+      identifier: Map.get(record, "identifier", issue_id),
+      issue_url: nil,
+      failure_class: class_name,
+      stop_reason: nil,
+      attempt_count: count,
+      identical_failure_count: identical,
+      first_failure_at: Map.get(record, "first_failure_at"),
+      last_failure_at: Map.get(record, "last_failure_at"),
+      error: Map.get(record, "last_error"),
+      worker_host: Map.get(record, "worker_host"),
+      workspace_path: Map.get(record, "workspace_path"),
+      workspace_root: Map.get(record, "workspace_root", root)
+    }
+
+    state = %{state | retry_history: Map.put(state.retry_history, issue_id, history)}
+
+    case status do
+      "parked" ->
+        entry = Map.merge(base_entry, %{stop_reason: :recovered_parked, parked_at: DateTime.to_iso8601(now_dt)})
+        %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
+
+      "retrying" ->
+        case recover_fence_verdict(Map.get(record, "worker_identity")) do
+          {:ok, :dead} ->
+            metadata = %{
+              identifier: base_entry.identifier,
+              issue_url: nil,
+              error: base_entry.error,
+              worker_host: base_entry.worker_host,
+              workspace_path: base_entry.workspace_path,
+              workspace_root: base_entry.workspace_root,
+              failure_class: class_name,
+              attempt_count: count,
+              identical_failure_count: identical,
+              first_failure_at: base_entry.first_failure_at,
+              reset_in_ms: nil
+            }
+
+            state = %{state | claimed: MapSet.put(state.claimed, issue_id)}
+            schedule_issue_retry(state, issue_id, count + 1, metadata)
+
+          {:error, :alive} ->
+            Logger.warning("Retry record worker still alive for issue_id=#{issue_id}; failing closed with claim and no timer")
+            entry = Map.merge(base_entry, %{stop_reason: :fence_alive, parked_at: DateTime.to_iso8601(now_dt)})
+            %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
+
+          {:error, :unknown} ->
+            Logger.warning("Retry record has no provable worker identity for issue_id=#{issue_id}; failing closed to PARKED with claim and no timer")
+            entry = Map.merge(base_entry, %{stop_reason: :fence_unknown, parked_at: DateTime.to_iso8601(now_dt)})
+            %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
+        end
+    end
+  end
+
+  # MIC-223: UNKNOWN -> no cleanup + no redispatch; absence of identity is never
+  # evidence of death. Only explicit never-spawned evidence (Port.open never
+  # succeeded for the workspace) is positively proven DEAD and safe to redispatch.
+  @spec recover_fence_verdict(term()) :: WorkerFence.verdict()
+  defp recover_fence_verdict("never_spawned"), do: WorkerFence.confirm_never_spawned(:never_spawned)
+  defp recover_fence_verdict(identity), do: WorkerFence.confirm_dead(identity)
 
   defp pick_retry_identifier(issue_id, previous_retry, metadata) do
     metadata[:identifier] || Map.get(previous_retry, :identifier) || issue_id
@@ -1694,11 +2031,28 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    parked =
+      state.parked
+      |> Enum.map(fn {issue_id, metadata} ->
+        %{
+          issue_id: issue_id,
+          identifier: Map.get(metadata, :identifier),
+          failure_class: Map.get(metadata, :failure_class),
+          stop_reason: Map.get(metadata, :stop_reason),
+          attempt_count: Map.get(metadata, :attempt_count),
+          error: Map.get(metadata, :error),
+          worker_host: Map.get(metadata, :worker_host),
+          workspace_path: Map.get(metadata, :workspace_path),
+          parked_at: Map.get(metadata, :parked_at)
+        }
+      end)
+
     {:reply,
-     %{
+    %{
        running: running,
        retrying: retrying,
        blocked: blocked,
+       parked: parked,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
