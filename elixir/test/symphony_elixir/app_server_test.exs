@@ -3,6 +3,7 @@ defmodule SymphonyElixir.AppServerTest do
 
   alias SymphonyElixir.Codex.WorkerEnvironment
   alias SymphonyElixir.DispatchRouter
+  alias SymphonyElixir.RetryPolicy
   alias SymphonyElixir.TestSupport.FakeSSH
 
  # Symlink escape coverage runs with a real symlink when the host allows it and
@@ -1908,6 +1909,132 @@ defmodule SymphonyElixir.AppServerTest do
       assert payload["params"]["config"]["model_reasoning_effort"] == fallback_reasoning
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  # MIC-195 Slice C precondition (C0 review finding): the presence of the
+  # :dispatch_selection key is meaningful. These tests use a nonexistent codex
+  # binary as a discriminator — a legacy re-resolution would attempt a spawn
+  # and fail with a port error, while fail-closed must return
+  # {:invalid_dispatch_selection, _} without ever attempting a session.
+  describe "dispatch_selection precondition fails closed" do
+    defp precondition_workspace_root(test_root) do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      workspace_root
+    end
+
+    defp precondition_issue do
+      %Issue{
+        id: "issue-precondition",
+        identifier: "MT-PRECOND",
+        title: "Dispatch selection precondition",
+        description: "Invalid dispatch selections must never silently execute primary",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-PRECOND",
+        labels: ["backend"]
+      }
+    end
+
+    test "absent dispatch_selection resolves through the legacy WorkerRouting path" do
+      test_root =
+        Path.join(System.tmp_dir!(), "symphony-elixir-precond-absent-#{System.unique_integer([:positive])}")
+
+      try do
+        workspace_root = precondition_workspace_root(test_root)
+        workspace = Path.join(workspace_root, "MT-PRECOND")
+        File.mkdir_p!(workspace)
+        codex_binary = Path.join(test_root, "fake-codex")
+
+        File.write!(codex_binary, """
+        #!/bin/sh
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          case "$count" in
+            1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+            2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-precond"}}}' ;;
+            *) exit 0 ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: workspace_root,
+          codex_command: "#{String.replace(codex_binary, "\\", "/")} app-server",
+          codex_fallback_enabled: true,
+          codex_fallback_model: "gpt-5.6-sol"
+        )
+
+        issue = precondition_issue()
+
+        # No :dispatch_selection key: legacy resolution must still be used, and
+        # it must NOT pick up the configured fallback route.
+        assert {:ok, session} = AppServer.start_session(workspace, issue: issue)
+        assert session.model == "gpt-6-astra"
+        assert session.route_source == :default
+      after
+        File.rm_rf(test_root)
+      end
+    end
+
+    test "a leaked fallback materialization error tuple fails closed instead of starting a primary session" do
+      test_root =
+        Path.join(System.tmp_dir!(), "symphony-elixir-precond-tuple-#{System.unique_integer([:positive])}")
+
+      try do
+        workspace_root = precondition_workspace_root(test_root)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: workspace_root,
+          # Any session attempt would fail with an unresolvable codex command,
+          # never with the precondition error.
+          codex_command: "definitely-missing-codex-binary-#{System.unique_integer([:positive])} app-server"
+        )
+
+        issue = precondition_issue()
+
+        assert {:error, {:invalid_dispatch_selection, {:error, :fallback_disabled}}} =
+                 AppServer.start_session(Path.join(workspace_root, "MT-PRECOND"),
+                   issue: issue,
+                   dispatch_selection: {:error, :fallback_disabled}
+                 )
+      after
+        File.rm_rf(test_root)
+      end
+    end
+
+    test "a malformed dispatch_selection fails closed instead of starting a primary session" do
+      test_root =
+        Path.join(System.tmp_dir!(), "symphony-elixir-precond-malformed-#{System.unique_integer([:positive])}")
+
+      try do
+        workspace_root = precondition_workspace_root(test_root)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: workspace_root,
+          codex_command: "definitely-missing-codex-binary-#{System.unique_integer([:positive])} app-server"
+        )
+
+        issue = precondition_issue()
+        malformed = %{model: "gpt-5.6-sol", reasoning_effort: "high"}
+
+        assert {:error, {:invalid_dispatch_selection, ^malformed}} =
+                 AppServer.start_session(Path.join(workspace_root, "MT-PRECOND"),
+                   issue: issue,
+                   dispatch_selection: malformed
+                 )
+      after
+        File.rm_rf(test_root)
+      end
+    end
+
+    test "an invalid dispatch_selection error is classified as a non-provider failure" do
+      reason = {:invalid_dispatch_selection, {:error, :fallback_disabled}}
+      assert AgentRunner.classify_failure(reason) == :transient_worker_failure
+      refute reason |> AgentRunner.classify_failure() |> RetryPolicy.fallback_eligible_class?()
     end
   end
 end

@@ -8,6 +8,14 @@ defmodule SymphonyElixir.RetryPolicy do
   formula. It is free of timers, filesystem I/O, tracker calls, process
   inspection, and Orchestrator state mutation.
 
+  Slice C adds the pure fallback route policy to the same authority: the
+  fallback-eligible failure classes, the per-class thresholds of consecutive
+  eligible primary failures, the primary→fallback route fold, and the
+  pin/opt-in permission rule (`fallback_eligible_class?/1`,
+  `update_route_state/2`, `fallback_route_decision/3`, `pin_permits_fallback?/2`).
+  The decision consumes only already-classified failures and caller-supplied
+  gate results; it never reads config or performs I/O.
+
   Failure classification remains owned by `SymphonyElixir.FailureClass`;
   this module consumes already-classified failure information and never
   parses raw app-server errors. The Orchestrator keeps the process concerns
@@ -32,6 +40,29 @@ defmodule SymphonyElixir.RetryPolicy do
 
   @type stop_reason :: :max_attempts | :max_age | :max_identical | :auth_unavailable
   @type decision :: {:retry, map()} | {:park, stop_reason(), map()}
+
+  # ── MIC-195 Slice C: fallback route policy ─────────────────────────────────
+  #
+  # The fallback route decision is pure: the Orchestrator classifies the
+  # failure, folds the durable route state, evaluates the config/pin gates,
+  # and persists the result. This module owns the single authority for the
+  # eligible classes, the per-class thresholds, the consecutive eligible
+  # primary-failure fold, and the pin/opt-in permission rule. It never reads
+  # config, performs I/O, spawns, or touches Orchestrator state.
+
+  @fallback_eligible_classes [:model_unavailable, :provider_quota, :provider_rate_limit, :provider_outage]
+
+  @fallback_thresholds %{
+    model_unavailable: 1,
+    provider_quota: 2,
+    provider_rate_limit: 2,
+    provider_outage: 2
+  }
+
+  @type route :: :primary | :fallback
+  @type route_state :: %{route: route(), primary_failure_count: non_neg_integer()}
+  @type fallback_opt_in :: :none | :opt_in | :opt_out | :ambiguous
+  @type route_decision :: {:switch_to_fallback, route_state()} | {:stay_primary, route_state()} | {:stay_fallback, route_state()}
 
   @doc "Maximum automatic failure attempts before parking."
   @spec max_attempts() :: pos_integer()
@@ -157,4 +188,146 @@ defmodule SymphonyElixir.RetryPolicy do
     exponential = min(@retry_base_ms * (1 <<< min(safe_attempt - 1, 10)), max_ms)
     if is_integer(reset_in_ms) and reset_in_ms > exponential, do: reset_in_ms, else: exponential
   end
+
+  @doc "Failure classes eligible for automatic primary→fallback routing (exact set, closed for extension)."
+  @spec fallback_eligible_classes() :: [FailureClass.t(), ...]
+  def fallback_eligible_classes, do: @fallback_eligible_classes
+
+  @doc "True when the class may trigger automatic fallback."
+  @spec fallback_eligible_class?(FailureClass.t()) :: boolean()
+  def fallback_eligible_class?(class), do: class in @fallback_eligible_classes
+
+  @doc """
+  Consecutive eligible primary failures required before switching to fallback
+  for the class, or nil when the class is not fallback-eligible.
+  """
+  @spec fallback_threshold(FailureClass.t()) :: pos_integer() | nil
+  def fallback_threshold(class) when class in @fallback_eligible_classes, do: Map.fetch!(@fallback_thresholds, class)
+  def fallback_threshold(_class), do: nil
+
+  @doc "Route state for a fresh failure sequence."
+  @spec new_route_state() :: route_state()
+  def new_route_state, do: %{route: :primary, primary_failure_count: 0}
+
+  @doc """
+  Fold one classified failure into the consecutive eligible-primary-failure count.
+
+  * eligible failure while route == primary → increment `primary_failure_count`;
+  * ineligible failure while route == primary → reset the count to 0 (the
+    consecutive eligible-primary sequence is terminated);
+  * any failure while route == fallback → count unchanged (fallback failures
+    never increment it and the latch never folds back to primary).
+
+  The count is diagnostic after the switch: it is preserved, not incremented,
+  for the rest of the failure sequence.
+  """
+  @spec update_route_state(route_state() | nil, FailureClass.t()) :: route_state()
+  def update_route_state(nil, failure_class), do: update_route_state(new_route_state(), failure_class)
+
+  def update_route_state(route_state, failure_class) when is_map(route_state) do
+    case Map.get(route_state, :route, :primary) do
+      :fallback ->
+        route_state
+
+      _primary ->
+        count = Map.get(route_state, :primary_failure_count, 0)
+        next_count = if fallback_eligible_class?(failure_class), do: count + 1, else: 0
+        route_state |> Map.put(:route, :primary) |> Map.put(:primary_failure_count, next_count)
+    end
+  end
+
+  def update_route_state(_route_state, failure_class), do: update_route_state(new_route_state(), failure_class)
+
+  @doc """
+  Decide the route of the NEXT attempt after a classified failure was folded
+  into `route_state` (fold first via `update_route_state/2`).
+
+  Options:
+
+    * `:pinned` — true when the failing dispatch carried an explicit
+      model/reasoning pin.
+    * `:fallback_opt_in` — parsed explicit fallback opt-in (`fallback_opt_in/1`).
+    * `:fallback_available` — true when the caller verified the fallback seam
+      is enabled with a valid model/reasoning pair (the Orchestrator probes
+      this through `DispatchRouter.materialize/3`; config never crosses this
+      boundary).
+
+  Rules:
+
+    * route == :fallback → `{:stay_fallback, route_state}` — the latch holds
+      for the whole failure sequence; fallback never routes back to primary.
+    * otherwise `{:switch_to_fallback, ...}` only when the class is eligible,
+      the per-class threshold of consecutive eligible primary failures is
+      reached, the fallback seam is available, and the pin policy permits;
+    * every other case → `{:stay_primary, route_state}`.
+  """
+  @spec fallback_route_decision(route_state(), FailureClass.t(), keyword()) :: route_decision()
+  def fallback_route_decision(route_state, failure_class, opts \\ []) when is_list(opts) do
+    case Map.get(route_state, :route, :primary) do
+      :fallback ->
+        {:stay_fallback, route_state}
+
+      _primary ->
+        if switch_eligible?(route_state, failure_class, opts) do
+          {:switch_to_fallback, Map.put(route_state, :route, :fallback)}
+        else
+          {:stay_primary, Map.put(route_state, :route, :primary)}
+        end
+    end
+  end
+
+  defp switch_eligible?(route_state, failure_class, opts) do
+    fallback_eligible_class?(failure_class) and
+      Map.get(route_state, :primary_failure_count, 0) >= fallback_threshold(failure_class) and
+      Keyword.get(opts, :fallback_available, false) and
+      pin_permits_fallback?(Keyword.get(opts, :pinned, false), Keyword.get(opts, :fallback_opt_in, :none))
+  end
+
+  @doc """
+  Whether an explicit pin permits automatic fallback.
+
+  * ambiguous or explicit `false` opt-in → never (fail closed);
+  * pinned without an explicit `fallback: true` opt-in → never (a pin is never
+    silently overridden and the opt-in is never inferred);
+  * pinned with an explicit opt-in → permitted;
+  * unpinned → permitted.
+  """
+  @spec pin_permits_fallback?(boolean(), fallback_opt_in()) :: boolean()
+  def pin_permits_fallback?(_pinned, :ambiguous), do: false
+  def pin_permits_fallback?(_pinned, :opt_out), do: false
+  def pin_permits_fallback?(true, :opt_in), do: true
+  def pin_permits_fallback?(true, _none), do: false
+  def pin_permits_fallback?(false, _opt_in), do: true
+
+  @doc """
+  Parse the explicit fallback opt-in from an issue's labels.
+
+  Exactly one `fallback:` label with value `true`/`false` (case-insensitive)
+  parses to `:opt_in`/`:opt_out`. Any other value, an empty value, or more
+  than one `fallback:` label is `:ambiguous` (fail closed). No `fallback:`
+  label is `:none`; the opt-in is never inferred from anything else.
+  """
+  @spec fallback_opt_in(term()) :: fallback_opt_in()
+  def fallback_opt_in(labels) when is_list(labels) do
+    values =
+      labels
+      |> Enum.filter(&is_binary/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.filter(&String.starts_with?(String.downcase(&1), "fallback:"))
+      |> Enum.map(fn label ->
+        label |> String.slice(String.length("fallback:")..-1//1) |> String.trim() |> String.downcase()
+      end)
+
+    case values do
+      [] -> :none
+      [value] -> parse_opt_in_value(value)
+      _multiple -> :ambiguous
+    end
+  end
+
+  def fallback_opt_in(_labels), do: :none
+
+  defp parse_opt_in_value("true"), do: :opt_in
+  defp parse_opt_in_value("false"), do: :opt_out
+  defp parse_opt_in_value(_other), do: :ambiguous
 end

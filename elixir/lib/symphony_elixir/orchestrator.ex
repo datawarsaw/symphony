@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.{DispatchRouter, FailureClass, RetryPolicy, RetryStore, WorkerFence}
+  alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -263,6 +264,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
     {decision, class, history, state} = note_failure(state, issue_id, reason)
+    {decision, history, state} = apply_fallback_decision(state, issue_id, class, history, decision, running_entry)
     error = "agent exited: #{inspect(reason)}"
     Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)} failure_class=#{FailureClass.to_name(class)}")
 
@@ -277,7 +279,9 @@ defmodule SymphonyElixir.Orchestrator do
       attempt_count: Map.get(history, :attempt_count, 1),
       identical_failure_count: Map.get(history, :identical_failure_count, 1),
       first_failure_at: Map.get(history, :first_failure_at_dt),
-      reset_in_ms: FailureClass.reset_in_ms(reason)
+      reset_in_ms: FailureClass.reset_in_ms(reason),
+      route: Map.get(history, :route, :primary),
+      primary_failure_count: Map.get(history, :primary_failure_count, 0)
     }
 
     case decision do
@@ -288,6 +292,66 @@ defmodule SymphonyElixir.Orchestrator do
         next_attempt = next_retry_attempt_from_running(running_entry)
         schedule_issue_retry(state, issue_id, next_attempt, metadata)
     end
+  end
+
+  # MIC-195 Slice C: after the envelope fold, decide whether the next attempt
+  # stays on primary or switches to the configured fallback route. The pure
+  # decision lives in RetryPolicy; the Orchestrator evaluates the gates it owns
+  # (issue pins, the fallback label opt-in, and fallback seam availability,
+  # probed through the DispatchRouter) and persists the outcome. Only reached
+  # on :retry — a parked issue dispatches nothing, primary or fallback.
+  defp apply_fallback_decision(state, _issue_id, _class, history, {:park, _stop_reason} = decision, _running_entry) do
+    {decision, history, state}
+  end
+
+  defp apply_fallback_decision(%State{} = state, issue_id, class, history, :retry, running_entry) do
+    route_state_before = route_state_from_history(history)
+    {pinned, opt_in, fallback_available} = fallback_decision_gates(Map.get(running_entry, :issue))
+
+    {route_decision, route_state} =
+      RetryPolicy.fallback_route_decision(route_state_before, class,
+        pinned: pinned,
+        fallback_opt_in: opt_in,
+        fallback_available: fallback_available
+      )
+
+    log_route_decision(issue_id, class, route_decision, route_state)
+
+    history = Map.merge(history, %{route: route_state.route, primary_failure_count: route_state.primary_failure_count})
+    {:retry, history, %{state | retry_history: Map.put(state.retry_history, issue_id, history)}}
+  end
+
+  defp log_route_decision(issue_id, class, route_decision, route_state) do
+    case route_decision do
+      {:switch_to_fallback, _switched} ->
+        Logger.warning(
+          "Fallback route selected for issue_id=#{issue_id} failure_class=#{FailureClass.to_name(class)} " <>
+            "primary_failure_count=#{route_state.primary_failure_count}; next attempt uses the fallback route"
+        )
+
+      _stayed ->
+        Logger.debug(
+          "Route decision for issue_id=#{issue_id} failure_class=#{FailureClass.to_name(class)} " <>
+            "decision=#{inspect(route_decision)} primary_failure_count=#{route_state.primary_failure_count}"
+        )
+    end
+  end
+
+  # Gate inputs for the pure fallback decision. Without an issue, every gate
+  # fails closed. Pin detection reuses WorkerRouting's resolution rules — the
+  # same authority DispatchRouter uses to set `Selection.pinned`. Fallback
+  # availability is probed through DispatchRouter.materialize(:fallback, ...)
+  # so the enabled/valid-model/valid-effort validation stays in exactly one
+  # place; this reads config but decides nothing.
+  defp fallback_decision_gates(%Issue{} = issue) do
+    pinned = match?(:explicit_override, WorkerRouting.resolve([], issue).route_source)
+    {pinned, RetryPolicy.fallback_opt_in(issue.labels), fallback_available?(issue)}
+  end
+
+  defp fallback_decision_gates(_issue), do: {false, :ambiguous, false}
+
+  defp fallback_available?(%Issue{} = issue) do
+    match?(%DispatchRouter.Selection{}, DispatchRouter.materialize(:fallback, issue, []))
   end
 
   defp maybe_dispatch(%State{} = state) do
@@ -1058,18 +1122,41 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, resumed?) do
-    # MIC-195 C0: the route intent is decided here (only :primary exists before
-    # Slice C); DispatchRouter materializes the selection, AgentRunner forwards
-    # it, and AppServer consumes it without re-resolving routing policy.
+    # MIC-195: the route intent is decided here — :primary for a fresh failure
+    # sequence, :fallback when the latched fallback route says so (Slice C).
+    # DispatchRouter materializes the selection, AgentRunner forwards it, and
+    # AppServer consumes it without re-resolving routing policy.
     dispatch_opts = [attempt: attempt, worker_host: worker_host, resumed: resumed?]
-    dispatch_selection = DispatchRouter.materialize(:primary, issue, dispatch_opts)
+    route = current_dispatch_route(state, issue.id)
 
-    Logger.info(
-      "Dispatch route materialized for #{issue_context(issue)} intent=primary model=#{dispatch_selection.model} " <>
-        "reasoning_effort=#{dispatch_selection.reasoning_effort} route_source=#{dispatch_selection.route_source} " <>
-        "pinned=#{dispatch_selection.pinned} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
-    )
+    case DispatchRouter.materialize(route, issue, dispatch_opts) do
+      %DispatchRouter.Selection{} = dispatch_selection ->
+        Logger.info(
+          "Dispatch route materialized for #{issue_context(issue)} intent=#{route} model=#{dispatch_selection.model} " <>
+            "reasoning_effort=#{dispatch_selection.reasoning_effort} route_source=#{dispatch_selection.route_source} " <>
+            "pinned=#{dispatch_selection.pinned} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
+        )
 
+        spawn_with_selection(state, issue, attempt, recipient, worker_host, resumed?, route, dispatch_selection, dispatch_opts)
+
+      {:error, reason} ->
+        handle_dispatch_route_materialization_error(state, issue, attempt, worker_host, route, reason)
+    end
+  end
+
+  # The runtime route projection for the next dispatch. A failure sequence
+  # without a route projection is primary; the latched :fallback survives in
+  # the same projection (and in the durable RetryStore record) until the
+  # sequence ends.
+  @spec current_dispatch_route(%State{}, String.t()) :: DispatchRouter.intent()
+  defp current_dispatch_route(%State{} = state, issue_id) do
+    case Map.get(state.retry_history, issue_id) do
+      %{route: :fallback} -> :fallback
+      _route -> :primary
+    end
+  end
+
+  defp spawn_with_selection(%State{} = state, issue, attempt, recipient, worker_host, resumed?, route, dispatch_selection, dispatch_opts) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            AgentRunner.run(issue, recipient, dispatch_opts ++ [dispatch_selection: dispatch_selection])
          end) do
@@ -1089,6 +1176,7 @@ defmodule SymphonyElixir.Orchestrator do
             workspace_path: nil,
             workspace_root: nil,
             session_id: nil,
+            route: route,
             resumed: resumed?,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -1125,6 +1213,49 @@ defmodule SymphonyElixir.Orchestrator do
           error: "failed to spawn agent: #{inspect(reason)}",
           worker_host: worker_host
         })
+    end
+  end
+
+  # MIC-195 Slice C precondition: a failed DispatchRouter.materialize/3 (in
+  # practice a failed fallback materialization) must never spawn a worker, must
+  # never fabricate a successful primary route, and must never lose the retry
+  # envelope. The failure folds into the global envelope as a transient worker
+  # failure (ineligible for fallback, so the latched route is preserved), a
+  # durable record is written, and the bounded envelope either schedules the
+  # next attempt on the still-decided route or parks.
+  @spec handle_dispatch_route_materialization_error(%State{}, Issue.t(), integer() | nil, String.t() | nil, DispatchRouter.intent(), term()) :: %State{}
+  defp handle_dispatch_route_materialization_error(%State{} = state, issue, attempt, worker_host, route, reason) do
+    Logger.error(
+      "Dispatch route materialization failed closed for #{issue_context(issue)} route=#{route} " <>
+        "reason=#{inspect(reason)}; no worker spawned"
+    )
+
+    # Classification input deliberately omits the materialization reason: the
+    # reason text must never be able to reclassify this as a provider failure.
+    {decision, class, history, state} =
+      note_failure(state, issue.id, {:dispatch_route_materialization_failed, route})
+
+    metadata = %{
+      identifier: issue.identifier,
+      issue_url: issue.url,
+      error: "dispatch route materialization failed: #{inspect(reason)}",
+      worker_host: worker_host,
+      failure_class: FailureClass.to_name(class),
+      attempt_count: Map.get(history, :attempt_count, 1),
+      identical_failure_count: Map.get(history, :identical_failure_count, 1),
+      first_failure_at: Map.get(history, :first_failure_at_dt),
+      reset_in_ms: nil,
+      route: Map.get(history, :route, :primary),
+      primary_failure_count: Map.get(history, :primary_failure_count, 0)
+    }
+
+    case decision do
+      {:park, stop_reason} ->
+        park_issue(state, issue.id, nil, Map.put(metadata, :stop_reason, stop_reason))
+
+      :retry ->
+        next_attempt = if is_integer(attempt), do: attempt + 1, else: 1
+        schedule_issue_retry(state, issue.id, next_attempt, metadata)
     end
   end
 
@@ -1173,6 +1304,20 @@ defmodule SymphonyElixir.Orchestrator do
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
     workspace_root = pick_retry_workspace_root(previous_retry, metadata)
+    # MIC-195 Slice C: the latched route and the consecutive eligible-primary
+    # count ride with the retry entry so durable records, later reschedules,
+    # and the snapshot all agree on one resolved value. The runtime route
+    # projection (retry_history) is the dispatch authority, so it is the final
+    # fallback when the metadata and the previous entry carry no route.
+    route =
+      metadata[:route] || Map.get(previous_retry, :route) ||
+        history_route(Map.get(state.retry_history, issue_id)) || :primary
+
+    primary_failure_count =
+      metadata[:primary_failure_count] || Map.get(previous_retry, :primary_failure_count) ||
+        history_primary_failure_count(Map.get(state.retry_history, issue_id)) || 0
+
+    metadata = Map.merge(metadata, %{route: route, primary_failure_count: primary_failure_count})
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1182,7 +1327,9 @@ defmodule SymphonyElixir.Orchestrator do
 
     error_suffix = if is_binary(error), do: " error=#{error}", else: ""
 
-    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+    Logger.warning(
+      "Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt}) route=#{route}#{error_suffix}"
+    )
 
     new_state = %{
       state
@@ -1197,7 +1344,9 @@ defmodule SymphonyElixir.Orchestrator do
             error: error,
             worker_host: worker_host,
             workspace_path: workspace_path,
-            workspace_root: workspace_root
+            workspace_root: workspace_root,
+            route: route,
+            primary_failure_count: primary_failure_count
           })
     }
 
@@ -1214,7 +1363,9 @@ defmodule SymphonyElixir.Orchestrator do
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
-          workspace_root: Map.get(retry_entry, :workspace_root)
+          workspace_root: Map.get(retry_entry, :workspace_root),
+          route: Map.get(retry_entry, :route, :primary),
+          primary_failure_count: Map.get(retry_entry, :primary_failure_count, 0)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1550,6 +1701,18 @@ defmodule SymphonyElixir.Orchestrator do
     retry_agent_down(state, issue_id, running_entry, session_id, reason)
   end
 
+  @doc false
+  @spec handle_route_materialization_error_for_test(term(), Issue.t(), integer() | nil, DispatchRouter.intent(), term()) :: term()
+  def handle_route_materialization_error_for_test(%State{} = state, %Issue{} = issue, attempt, route, reason) do
+    handle_dispatch_route_materialization_error(state, issue, attempt, nil, route, reason)
+  end
+
+  @doc false
+  @spec next_dispatch_route_for_test(term(), String.t()) :: DispatchRouter.intent()
+  def next_dispatch_route_for_test(%State{} = state, issue_id) when is_binary(issue_id) do
+    current_dispatch_route(state, issue_id)
+  end
+
   @spec note_failure(term(), String.t(), term()) ::
           {:retry | {:park, atom()}, atom(), map(), term()}
   defp note_failure(%State{} = state, issue_id, reason) do
@@ -1567,13 +1730,37 @@ defmodule SymphonyElixir.Orchestrator do
         {:park, stop_reason, history} -> {{:park, stop_reason}, history}
       end
 
+    # MIC-195 Slice C: the same fold point also folds the consecutive
+    # eligible-primary-failure count into the runtime route projection. The
+    # envelope fields above are untouched by the route fold — a route switch
+    # never resets the global retry budget.
     history =
       history
       |> Map.put_new(:first_failure_at_dt, DateTime.to_iso8601(now_dt))
       |> Map.put(:last_failure_at_dt, DateTime.to_iso8601(now_dt))
+      |> Map.merge(RetryPolicy.update_route_state(route_state_from_history(Map.get(state.retry_history, issue_id)), class))
 
     {decision, class, history, %{state | retry_history: Map.put(state.retry_history, issue_id, history)}}
   end
+
+  # Runtime projection of the durable route state for one issue's failure
+  # sequence. RetryPolicy owns the semantics; this only extracts the two
+  # durable fields with legacy-safe defaults.
+  @spec route_state_from_history(term()) :: RetryPolicy.route_state()
+  defp route_state_from_history(history) when is_map(history) do
+    %{
+      route: Map.get(history, :route, :primary),
+      primary_failure_count: Map.get(history, :primary_failure_count, 0)
+    }
+  end
+
+  defp route_state_from_history(_history), do: RetryPolicy.new_route_state()
+
+  defp history_route(history) when is_map(history), do: Map.get(history, :route)
+  defp history_route(_history), do: nil
+
+  defp history_primary_failure_count(history) when is_map(history), do: Map.get(history, :primary_failure_count)
+  defp history_primary_failure_count(_history), do: nil
 
   @spec park_issue(term(), String.t(), map() | nil, map()) :: term()
   defp park_issue(%State{} = state, issue_id, running_entry, metadata) when is_map(metadata) do
@@ -1599,6 +1786,8 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: metadata[:worker_host] || Map.get(runtime, :worker_host),
       workspace_path: metadata[:workspace_path] || Map.get(runtime, :workspace_path),
       workspace_root: metadata[:workspace_root] || Map.get(runtime, :workspace_root),
+      route: metadata[:route] || Map.get(history, :route, :primary),
+      primary_failure_count: metadata[:primary_failure_count] || Map.get(history, :primary_failure_count, 0),
       parked_at: DateTime.to_iso8601(now_dt)
     }
 
@@ -1636,6 +1825,8 @@ defmodule SymphonyElixir.Orchestrator do
         worker_host: metadata[:worker_host],
         workspace_path: metadata[:workspace_path],
         workspace_root: metadata[:workspace_root],
+        route: metadata[:route] || :primary,
+        primary_failure_count: metadata[:primary_failure_count] || 0,
         next_retry_in_ms: delay_ms
       }
 
@@ -1663,7 +1854,9 @@ defmodule SymphonyElixir.Orchestrator do
         last_error: entry.error || "",
         worker_host: entry.worker_host || "",
         workspace_path: entry.workspace_path || "",
-        workspace_root: entry.workspace_root || root
+        workspace_root: entry.workspace_root || root,
+        route: Map.get(entry, :route, :primary),
+        primary_failure_count: Map.get(entry, :primary_failure_count, 0)
       })
 
     try do
@@ -1718,8 +1911,14 @@ defmodule SymphonyElixir.Orchestrator do
          class_name when is_binary(class_name) <- Map.get(record, "failure_class"),
          {:ok, class} <- FailureClass.from_name(class_name),
          count when is_integer(count) <- Map.get(record, "attempt_count"),
-         {:ok, first_dt} <- parse_record_time(Map.get(record, "first_failure_at")) do
-      recover_valid_retry_record(state, record, root, issue_id, status, class, count, first_dt)
+         {:ok, first_dt} <- parse_record_time(Map.get(record, "first_failure_at")),
+         # MIC-195 Slice C: legacy records carry no route fields and default to
+         # primary/0; a present-but-invalid value is ambiguous state and fails
+         # closed (claim, no timer) like any other unrecoverable record.
+         route_name when route_name in ["primary", "fallback"] <- Map.get(record, "route", "primary"),
+         pfc when is_integer(pfc) and pfc >= 0 <- Map.get(record, "primary_failure_count", 0) do
+      route = if route_name == "fallback", do: :fallback, else: :primary
+      recover_valid_retry_record(state, record, root, issue_id, status, class, count, first_dt, route, pfc)
     else
       _ ->
         issue_id = Map.get(record, "issue_id")
@@ -1737,8 +1936,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
   defp parse_record_time(_value), do: :error
 
-  @spec recover_valid_retry_record(term(), map(), String.t(), String.t(), String.t(), atom(), integer(), DateTime.t()) :: term()
-  defp recover_valid_retry_record(state, record, root, issue_id, status, class, count, first_dt) do
+  @spec recover_valid_retry_record(term(), map(), String.t(), String.t(), String.t(), atom(), integer(), DateTime.t(), RetryPolicy.route(), non_neg_integer()) :: term()
+  defp recover_valid_retry_record(state, record, root, issue_id, status, class, count, first_dt, route, primary_failure_count) do
     now_dt = DateTime.utc_now()
     now_ms = System.monotonic_time(:millisecond)
     age_ms = max(0, DateTime.diff(now_dt, first_dt, :millisecond))
@@ -1746,6 +1945,9 @@ defmodule SymphonyElixir.Orchestrator do
     identical = if is_integer(identical), do: identical, else: 1
     class_name = FailureClass.to_name(class)
 
+    # Recovery restores the durable route state verbatim: the failure that
+    # produced this record was already folded before it was written, so the
+    # count is not incremented again and no new failure attempt is fabricated.
     history = %{
       attempt_count: count,
       identical_failure_count: identical,
@@ -1753,7 +1955,9 @@ defmodule SymphonyElixir.Orchestrator do
       last_failure_at_ms: now_ms,
       last_failure_class: class,
       first_failure_at_dt: Map.get(record, "first_failure_at"),
-      last_failure_at_dt: Map.get(record, "last_failure_at")
+      last_failure_at_dt: Map.get(record, "last_failure_at"),
+      route: route,
+      primary_failure_count: primary_failure_count
     }
 
     base_entry = %{
@@ -1769,7 +1973,9 @@ defmodule SymphonyElixir.Orchestrator do
       error: Map.get(record, "last_error"),
       worker_host: Map.get(record, "worker_host"),
       workspace_path: Map.get(record, "workspace_path"),
-      workspace_root: Map.get(record, "workspace_root", root)
+      workspace_root: Map.get(record, "workspace_root", root),
+      route: route,
+      primary_failure_count: primary_failure_count
     }
 
     state = %{state | retry_history: Map.put(state.retry_history, issue_id, history)}
@@ -1793,7 +1999,9 @@ defmodule SymphonyElixir.Orchestrator do
               attempt_count: count,
               identical_failure_count: identical,
               first_failure_at: base_entry.first_failure_at,
-              reset_in_ms: nil
+              reset_in_ms: nil,
+              route: route,
+              primary_failure_count: primary_failure_count
             }
 
             state = %{state | claimed: MapSet.put(state.claimed, issue_id)}
@@ -1993,6 +2201,7 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
+          route: Map.get(metadata, :route),
           model: Map.get(metadata, :model),
           reasoning_effort: Map.get(metadata, :reasoning_effort),
           route_source: Map.get(metadata, :route_source),
@@ -2020,7 +2229,8 @@ defmodule SymphonyElixir.Orchestrator do
           issue_url: Map.get(retry, :issue_url),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
+          workspace_path: Map.get(retry, :workspace_path),
+          route: Map.get(retry, :route)
         }
       end)
 
@@ -2055,6 +2265,7 @@ defmodule SymphonyElixir.Orchestrator do
           error: Map.get(metadata, :error),
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
+          route: Map.get(metadata, :route),
           parked_at: Map.get(metadata, :parked_at)
         }
       end)
