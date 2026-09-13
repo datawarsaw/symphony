@@ -49,6 +49,14 @@ defmodule SymphonyElixir.Orchestrator do
     ]
   end
 
+  @typedoc """
+  Operator-visible status for one issue (MIC-195 Slice D projection).
+
+  Derived read-only from the authoritative lifecycle maps — never persisted,
+  never consulted by any retry, route, park, block, or tracker decision.
+  """
+  @type operational_status :: :running | :fallback_running | :waiting_retry | :provider_unavailable | :parked | :blocked
+
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -2270,6 +2278,7 @@ defmodule SymphonyElixir.Orchestrator do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
     now_ms = System.monotonic_time(:millisecond)
+    operational_status = operational_statuses(state)
 
     running =
       state.running
@@ -2286,6 +2295,7 @@ defmodule SymphonyElixir.Orchestrator do
           model: Map.get(metadata, :model),
           reasoning_effort: Map.get(metadata, :reasoning_effort),
           route_source: Map.get(metadata, :route_source),
+          operational_status: Map.get(operational_status, issue_id),
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
@@ -2311,7 +2321,8 @@ defmodule SymphonyElixir.Orchestrator do
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
           workspace_path: Map.get(retry, :workspace_path),
-          route: Map.get(retry, :route)
+          route: Map.get(retry, :route),
+          operational_status: Map.get(operational_status, issue_id)
         }
       end)
 
@@ -2330,7 +2341,8 @@ defmodule SymphonyElixir.Orchestrator do
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
           last_codex_message: Map.get(metadata, :last_codex_message),
-          last_codex_event: Map.get(metadata, :last_codex_event)
+          last_codex_event: Map.get(metadata, :last_codex_event),
+          operational_status: Map.get(operational_status, issue_id)
         }
       end)
 
@@ -2347,7 +2359,8 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           route: Map.get(metadata, :route),
-          parked_at: Map.get(metadata, :parked_at)
+          parked_at: Map.get(metadata, :parked_at),
+          operational_status: Map.get(operational_status, issue_id)
         }
       end)
 
@@ -2357,6 +2370,7 @@ defmodule SymphonyElixir.Orchestrator do
        retrying: retrying,
        blocked: blocked,
        parked: parked,
+       operational_status: operational_status,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -2391,6 +2405,81 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp blocked_issue_url(%{issue: %Issue{url: url}}), do: url
   defp blocked_issue_url(_metadata), do: nil
+
+  # ── MIC-195 Slice D: operational status projection ─────────────────────────
+  #
+  # Deterministic, read-only projection of the authoritative lifecycle maps
+  # onto the six operator-visible statuses. Observability only: this cluster
+  # never mutates state and has zero control-plane authority — no retry,
+  # route, park, block, or tracker decision consults its output.
+  #
+  # Precedence (first match wins, evaluated per issue):
+  #
+  #   1. :blocked             — existing reconciliation/safety block
+  #   2. :parked              — bounded retry envelope reached PARKED
+  #   3. :fallback_running    — active worker on the route materialized at
+  #                             dispatch (running entry's `route`, never
+  #                             re-derived from current config)
+  #   4. :running             — active worker on primary
+  #   5. :provider_unavailable — no worker executing; a retry is scheduled and
+  #                             the active failure sequence's already-classified
+  #                             `last_failure_class` is a provider class
+  #   6. :waiting_retry       — no worker executing; a retry is scheduled
+  #
+  # Provider-class membership is consumed through RetryPolicy's closed Slice C
+  # class list (fallback_eligible_class?/1) and FailureClass normalization —
+  # never redefined here and never re-derived from error strings. Sequence
+  # resets (completion and reconcile-driven termination) delete the history,
+  # so stale provider/fallback state cannot leak into a fresh lifecycle, and
+  # issues present in none of the lifecycle maps get no fabricated status.
+
+  @spec operational_statuses(%State{}) :: %{String.t() => operational_status()}
+  defp operational_statuses(%State{} = state) do
+    %State{running: running, retry_attempts: retry_attempts, parked: parked, blocked: blocked} = state
+
+    running
+    |> Map.merge(retry_attempts)
+    |> Map.merge(parked)
+    |> Map.merge(blocked)
+    |> Map.keys()
+    |> Map.new(fn issue_id -> {issue_id, operational_status(state, issue_id)} end)
+  end
+
+  @spec operational_status(%State{}, String.t()) :: operational_status()
+  defp operational_status(%State{} = state, issue_id) do
+    cond do
+      Map.has_key?(state.blocked, issue_id) -> :blocked
+      Map.has_key?(state.parked, issue_id) -> :parked
+      true -> active_or_waiting_status(state, issue_id)
+    end
+  end
+
+  defp active_or_waiting_status(%State{} = state, issue_id) do
+    case Map.get(state.running, issue_id) do
+      %{route: :fallback} -> :fallback_running
+      entry when is_map(entry) -> :running
+      _missing -> waiting_status(state, issue_id)
+    end
+  end
+
+  defp waiting_status(%State{retry_attempts: retry_attempts, retry_history: retry_history}, issue_id) do
+    if Map.has_key?(retry_attempts, issue_id) and provider_failure_sequence?(retry_history, issue_id) do
+      :provider_unavailable
+    else
+      :waiting_retry
+    end
+  end
+
+  defp provider_failure_sequence?(retry_history, issue_id) do
+    case Map.get(retry_history, issue_id) do
+      %{last_failure_class: class} -> class |> FailureClass.normalize_class() |> RetryPolicy.fallback_eligible_class?()
+      _none -> false
+    end
+  end
+
+  @doc false
+  @spec operational_statuses_for_test(term()) :: %{String.t() => operational_status()}
+  def operational_statuses_for_test(%State{} = state), do: operational_statuses(state)
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
