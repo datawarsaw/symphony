@@ -191,7 +191,7 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
       assert {:ok, record} = RetryStore.read_record(root, issue.id)
 
       expected_keys =
-        ~w(schema_version issue_id identifier status failure_class attempt_count identical_failure_count first_failure_at last_failure_at next_retry_at last_error worker_host worker_identity workspace_path workspace_root)
+        ~w(schema_version issue_id identifier status failure_class attempt_count identical_failure_count first_failure_at last_failure_at next_retry_at last_error worker_host worker_identity workspace_path workspace_root route primary_failure_count)
         |> Enum.sort()
 
       assert Map.keys(record) |> Enum.sort() == expected_keys
@@ -199,7 +199,10 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
       assert record["issue_id"] == issue.id
       assert record["status"] == "parked"
       assert record["worker_identity"] == nil
-      refute Map.has_key?(record, "route")
+      # MIC-195 Slice C: durable route state rides in the same version-1
+      # schema; a fallback lane label is still not a concept.
+      assert record["route"] == "primary"
+      assert record["primary_failure_count"] == 0
       refute Map.has_key?(record, "fallback")
       refute Map.has_key?(record, "lane")
     after

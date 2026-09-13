@@ -55,9 +55,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     discovery_route = Keyword.get(opts, :discovery_route)
     dynamic_tool_binding = if discovery_route, do: Map.put(dynamic_tool_binding, :tool_specs, []), else: dynamic_tool_binding
     issue = Keyword.get(opts, :issue)
-    worker_route = worker_route_for(opts, issue, discovery_route)
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+    with {:ok, worker_route} <- worker_route_for(opts, issue, discovery_route),
+         {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
@@ -438,12 +438,25 @@ defmodule SymphonyElixir.Codex.AppServer do
   # Discovery routes resolve through Discovery.Session; implementation workers
   # use the selection materialized by DispatchRouter at dispatch time, and fall
   # back to WorkerRouting resolution for callers that predate the seam.
-  defp worker_route_for(_opts, _issue, discovery_route) when not is_nil(discovery_route), do: nil
+  #
+  # MIC-195 Slice C precondition (C0 review finding): the PRESENCE of the
+  # :dispatch_selection key is meaningful, so its three states are handled
+  # explicitly — absent → legacy WorkerRouting resolution; a valid Selection →
+  # consumed as-is; present but invalid → fail closed. A leaked fallback
+  # materialization error tuple (or any malformed selection) must never be
+  # silently re-resolved into a primary session.
+  defp worker_route_for(_opts, _issue, discovery_route) when not is_nil(discovery_route), do: {:ok, nil}
 
   defp worker_route_for(opts, issue, nil) do
-    case Keyword.get(opts, :dispatch_selection) do
-      %DispatchRouter.Selection{} = selection -> DispatchRouter.worker_route(selection)
-      _ -> WorkerRouting.resolve(opts, issue)
+    case Keyword.fetch(opts, :dispatch_selection) do
+      {:ok, %DispatchRouter.Selection{} = selection} ->
+        {:ok, DispatchRouter.worker_route(selection)}
+
+      {:ok, invalid} ->
+        {:error, {:invalid_dispatch_selection, invalid}}
+
+      :error ->
+        {:ok, WorkerRouting.resolve(opts, issue)}
     end
   end
 

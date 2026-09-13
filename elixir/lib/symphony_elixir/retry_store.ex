@@ -114,7 +114,19 @@ defmodule SymphonyElixir.RetryStore do
       "worker_host" => Map.get(attrs, :worker_host, ""),
       "worker_identity" => Map.get(attrs, :worker_identity),
       "workspace_path" => Map.get(attrs, :workspace_path, ""),
-      "workspace_root" => Map.get(attrs, :workspace_root, "")
+      "workspace_root" => Map.get(attrs, :workspace_root, ""),
+      # MIC-195 Slice C: durable route state. Additive fields with safe
+      # defaults — legacy version-1 records without them still parse and
+      # recover as route=primary, primary_failure_count=0, so no version bump
+      # and no invalidation of existing retry state.
+      "route" => route_name(Map.get(attrs, :route)),
+      "primary_failure_count" => primary_failure_count(Map.get(attrs, :primary_failure_count))
     }
   end
+
+  defp route_name(:fallback), do: "fallback"
+  defp route_name(_route), do: "primary"
+
+  defp primary_failure_count(count) when is_integer(count) and count >= 0, do: count
+  defp primary_failure_count(_count), do: 0
 end
