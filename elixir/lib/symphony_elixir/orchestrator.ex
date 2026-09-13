@@ -475,12 +475,33 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec reconcile_missing_running_issue_ids_for_test(term(), [String.t()], [Issue.t()]) :: term()
+  def reconcile_missing_running_issue_ids_for_test(%State{} = state, requested_issue_ids, issues)
+      when is_list(requested_issue_ids) and is_list(issues) do
+    reconcile_missing_running_issue_ids(state, requested_issue_ids, issues)
+  end
+
+  @doc false
+  @spec reconcile_stalled_running_issues_for_test(term()) :: term()
+  def reconcile_stalled_running_issues_for_test(%State{} = state) do
+    reconcile_stalled_running_issues(state)
+  end
+
+  @doc false
   @spec handle_retry_issue_lookup_for_test(Issue.t(), term(), String.t(), non_neg_integer(), map()) ::
           term()
   def handle_retry_issue_lookup_for_test(%Issue{} = issue, %State{} = state, issue_id, attempt, metadata)
       when is_binary(issue_id) and is_integer(attempt) and attempt >= 0 and is_map(metadata) do
     {:noreply, updated_state} = handle_retry_issue_lookup(issue, state, issue_id, attempt, metadata)
     updated_state
+  end
+
+  @doc false
+  @spec handle_retry_poll_failure_for_test(term(), String.t(), non_neg_integer(), map(), term()) ::
+          term()
+  def handle_retry_poll_failure_for_test(%State{} = state, issue_id, attempt, metadata, reason)
+      when is_binary(issue_id) and is_integer(attempt) and attempt >= 0 and is_map(metadata) do
+    handle_retry_poll_failure(state, issue_id, attempt, metadata, reason)
   end
 
   @doc false
@@ -563,12 +584,12 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        terminate_running_issue(state, issue.id, true, clear_sequence?: true)
 
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, clear_sequence?: true)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -576,7 +597,7 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        terminate_running_issue(state, issue.id, false, clear_sequence?: true)
     end
   end
 
@@ -640,7 +661,7 @@ defmodule SymphonyElixir.Orchestrator do
         state_acc
       else
         log_missing_running_issue(state_acc, issue_id)
-        terminate_running_issue(state_acc, issue_id, false)
+        terminate_running_issue(state_acc, issue_id, false, clear_sequence?: true)
       end
     end)
   end
@@ -701,7 +722,11 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+  # `clear_sequence?: true` marks a reconcile-driven lifecycle termination: the
+  # issue's active failure sequence ends with the worker (see
+  # `clear_failure_sequence/2`). Stall restarts deliberately omit the option —
+  # a stall is part of the same active sequence and must preserve its route.
+  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, opts \\ []) do
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
@@ -715,6 +740,13 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
         end
 
+        state =
+          if Keyword.get(opts, :clear_sequence?, false) do
+            clear_failure_sequence(state, issue_id)
+          else
+            state
+          end
+
         %{
           state
           | running: Map.delete(state.running, issue_id),
@@ -726,6 +758,22 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         release_issue_claim(state, issue_id)
     end
+  end
+
+  # MIC-195 Slice C correction: a reconcile-driven lifecycle termination
+  # (terminal, unroutable, non-active, or disappeared issue) ends the active
+  # failure sequence. The latched route and the consecutive primary-failure
+  # count describe one continuous sequence; once the lifecycle ends they must
+  # not leak into a future dispatch, so the runtime route projection
+  # (retry_history) and the durable RetryStore record are both cleared and the
+  # next future dispatch starts from :primary with primary_failure_count 0.
+  # Only reached with `clear_sequence?: true` — a stall restart is still part
+  # of the same active sequence and keeps route, count, and envelope.
+  @spec clear_failure_sequence(%State{}, String.t()) :: %State{}
+  defp clear_failure_sequence(%State{} = state, issue_id) do
+    state = cancel_retry_timer(state, issue_id)
+    delete_retry_record_best_effort(issue_id)
+    %{state | retry_history: Map.delete(state.retry_history, issue_id)}
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
@@ -1281,6 +1329,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp complete_issue(%State{} = state, issue_id) do
     delete_retry_record_best_effort(issue_id)
+
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
@@ -1327,9 +1376,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     error_suffix = if is_binary(error), do: " error=#{error}", else: ""
 
-    Logger.warning(
-      "Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt}) route=#{route}#{error_suffix}"
-    )
+    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt}) route=#{route}#{error_suffix}")
 
     new_state = %{
       state
@@ -1383,35 +1430,49 @@ defmodule SymphonyElixir.Orchestrator do
         |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
 
       {:error, reason} ->
-        Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+        {:noreply, handle_retry_poll_failure(state, issue_id, attempt, metadata, reason)}
+    end
+  end
 
-        {decision, class, history, state} = note_failure(state, issue_id, {:retry_poll_failed, reason})
+  # MIC-195 Slice C correction: a tracker/retry-poll failure is an orchestrator
+  # scheduling hiccup, not a worker or provider failure. It still folds into
+  # the pre-existing global retry envelope, but it never participates in the
+  # Slice C route-state fold (`fold_route_state?: false`): a provider-shaped
+  # poll error must not increment primary_failure_count or latch fallback, and
+  # an opaque one must not reset the count to 0. The reschedule takes the
+  # authoritative route state from the current history — never the pre-poll
+  # retry metadata — so the retry entry and the durable RetryStore record carry
+  # exactly the in-memory route/count after the poll failure.
+  defp handle_retry_poll_failure(%State{} = state, issue_id, attempt, metadata, reason) do
+    Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
 
-        case decision do
-          {:park, stop_reason} ->
-            park_metadata =
-              metadata
-              |> Map.merge(%{
-                failure_class: FailureClass.to_name(class),
-                stop_reason: stop_reason,
-                error: "retry poll failed: #{inspect(reason)}",
-                attempt_count: Map.get(history, :attempt_count, 1),
-                identical_failure_count: Map.get(history, :identical_failure_count, 1),
-                first_failure_at: Map.get(history, :first_failure_at_dt),
-                reset_in_ms: nil
-              })
+    {decision, class, history, state} = note_failure(state, issue_id, {:retry_poll_failed, reason}, fold_route_state?: false)
 
-            {:noreply, park_issue(state, issue_id, nil, park_metadata)}
+    case decision do
+      {:park, stop_reason} ->
+        park_metadata =
+          metadata
+          |> Map.merge(%{
+            failure_class: FailureClass.to_name(class),
+            stop_reason: stop_reason,
+            error: "retry poll failed: #{inspect(reason)}",
+            attempt_count: Map.get(history, :attempt_count, 1),
+            identical_failure_count: Map.get(history, :identical_failure_count, 1),
+            first_failure_at: Map.get(history, :first_failure_at_dt),
+            reset_in_ms: nil
+          })
 
-          :retry ->
-            {:noreply,
-             schedule_issue_retry(
-               state,
-               issue_id,
-               attempt + 1,
-               Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
-             )}
-        end
+        park_issue(state, issue_id, nil, park_metadata)
+
+      :retry ->
+        reschedule_metadata =
+          Map.merge(metadata, %{
+            error: "retry poll failed: #{inspect(reason)}",
+            route: Map.get(history, :route, :primary),
+            primary_failure_count: Map.get(history, :primary_failure_count, 0)
+          })
+
+        schedule_issue_retry(state, issue_id, attempt + 1, reschedule_metadata)
     end
   end
 
@@ -1645,6 +1706,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp release_issue_claim(%State{} = state, issue_id) do
     delete_retry_record_best_effort(issue_id)
+
     %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
@@ -1715,7 +1777,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec note_failure(term(), String.t(), term()) ::
           {:retry | {:park, atom()}, atom(), map(), term()}
-  defp note_failure(%State{} = state, issue_id, reason) do
+  defp note_failure(%State{} = state, issue_id, reason, opts \\ []) do
     class = AgentRunner.classify_failure(reason)
     now_ms = System.monotonic_time(:millisecond)
     now_dt = DateTime.utc_now()
@@ -1733,12 +1795,26 @@ defmodule SymphonyElixir.Orchestrator do
     # MIC-195 Slice C: the same fold point also folds the consecutive
     # eligible-primary-failure count into the runtime route projection. The
     # envelope fields above are untouched by the route fold — a route switch
-    # never resets the global retry budget.
+    # never resets the global retry budget. `fold_route_state?: false` skips
+    # only the route fold: tracker/retry-poll failures are orchestrator
+    # scheduling hiccups, not worker/provider failures, so they must neither
+    # increment/reset primary_failure_count nor touch the latched route. The
+    # pre-fold projection is still carried through verbatim — update_history/3
+    # rebuilds the map without the route keys, and dropping them here would
+    # silently un-latch a fallback route.
     history =
       history
       |> Map.put_new(:first_failure_at_dt, DateTime.to_iso8601(now_dt))
       |> Map.put(:last_failure_at_dt, DateTime.to_iso8601(now_dt))
-      |> Map.merge(RetryPolicy.update_route_state(route_state_from_history(Map.get(state.retry_history, issue_id)), class))
+
+    route_state_before = route_state_from_history(Map.get(state.retry_history, issue_id))
+
+    history =
+      if Keyword.get(opts, :fold_route_state?, true) do
+        Map.merge(history, RetryPolicy.update_route_state(route_state_before, class))
+      else
+        Map.merge(history, route_state_before)
+      end
 
     {decision, class, history, %{state | retry_history: Map.put(state.retry_history, issue_id, history)}}
   end
@@ -1811,6 +1887,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp persist_failure_retry_record(_state, issue_id, attempt, delay_ms, metadata) do
     if is_binary(metadata[:failure_class]) do
       now_dt = DateTime.utc_now()
+
       entry = %{
         issue_id: issue_id,
         identifier: metadata[:identifier] || issue_id,
@@ -1872,6 +1949,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp next_retry_at_iso(%{next_retry_in_ms: delay_ms}) when is_integer(delay_ms) and delay_ms >= 0 do
     DateTime.utc_now() |> DateTime.add(delay_ms, :millisecond) |> DateTime.to_iso8601()
   end
+
   defp next_retry_at_iso(_entry), do: nil
 
   @spec delete_retry_record_best_effort(String.t()) :: :ok
@@ -1896,7 +1974,9 @@ defmodule SymphonyElixir.Orchestrator do
 
     Enum.reduce(RetryStore.list_records(root), state, fn {file_id, result}, acc ->
       case result do
-        {:ok, record} -> recover_retry_record(acc, record, root)
+        {:ok, record} ->
+          recover_retry_record(acc, record, root)
+
         {:error, reason} ->
           Logger.warning("Ignoring corrupt retry record file_id=#{file_id}: #{inspect(reason)}; preserving workspaces")
           acc
@@ -1934,6 +2014,7 @@ defmodule SymphonyElixir.Orchestrator do
       _ -> :error
     end
   end
+
   defp parse_record_time(_value), do: :error
 
   @spec recover_valid_retry_record(term(), map(), String.t(), String.t(), String.t(), atom(), integer(), DateTime.t(), RetryPolicy.route(), non_neg_integer()) :: term()
@@ -2271,7 +2352,7 @@ defmodule SymphonyElixir.Orchestrator do
       end)
 
     {:reply,
-    %{
+     %{
        running: running,
        retrying: retrying,
        blocked: blocked,

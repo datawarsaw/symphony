@@ -28,10 +28,15 @@ defmodule SymphonyElixir.FallbackRoutingTest do
     {:ok, root: root}
   end
 
-  defp fresh_state, do: %Orchestrator.State{}
+  # Production init seeds the token totals with an empty map; the bare struct
+  # leaves it nil, which only the completion/termination paths read.
+  @empty_codex_totals %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+
+  defp fresh_state, do: %Orchestrator.State{codex_totals: @empty_codex_totals}
 
   defp enable_fallback(opts \\ []) do
-    write_workflow_file!(Workflow.workflow_file_path(),
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
       Keyword.merge(
         [
           codex_fallback_enabled: true,
@@ -91,6 +96,321 @@ defmodule SymphonyElixir.FallbackRoutingTest do
 
   defp fail(state, issue, reason) do
     Orchestrator.handle_failure_for_test(state, issue.id, running_entry(issue), "sess-" <> issue.id, reason)
+  end
+
+  # MIC-195 correction regression coverage: seed one failure sequence onto the
+  # latched fallback route (threshold 1 for MODEL_UNAVAILABLE) with the durable
+  # retrying record already written.
+  defp latched_state(issue) do
+    switched = fail(fresh_state(), issue, :model_unavailable)
+    assert Map.fetch!(switched.retry_attempts, issue.id).route == :fallback
+    switched
+  end
+
+  # A running entry whose worker is a real alive process, so a reconcile-driven
+  # termination demonstrably stops it.
+  defp terminate_test_entry(issue) do
+    %{
+      pid: spawn(fn -> Process.sleep(:infinity) end),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: nil,
+      workspace_root: nil,
+      started_at: DateTime.utc_now()
+    }
+  end
+
+  describe "reconcile-driven termination ends the failure sequence" do
+    test "terminal issue: the latched fallback sequence is cleared and the next dispatch starts primary", %{root: root} do
+      enable_fallback()
+      issue = test_issue("ISS-FB-TERM", "MT-FB-TERM")
+
+      latched = latched_state(issue)
+      assert {:ok, record} = RetryStore.read_record(root, issue.id)
+      assert record["route"] == "fallback"
+
+      entry = terminate_test_entry(issue)
+      state = %{latched | running: Map.put(latched.running, issue.id, entry)}
+      assert Map.has_key?(state.retry_attempts, issue.id)
+
+      next = Orchestrator.reconcile_issue_states_for_test([%{issue | state: "Closed"}], state)
+
+      try do
+        # The running worker is terminated and the claim released.
+        refute Process.alive?(entry.pid)
+        refute MapSet.member?(next.claimed, issue.id)
+        # Stale retry attempt/timer state is gone with it.
+        assert next.retry_attempts == %{}
+        # The failure sequence ended: runtime projection and durable record gone.
+        refute Map.has_key?(Orchestrator.retry_history_for_test(next), issue.id)
+        assert {:error, :not_found} = RetryStore.read_record(root, issue.id)
+        assert Orchestrator.next_dispatch_route_for_test(next, issue.id) == :primary
+
+        # The issue is active/routable again: the new sequence starts from a
+        # zeroed count, so one quota failure must NOT reach the threshold.
+        again = fail(%{next | retry_attempts: %{}}, issue, :provider_quota)
+
+        try do
+          retry = Map.fetch!(again.retry_attempts, issue.id)
+          assert retry.route == :primary
+          assert retry.primary_failure_count == 1
+          assert Orchestrator.retry_history_for_test(again)[issue.id].primary_failure_count == 1
+        after
+          cancel_timers(again)
+        end
+      after
+        cancel_timers(next)
+      end
+    end
+
+    test "unroutable issue: the latched fallback sequence is cleared", %{root: root} do
+      enable_fallback(tracker_required_labels: ["repo:symphony-runtime"])
+      issue = test_issue("ISS-FB-UNROUTABLE", "MT-FB-UNROUTABLE")
+
+      latched = latched_state(issue)
+      assert {:ok, _record} = RetryStore.read_record(root, issue.id)
+
+      entry = terminate_test_entry(issue)
+      state = %{latched | running: Map.put(latched.running, issue.id, entry)}
+
+      next = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      try do
+        refute Map.has_key?(Orchestrator.retry_history_for_test(next), issue.id)
+        assert {:error, :not_found} = RetryStore.read_record(root, issue.id)
+        assert Orchestrator.next_dispatch_route_for_test(next, issue.id) == :primary
+      after
+        cancel_timers(next)
+      end
+    end
+
+    test "disappeared issue: the latched fallback sequence is cleared", %{root: root} do
+      enable_fallback()
+      issue = test_issue("ISS-FB-MISSING", "MT-FB-MISSING")
+
+      latched = latched_state(issue)
+      assert {:ok, _record} = RetryStore.read_record(root, issue.id)
+
+      entry = terminate_test_entry(issue)
+      state = %{latched | running: Map.put(latched.running, issue.id, entry)}
+
+      next = Orchestrator.reconcile_missing_running_issue_ids_for_test(state, [issue.id], [])
+
+      try do
+        refute Process.alive?(entry.pid)
+        refute Map.has_key?(Orchestrator.retry_history_for_test(next), issue.id)
+        assert {:error, :not_found} = RetryStore.read_record(root, issue.id)
+        assert Orchestrator.next_dispatch_route_for_test(next, issue.id) == :primary
+      after
+        cancel_timers(next)
+      end
+    end
+
+    test "stall restart preserves the latched fallback route, count, and envelope", %{root: root} do
+      enable_fallback(codex_stall_timeout_ms: 1_000)
+      issue = test_issue("ISS-FB-STALL", "MT-FB-STALL")
+
+      latched = latched_state(issue)
+
+      stale = DateTime.add(DateTime.utc_now(), -5, :second)
+
+      entry =
+        terminate_test_entry(issue)
+        |> Map.put(:last_codex_timestamp, stale)
+        |> Map.put(:last_codex_event, nil)
+        |> Map.put(:started_at, stale)
+
+      state = %{latched | running: Map.put(latched.running, issue.id, entry)}
+
+      next = Orchestrator.reconcile_stalled_running_issues_for_test(state)
+
+      try do
+        # The stalled worker was stopped for the restart...
+        refute Process.alive?(entry.pid)
+        # ...but the sequence survived: the restart stays on the latched route.
+        retry = Map.fetch!(next.retry_attempts, issue.id)
+        assert retry.route == :fallback
+        assert retry.primary_failure_count == 1
+        assert retry.error =~ "stalled for"
+
+        history = Orchestrator.retry_history_for_test(next)[issue.id]
+        assert history.route == :fallback
+        assert history.primary_failure_count == 1
+        assert Orchestrator.next_dispatch_route_for_test(next, issue.id) == :fallback
+
+        assert {:ok, record} = RetryStore.read_record(root, issue.id)
+        assert record["status"] == "retrying"
+        assert record["route"] == "fallback"
+        assert record["primary_failure_count"] == 1
+      after
+        cancel_timers(next)
+      end
+    end
+  end
+
+  describe "retry-poll failures never fold route state" do
+    # Mirrors the metadata shape pop_retry_attempt_state/3 hands to
+    # handle_retry_issue/4 when a retry timer fires.
+    defp retry_entry_metadata(state, issue_id) do
+      entry = Map.fetch!(state.retry_attempts, issue_id)
+
+      %{
+        identifier: Map.get(entry, :identifier),
+        issue_url: Map.get(entry, :issue_url),
+        error: Map.get(entry, :error),
+        worker_host: Map.get(entry, :worker_host),
+        workspace_path: Map.get(entry, :workspace_path),
+        workspace_root: Map.get(entry, :workspace_root),
+        route: Map.get(entry, :route, :primary),
+        primary_failure_count: Map.get(entry, :primary_failure_count, 0)
+      }
+    end
+
+    defp poll_failure(state, issue_id, attempt, metadata, reason) do
+      Orchestrator.handle_retry_poll_failure_for_test(state, issue_id, attempt, metadata, reason)
+    end
+
+    test "a provider-shaped poll error does not increment primary_failure_count or latch fallback", %{root: root} do
+      enable_fallback()
+      issue = test_issue("ISS-FB-POLL429", "MT-FB-POLL429")
+
+      first = fail(fresh_state(), issue, :provider_quota)
+      assert Orchestrator.retry_history_for_test(first)[issue.id].primary_failure_count == 1
+
+      metadata = retry_entry_metadata(first, issue.id)
+
+      next =
+        poll_failure(first, issue.id, 1, metadata, {:retry_poll_failed, "tracker HTTP 429: too many requests"})
+
+      try do
+        # Route state untouched: not incremented to 2, not latched to fallback.
+        history = Orchestrator.retry_history_for_test(next)[issue.id]
+        assert history.route == :primary
+        assert history.primary_failure_count == 1
+
+        retry = Map.fetch!(next.retry_attempts, issue.id)
+        assert retry.route == :primary
+        assert retry.primary_failure_count == 1
+
+        # The durable record agrees with the authoritative in-memory state.
+        assert {:ok, record} = RetryStore.read_record(root, issue.id)
+        assert record["route"] == "primary"
+        assert record["primary_failure_count"] == 1
+      after
+        cancel_timers(next)
+      end
+    end
+
+    test "an opaque poll error does not reset primary_failure_count" do
+      enable_fallback()
+      issue = test_issue("ISS-FB-POLLOPAQUE", "MT-FB-POLLOPAQUE")
+
+      first = fail(fresh_state(), issue, :provider_quota)
+      assert Orchestrator.retry_history_for_test(first)[issue.id].primary_failure_count == 1
+
+      metadata = retry_entry_metadata(first, issue.id)
+      next = poll_failure(first, issue.id, 1, metadata, {:retry_poll_failed, :nxdomain})
+
+      try do
+        history = Orchestrator.retry_history_for_test(next)[issue.id]
+        assert history.route == :primary
+        assert history.primary_failure_count == 1
+
+        retry = Map.fetch!(next.retry_attempts, issue.id)
+        assert retry.route == :primary
+        assert retry.primary_failure_count == 1
+      after
+        cancel_timers(next)
+      end
+    end
+
+    test "a poll error on a latched fallback sequence preserves the latch and the durable record", %{root: root} do
+      enable_fallback()
+      issue = test_issue("ISS-FB-POLLLATCH", "MT-FB-POLLLATCH")
+
+      latched = latched_state(issue)
+      metadata = retry_entry_metadata(latched, issue.id)
+      next = poll_failure(latched, issue.id, 1, metadata, {:retry_poll_failed, :timeout})
+
+      try do
+        assert Orchestrator.next_dispatch_route_for_test(next, issue.id) == :fallback
+
+        retry = Map.fetch!(next.retry_attempts, issue.id)
+        assert retry.route == :fallback
+        assert retry.primary_failure_count == 1
+
+        assert {:ok, record} = RetryStore.read_record(root, issue.id)
+        assert record["route"] == "fallback"
+        assert record["primary_failure_count"] == 1
+      after
+        cancel_timers(next)
+      end
+    end
+
+    test "the next eligible worker failure after a poll hiccup still switches at the exact threshold" do
+      enable_fallback()
+      issue = test_issue("ISS-FB-POLLSEQ", "MT-FB-POLLSEQ")
+
+      # Quota worker failure #1 → count 1.
+      first = fail(fresh_state(), issue, :provider_quota)
+      assert Orchestrator.retry_history_for_test(first)[issue.id].primary_failure_count == 1
+
+      # Poll failure → count stays 1.
+      metadata = retry_entry_metadata(first, issue.id)
+      polled = poll_failure(first, issue.id, 1, metadata, {:retry_poll_failed, :timeout})
+      assert Orchestrator.retry_history_for_test(polled)[issue.id].primary_failure_count == 1
+
+      # Quota worker failure #2 → count 2 → fallback.
+      second = fail(%{polled | retry_attempts: %{}}, issue, :provider_quota)
+
+      try do
+        retry = Map.fetch!(second.retry_attempts, issue.id)
+        assert retry.route == :fallback
+        assert retry.primary_failure_count == 2
+      after
+        cancel_timers(polled)
+        cancel_timers(second)
+      end
+    end
+  end
+
+  describe "success and continuation semantics" do
+    test "normal completion resets the route state so the next sequence starts primary", %{root: root} do
+      enable_fallback()
+      issue = test_issue("ISS-FB-DONE", "MT-FB-DONE")
+
+      latched = latched_state(issue)
+
+      ref = make_ref()
+
+      state = %{
+        latched
+        | running:
+            Map.put(latched.running, issue.id, %{
+              pid: self(),
+              ref: ref,
+              identifier: issue.identifier,
+              issue: issue,
+              started_at: DateTime.utc_now()
+            })
+      }
+
+      assert {:noreply, next} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :normal}, state)
+
+      try do
+        retry = Map.fetch!(next.retry_attempts, issue.id)
+        assert retry.route == :primary
+        assert retry.primary_failure_count == 0
+
+        refute Map.has_key?(Orchestrator.retry_history_for_test(next), issue.id)
+        assert Orchestrator.next_dispatch_route_for_test(next, issue.id) == :primary
+        assert {:error, :not_found} = RetryStore.read_record(root, issue.id)
+      after
+        cancel_timers(next)
+      end
+    end
   end
 
   describe "route decision on classified failures" do

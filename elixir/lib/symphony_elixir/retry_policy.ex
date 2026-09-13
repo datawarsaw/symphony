@@ -290,7 +290,9 @@ defmodule SymphonyElixir.RetryPolicy do
   * pinned without an explicit `fallback: true` opt-in → never (a pin is never
     silently overridden and the opt-in is never inferred);
   * pinned with an explicit opt-in → permitted;
-  * unpinned → permitted.
+  * unpinned with no explicit opt-in (`:none`) → permitted. An unpinned issue
+    with an explicit `fallback: false` label is still an explicit opt-out and
+    is never permitted.
   """
   @spec pin_permits_fallback?(boolean(), fallback_opt_in()) :: boolean()
   def pin_permits_fallback?(_pinned, :ambiguous), do: false
