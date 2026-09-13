@@ -16,8 +16,15 @@ defmodule SymphonyElixirWeb.Presenter do
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
-            blocked: length(Map.get(snapshot, :blocked, []))
+            blocked: length(Map.get(snapshot, :blocked, [])),
+            parked: length(Map.get(snapshot, :parked, []))
           },
+          # MIC-195 Slice D: read-only projection of the authoritative
+          # orchestrator state (issue_id => operator status). Display-only.
+          operational_status:
+            snapshot
+            |> Map.get(:operational_status, %{})
+            |> Map.new(fn {issue_id, status} -> {issue_id, operational_status_name(status)} end),
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
@@ -40,11 +47,13 @@ defmodule SymphonyElixirWeb.Presenter do
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
         blocked = Enum.find(Map.get(snapshot, :blocked, []), &(&1.identifier == issue_identifier))
+        parked = Enum.find(Map.get(snapshot, :parked, []), &(&1.identifier == issue_identifier))
+        operational_status = Map.get(Map.get(snapshot, :operational_status, %{}), issue_id_from_entries(running, retry, blocked, parked))
 
-        if is_nil(running) and is_nil(retry) and is_nil(blocked) do
+        if is_nil(running) and is_nil(retry) and is_nil(blocked) and is_nil(parked) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry, blocked)}
+          {:ok, issue_payload_body(issue_identifier, running, retry, blocked, parked, operational_status)}
         end
 
       _ ->
@@ -63,14 +72,15 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry, blocked) do
+  defp issue_payload_body(issue_identifier, running, retry, blocked, parked, operational_status) do
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry, blocked),
-      status: issue_status(running, retry, blocked),
+      issue_id: issue_id_from_entries(running, retry, blocked, parked),
+      status: issue_status(running, retry, blocked, parked),
+      operational_status: operational_status_name(operational_status),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry, blocked),
-        host: workspace_host(running, retry, blocked)
+        path: workspace_path(issue_identifier, running, retry, blocked, parked),
+        host: workspace_host(running, retry, blocked, parked)
       },
       attempts: %{
         restart_count: restart_count(retry),
@@ -79,6 +89,7 @@ defmodule SymphonyElixirWeb.Presenter do
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
       blocked: blocked && blocked_issue_payload(blocked),
+      parked: parked && parked_issue_payload(parked),
       logs: %{
         codex_session_logs: []
       },
@@ -88,16 +99,31 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp issue_id_from_entries(running, retry, blocked),
-    do: (running && running.issue_id) || (retry && retry.issue_id) || (blocked && blocked.issue_id)
+  defp issue_id_from_entries(running, retry, blocked, parked) do
+    (running && running.issue_id) || (retry && retry.issue_id) || (blocked && blocked.issue_id) ||
+      (parked && parked.issue_id)
+  end
 
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(running, _retry, _blocked) when not is_nil(running), do: "running"
-  defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
-  defp issue_status(nil, nil, _blocked), do: "blocked"
+  # Legacy coarse status, kept for API compatibility. The deterministic
+  # MIC-195 operational projection is `operational_status`.
+  defp issue_status(running, _retry, _blocked, _parked) when not is_nil(running), do: "running"
+  defp issue_status(nil, retry, _blocked, _parked) when not is_nil(retry), do: "retrying"
+  defp issue_status(nil, nil, blocked, _parked) when not is_nil(blocked), do: "blocked"
+  defp issue_status(nil, nil, nil, parked) when not is_nil(parked), do: "parked"
+
+  # MIC-195 Slice D: stable serialized name for the orchestrator's projected
+  # status atom (e.g. :waiting_retry -> "WAITING_RETRY").
+  defp operational_status_name(nil), do: nil
+
+  defp operational_status_name(status) when is_atom(status) do
+    status |> to_string() |> String.upcase()
+  end
+
+  defp operational_status_name(status) when is_binary(status), do: String.upcase(status)
 
   defp running_entry_payload(entry) do
     %{
@@ -105,6 +131,7 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_identifier: entry.identifier,
       issue_url: Map.get(entry, :issue_url),
       state: entry.state,
+      operational_status: operational_status_name(Map.get(entry, :operational_status)),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
@@ -128,6 +155,7 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_url: Map.get(entry, :issue_url),
       attempt: entry.attempt,
       due_at: due_at_iso8601(entry.due_in_ms),
+      operational_status: operational_status_name(Map.get(entry, :operational_status)),
       error: entry.error,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
@@ -140,6 +168,7 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_identifier: entry.identifier,
       issue_url: Map.get(entry, :issue_url),
       state: entry.state,
+      operational_status: operational_status_name(Map.get(entry, :operational_status)),
       error: entry.error,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
@@ -148,6 +177,18 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
       last_event_at: iso8601(entry.last_codex_timestamp)
+    }
+  end
+
+  defp parked_issue_payload(entry) do
+    %{
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      failure_class: Map.get(entry, :failure_class),
+      stop_reason: Map.get(entry, :stop_reason),
+      attempt_count: Map.get(entry, :attempt_count),
+      error: entry.error,
+      parked_at: iso8601(Map.get(entry, :parked_at))
     }
   end
 
@@ -194,17 +235,19 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp workspace_path(issue_identifier, running, retry, blocked) do
+  defp workspace_path(issue_identifier, running, retry, blocked, parked) do
     (running && Map.get(running, :workspace_path)) ||
       (retry && Map.get(retry, :workspace_path)) ||
       (blocked && Map.get(blocked, :workspace_path)) ||
+      (parked && Map.get(parked, :workspace_path)) ||
       Path.join(Config.settings!().workspace.root, Workspace.workspace_key(issue_identifier))
   end
 
-  defp workspace_host(running, retry, blocked) do
+  defp workspace_host(running, retry, blocked, parked) do
     (running && Map.get(running, :worker_host)) ||
       (retry && Map.get(retry, :worker_host)) ||
-      (blocked && Map.get(blocked, :worker_host))
+      (blocked && Map.get(blocked, :worker_host)) ||
+      (parked && Map.get(parked, :worker_host))
   end
 
   defp recent_events_payload(nil), do: []
