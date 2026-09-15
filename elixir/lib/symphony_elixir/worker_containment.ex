@@ -288,12 +288,32 @@ defmodule SymphonyElixir.WorkerContainment do
 
   def stop_and_confirm(port, identity, grace_ms_value) when is_port(port) do
     os_pid = wrapper_os_pid(identity)
-    Port.close(port)
+    close_port(port)
     deadline = System.monotonic_time(:millisecond) + grace_ms_value + @hard_terminate_budget_ms
 
     case await_wrapper_completion(os_pid, identity, deadline) do
       :completed -> confirm_from_receipt(identity)
       :timeout -> %{status: :TERMINATION_UNCONFIRMED, receipt: nil, exit_code: nil, reason: :termination_wait_timeout}
+    end
+  end
+
+  # The wrapper may already be gone (crash, or a mid-run exit whose
+  # exit_status delivery auto-closed the port). Stopping must never raise: a
+  # raise here would skip the termination report and leave the reuse gate
+  # without evidence, which fails open. A missing port means there is nothing
+  # left to stop; the receipt still decides the verdict below.
+  defp close_port(port) do
+    case :erlang.port_info(port) do
+      :undefined ->
+        :ok
+
+      _ ->
+        try do
+          Port.close(port)
+          :ok
+        rescue
+          ArgumentError -> :ok
+        end
     end
   end
 
