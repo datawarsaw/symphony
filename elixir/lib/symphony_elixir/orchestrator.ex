@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
 
   alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Steering, Tracker, Workspace}
-  alias SymphonyElixir.{DispatchRouter, FailureClass, RetryPolicy, RetryStore, WorkerFence}
+  alias SymphonyElixir.{DispatchRouter, FailureClass, RetryPolicy, RetryStore, WorkerContainment, WorkerFence}
   alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Tracker.Issue
 
@@ -180,6 +180,34 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # MIC-223 termination evidence, sent by the agent task before its DOWN
+  # message. Stored on the running entry so the retry/cleanup decisions below
+  # can enforce: no workspace reuse until TERMINATED_CONFIRMED.
+  def handle_info({:worker_termination, issue_id, termination_info}, %{running: running} = state)
+      when is_binary(issue_id) and is_map(termination_info) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        updated_running_entry =
+          running_entry
+          |> maybe_put_runtime_value(:worker_identity, termination_info[:worker_identity])
+          |> maybe_put_runtime_value(:worker_termination, summarize_termination(termination_info[:worker_termination]))
+
+        case updated_running_entry[:worker_termination] do
+          %{status: :TERMINATION_UNCONFIRMED} ->
+            Logger.error("Worker termination UNCONFIRMED for issue_id=#{issue_id}; workspace reuse/cleanup will fail closed evidence=#{inspect(updated_running_entry[:worker_termination])}")
+
+          _ ->
+            :ok
+        end
+
+        notify_dashboard()
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
+
   def handle_info(
         {:codex_worker_update, issue_id, %{event: _, timestamp: _} = update},
         %{running: running} = state
@@ -283,6 +311,7 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       workspace_root: Map.get(running_entry, :workspace_root),
+      worker_identity: Map.get(running_entry, :worker_identity),
       failure_class: FailureClass.to_name(class),
       attempt_count: Map.get(history, :attempt_count, 1),
       identical_failure_count: Map.get(history, :identical_failure_count, 1),
@@ -297,8 +326,20 @@ defmodule SymphonyElixir.Orchestrator do
         park_issue(state, issue_id, running_entry, Map.put(metadata, :stop_reason, stop_reason))
 
       :retry ->
-        next_attempt = next_retry_attempt_from_running(running_entry)
-        schedule_issue_retry(state, issue_id, next_attempt, metadata)
+        # MIC-224/MIC-195 ordering: worker termination must be confirmed
+        # before any retry/fallback worker is scheduled against the same
+        # mutable workspace. Unconfirmed death parks fail-closed (claim, no
+        # timer) and preserves the workspace and its receipt evidence.
+        case WorkerContainment.reuse_gate(Map.get(running_entry, :worker_termination)) do
+          :allowed ->
+            next_attempt = next_retry_attempt_from_running(running_entry)
+            schedule_issue_retry(state, issue_id, next_attempt, metadata)
+
+          {:blocked, :worker_termination_unconfirmed} ->
+            Logger.error("Failing closed for issue_id=#{issue_id}: previous worker termination unconfirmed; parking with claim, preserving workspace, no retry timer")
+
+            park_issue(state, issue_id, running_entry, Map.put(metadata, :stop_reason, :worker_termination_unconfirmed))
+        end
     end
   end
 
@@ -361,6 +402,17 @@ defmodule SymphonyElixir.Orchestrator do
   defp fallback_available?(%Issue{} = issue) do
     match?(%DispatchRouter.Selection{}, DispatchRouter.materialize(:fallback, issue, []))
   end
+
+  # Persist only the bounded decision-relevant termination evidence.
+  defp summarize_termination(%{status: status} = confirmation) when is_atom(status) do
+    %{
+      status: status,
+      exit_code: Map.get(confirmation, :exit_code),
+      reason: Map.get(confirmation, :reason)
+    }
+  end
+
+  defp summarize_termination(_other), do: nil
 
   defp maybe_dispatch(%State{} = state) do
     state =
@@ -1897,6 +1949,7 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_root: metadata[:workspace_root] || Map.get(runtime, :workspace_root),
       route: metadata[:route] || Map.get(history, :route, :primary),
       primary_failure_count: metadata[:primary_failure_count] || Map.get(history, :primary_failure_count, 0),
+      worker_identity: metadata[:worker_identity] || Map.get(runtime, :worker_identity),
       parked_at: DateTime.to_iso8601(now_dt)
     }
 
@@ -1937,6 +1990,7 @@ defmodule SymphonyElixir.Orchestrator do
         workspace_root: metadata[:workspace_root],
         route: metadata[:route] || :primary,
         primary_failure_count: metadata[:primary_failure_count] || 0,
+        worker_identity: metadata[:worker_identity],
         next_retry_in_ms: delay_ms
       }
 
@@ -1963,6 +2017,10 @@ defmodule SymphonyElixir.Orchestrator do
         next_retry_at: next_retry_at_iso(entry),
         last_error: entry.error || "",
         worker_host: entry.worker_host || "",
+        # MIC-223: persisted worker identity (with receipt_path) lets restart
+        # reconciliation positively reconstruct worker death instead of
+        # guessing from PIDs.
+        worker_identity: entry.worker_identity,
         workspace_path: entry.workspace_path || "",
         workspace_root: entry.workspace_root || root,
         route: Map.get(entry, :route, :primary),
@@ -2136,9 +2194,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   # MIC-223: UNKNOWN -> no cleanup + no redispatch; absence of identity is never
   # evidence of death. Only explicit never-spawned evidence (Port.open never
-  # succeeded for the workspace) is positively proven DEAD and safe to redispatch.
+  # succeeded for the workspace) or a persisted termination receipt that
+  # positively proves the tree drained is DEAD and safe to redispatch. After a
+  # runtime restart the receipt file — not a PID — is the death evidence; a
+  # missing/unproven receipt parks the issue fail-closed.
   @spec recover_fence_verdict(term()) :: WorkerFence.verdict()
   defp recover_fence_verdict("never_spawned"), do: WorkerFence.confirm_never_spawned(:never_spawned)
+
+  defp recover_fence_verdict(%{"receipt_path" => _} = identity), do: WorkerFence.confirm_termination_receipt(identity)
   defp recover_fence_verdict(identity), do: WorkerFence.confirm_dead(identity)
 
   defp pick_retry_identifier(issue_id, previous_retry, metadata) do

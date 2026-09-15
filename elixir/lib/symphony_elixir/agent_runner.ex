@@ -138,6 +138,26 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _workspace_root), do: :ok
 
+  # MIC-223: the termination confirmation is the evidence channel for the
+  # orchestrator's no-reuse-without-TERMINATED_CONFIRMED gate. It must reach
+  # the orchestrator BEFORE the agent task's DOWN message, which holds because
+  # the message is sent from the task process before it exits.
+  defp send_worker_termination_info(recipient, %Issue{id: issue_id}, worker_identity, confirmation)
+       when is_binary(issue_id) and is_pid(recipient) do
+    send(
+      recipient,
+      {:worker_termination, issue_id,
+       %{
+         worker_identity: worker_identity,
+         worker_termination: confirmation
+       }}
+    )
+
+    :ok
+  end
+
+  defp send_worker_termination_info(_recipient, _issue, _worker_identity, _confirmation), do: :ok
+
   defp log_workspace_provenance(issue, provenance) do
     Logger.info("Workspace provenance captured for #{issue_context(issue)} evidence=#{Jason.encode!(provenance)}")
   end
@@ -156,12 +176,56 @@ defmodule SymphonyElixir.AgentRunner do
     session_opts = [worker_host: worker_host, issue: issue, workspace_root: workspace_root] ++ opts
 
     with {:ok, session} <- AppServer.start_session(workspace, session_opts) do
-      try do
-        do_run_codex_turns(session, issue, 1, context)
-      after
-        AppServer.stop_session(session)
+      {outcome, confirmation} = run_turns_and_stop(session, issue, context)
+
+      case outcome do
+        {:ok, :ok} ->
+          require_termination_confirmed(issue, confirmation)
+          :ok
+
+        {:ok, {:error, _reason} = error} ->
+          error
+
+        {:raise, error} ->
+          raise error
       end
     end
+  end
+
+  # Exactly one stop per session on every path: turns result, turns error, or
+  # turns crash. Stop order is load-bearing (MIC-223): the worker termination
+  # must be positively confirmed BEFORE this function returns, because every
+  # downstream path (continuation, retry, cleanup) may otherwise touch a
+  # workspace a live worker tree can still mutate. The termination report is
+  # sent before returning or re-raising, so it reaches the orchestrator before
+  # the agent task's DOWN message.
+  defp run_turns_and_stop(session, issue, context) do
+    outcome =
+      try do
+        {:ok, do_run_codex_turns(session, issue, 1, context)}
+      rescue
+        error -> {:raise, error}
+      end
+
+    confirmation = AppServer.stop_session(session)
+    send_worker_termination_info(context.codex_update_recipient, issue, session[:worker_identity], confirmation)
+    {outcome, confirmation}
+  end
+
+  # A successful turn sequence with unproven worker death must not hand a live
+  # workspace back to the orchestrator: fail closed into the classified
+  # failure path, where the unconfirmed-termination gate parks the issue.
+  defp require_termination_confirmed(_issue, %{status: status}) when status != :TERMINATION_UNCONFIRMED, do: :ok
+
+  defp require_termination_confirmed(issue, confirmation) do
+    raise FailureError,
+      message: "Worker termination could not be confirmed for #{issue_context(issue)}; blocking workspace reuse",
+      failure_class: :transient_worker_failure,
+      failure_info: %{
+        kind: :worker_termination_unconfirmed,
+        worker_termination: Map.drop(confirmation, [:receipt])
+      },
+      reason: :worker_termination_unconfirmed
   end
 
   defp do_run_codex_turns(app_session, issue, turn_number, context) do

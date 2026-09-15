@@ -2,6 +2,23 @@ ExUnit.start()
 Code.require_file("support/snapshot_support.exs", __DIR__)
 Code.require_file("support/fake_ssh.exs", __DIR__)
 Code.require_file("support/test_support.exs", __DIR__)
+Code.require_file("support/scratch_process.exs", __DIR__)
+
+# MIC-223: on Windows the containment helper must exist and hash-verify before
+# the suite runs, because local worker launches go through jobrun. Building from
+# checked-in source is deterministic (in-box csc.exe) and fails visibly here.
+case :os.type() do
+  {:win32, _} ->
+    case SymphonyElixir.WorkerContainment.ensure_helper_built() do
+      :ok -> :ok
+      {:error, reason} -> raise "MIC-223 jobrun helper build failed: #{inspect(reason)}"
+    end
+
+    SymphonyElixir.TestSupport.ScratchProcess.ensure_built!()
+
+  _ ->
+    :ok
+end
 
 # Capture the configured test baseline before any test can change shared state.
 SymphonyElixir.TestSupport.capture_baseline!()
