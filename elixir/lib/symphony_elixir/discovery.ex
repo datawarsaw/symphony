@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.Discovery do
   @moduledoc "A bounded read-only Discovery lane. The host retains evidence; workers never write lifecycle state."
   require Logger
+  alias SymphonyElixir.AgentRunner
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Config
   alias SymphonyElixir.Discovery.Contract
@@ -218,6 +219,12 @@ defmodule SymphonyElixir.Discovery do
       result =
         AppServer.run(workspace, input, issue,
           discovery_route: route,
+          # MIC-223: Discovery sessions launch managed workers on contained
+          # hosts too; their launch/stop termination evidence must reach the
+          # orchestrator through the same :worker_termination channel so the
+          # reuse gate never falls back to legacy nil semantics for a possibly
+          # started managed worker.
+          worker_termination_publisher: AgentRunner.worker_termination_publisher(recipient, issue),
           tool_executor: fn _, _ -> %{"success" => false, "output" => "Discovery tool execution denied"} end,
           on_message: fn message -> collect(key, message) |> forward_update(recipient, issue, message) end
         )

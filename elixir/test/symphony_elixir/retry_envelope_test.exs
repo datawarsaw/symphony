@@ -44,7 +44,10 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
       issue: issue,
       worker_host: nil,
       workspace_path: Path.join(System.tmp_dir!(), "ws-" <> issue.id),
-      workspace_root: System.tmp_dir!()
+      workspace_root: System.tmp_dir!(),
+      # MIC-223: these fixtures codify the legacy (non-managed) retry envelope;
+      # a nil expectation would fail closed at the reuse gate.
+      termination_expectation: :NOT_APPLICABLE
     }
   end
 
@@ -183,7 +186,10 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
   test "failure retry records carry the minimum durable schema", %{root: root} do
     state = fresh_state()
     issue = test_issue("ISS-SCHEMA-1", "MT-SCHEMA-1")
-    entry = running_entry(issue)
+
+    # A legacy (expectation-less) running entry must still write the exact
+    # minimum durable schema; the MIC-223 expectation is added only when known.
+    entry = Map.delete(running_entry(issue), :termination_expectation)
 
     next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-s", :unauthorized)
 
@@ -422,5 +428,252 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
     assert history["ISS-ISO-A"].attempt_count == 2
     assert history["ISS-ISO-B"].attempt_count == 1
     assert history["ISS-ISO-B"].identical_failure_count == 1
+  end
+
+  # ---------------------------------------------------------------------------
+  # MIC-223 termination expectation: expectation-aware reuse gating
+  # ---------------------------------------------------------------------------
+
+  defp managed_entry(%Issue{} = issue, overrides \\ %{}) do
+    entry =
+      Map.merge(running_entry(issue), %{
+        termination_expectation: :MANAGED_CONFIRMATION_REQUIRED,
+        worker_identity: nil,
+        worker_termination: nil
+      })
+
+    Map.merge(entry, overrides)
+  end
+
+  test "managed expectation with nil termination evidence parks with claim, preserved workspace, and no timer", %{
+    root: root
+  } do
+    state = fresh_state()
+    issue = test_issue("ISS-MANAGED-NIL", "MT-MANAGED-NIL")
+    entry = managed_entry(issue)
+
+    next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-mnil", :provider_outage)
+
+    try do
+      parked = Orchestrator.parked_for_test(next)
+      assert Map.has_key?(parked, issue.id)
+      assert parked[issue.id].stop_reason == :worker_termination_unconfirmed
+      assert parked[issue.id].workspace_path == entry.workspace_path
+      assert MapSet.member?(next.claimed, issue.id)
+      assert next.retry_attempts == %{}
+
+      assert {:ok, record} = RetryStore.read_record(root, issue.id)
+      assert record["status"] == "parked"
+      assert record["termination_expectation"] == "MANAGED_CONFIRMATION_REQUIRED"
+      assert record["workspace_path"] == entry.workspace_path
+    after
+      cancel_timers(next)
+    end
+  end
+
+  test "managed expectation with UNCONFIRMED termination evidence parks", %{root: root} do
+    state = fresh_state()
+    issue = test_issue("ISS-MANAGED-UNC", "MT-MANAGED-UNC")
+
+    entry =
+      managed_entry(issue, %{
+        worker_identity: %{"launch_id" => "l-unc", "receipt_path" => Path.join(root, "l-unc.json")},
+        worker_termination: %{status: :TERMINATION_UNCONFIRMED, exit_code: nil, reason: :termination_wait_timeout}
+      })
+
+    next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-munc", :provider_outage)
+
+    try do
+      parked = Orchestrator.parked_for_test(next)
+      assert Map.has_key?(parked, issue.id)
+      assert parked[issue.id].stop_reason == :worker_termination_unconfirmed
+      assert next.retry_attempts == %{}
+    after
+      cancel_timers(next)
+    end
+  end
+
+  test "managed expectation with TERMINATED_CONFIRMED evidence allows the retry" do
+    state = fresh_state()
+    issue = test_issue("ISS-MANAGED-OK", "MT-MANAGED-OK")
+
+    entry =
+      managed_entry(issue, %{
+        worker_identity: %{"launch_id" => "l-ok", "receipt_path" => Path.join(System.tmp_dir!(), "l-ok.json")},
+        worker_termination: %{status: :TERMINATED_CONFIRMED, exit_code: 0, reason: "NATURAL_EXIT"}
+      })
+
+    next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-mok", :provider_outage)
+
+    try do
+      assert Map.fetch!(next.retry_attempts, issue.id).attempt == 1
+      refute Map.has_key?(Orchestrator.parked_for_test(next), issue.id)
+    after
+      cancel_timers(next)
+    end
+  end
+
+  test "never-started expectation keeps the legacy retry semantics", %{root: root} do
+    state = fresh_state()
+    issue = test_issue("ISS-NEVER-STARTED", "MT-NEVER-STARTED")
+    entry = managed_entry(issue, %{termination_expectation: :NEVER_STARTED})
+
+    next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-ns", :provider_outage)
+
+    try do
+      assert Map.fetch!(next.retry_attempts, issue.id).attempt == 1
+      refute Map.has_key?(Orchestrator.parked_for_test(next), issue.id)
+
+      assert {:ok, record} = RetryStore.read_record(root, issue.id)
+      assert record["status"] == "retrying"
+      assert record["termination_expectation"] == "NEVER_STARTED"
+    after
+      cancel_timers(next)
+    end
+  end
+
+  test "remote launches keep NOT_APPLICABLE and the legacy retry semantics" do
+    state = fresh_state()
+    issue = test_issue("ISS-REMOTE-NP", "MT-REMOTE-NP")
+    entry = managed_entry(issue, %{termination_expectation: :NOT_APPLICABLE, worker_host: "worker-1.example"})
+
+    next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-rnp", :provider_outage)
+
+    try do
+      assert Map.fetch!(next.retry_attempts, issue.id).attempt == 1
+      refute Map.has_key?(Orchestrator.parked_for_test(next), issue.id)
+    after
+      cancel_timers(next)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # MIC-223 termination expectation: restart reconciliation
+  # ---------------------------------------------------------------------------
+
+  test "restart with managed expectation and no receipt fails closed to PARKED", %{root: root} do
+    now = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    record =
+      RetryStore.build_record(%{
+        issue_id: "ISS-REC-MANAGED",
+        identifier: "MT-REC-MANAGED",
+        status: "retrying",
+        failure_class: "PROVIDER_OUTAGE",
+        attempt_count: 1,
+        identical_failure_count: 1,
+        first_failure_at: now,
+        last_failure_at: now,
+        workspace_path: "/tmp/ws-managed",
+        workspace_root: root,
+        worker_identity: nil
+      })
+      |> Map.put("termination_expectation", "MANAGED_CONFIRMATION_REQUIRED")
+
+    :ok = RetryStore.write_record(root, record)
+
+    next = Orchestrator.recover_retry_records_for_test(fresh_state())
+
+    try do
+      parked = Orchestrator.parked_for_test(next)
+      entry = Map.fetch!(parked, "ISS-REC-MANAGED")
+      assert entry.stop_reason == :fence_unknown
+      assert entry.termination_expectation == :MANAGED_CONFIRMATION_REQUIRED
+      assert MapSet.member?(next.claimed, "ISS-REC-MANAGED")
+      assert next.retry_attempts == %{}
+    after
+      cancel_timers(next)
+    end
+  end
+
+  test "restart preserves a managed expectation backed by a proven receipt and arms the retry", %{root: root} do
+    receipts = tmp_receipt_dir()
+    launch_id = "launch-managed-ok"
+    receipt_path = write_confirmed_receipt(receipts, launch_id)
+
+    now = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    record =
+      RetryStore.build_record(%{
+        issue_id: "ISS-REC-MANAGED-OK",
+        identifier: "MT-REC-MANAGED-OK",
+        status: "retrying",
+        failure_class: "PROVIDER_OUTAGE",
+        attempt_count: 1,
+        identical_failure_count: 1,
+        first_failure_at: now,
+        last_failure_at: now,
+        workspace_root: root,
+        worker_identity: %{"schema_version" => 1, "launch_id" => launch_id, "receipt_path" => receipt_path}
+      })
+      |> Map.put("termination_expectation", "MANAGED_CONFIRMATION_REQUIRED")
+
+    :ok = RetryStore.write_record(root, record)
+
+    next = Orchestrator.recover_retry_records_for_test(fresh_state())
+
+    try do
+      assert Map.fetch!(next.retry_attempts, "ISS-REC-MANAGED-OK").attempt == 2
+      assert Orchestrator.retry_history_for_test(next)["ISS-REC-MANAGED-OK"].attempt_count == 1
+    after
+      cancel_timers(next)
+    end
+  end
+
+  test "restart honors a persisted NEVER_STARTED expectation and arms the retry", %{root: root} do
+    now = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    record =
+      RetryStore.build_record(%{
+        issue_id: "ISS-REC-NEVER",
+        identifier: "MT-REC-NEVER",
+        status: "retrying",
+        failure_class: "PROVIDER_OUTAGE",
+        attempt_count: 2,
+        identical_failure_count: 2,
+        first_failure_at: now,
+        last_failure_at: now,
+        workspace_root: root,
+        worker_identity: nil
+      })
+      |> Map.put("termination_expectation", "NEVER_STARTED")
+
+    :ok = RetryStore.write_record(root, record)
+
+    next = Orchestrator.recover_retry_records_for_test(fresh_state())
+
+    try do
+      assert Map.fetch!(next.retry_attempts, "ISS-REC-NEVER").attempt == 3
+      assert Orchestrator.retry_history_for_test(next)["ISS-REC-NEVER"].attempt_count == 2
+      refute Map.has_key?(Orchestrator.parked_for_test(next), "ISS-REC-NEVER")
+    after
+      cancel_timers(next)
+    end
+  end
+
+  defp tmp_receipt_dir do
+    root = Path.join(System.tmp_dir!(), "mic223-expectation-receipts-#{:erlang.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    Application.put_env(:symphony_elixir, :worker_termination_receipt_root, root)
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :worker_termination_receipt_root) end)
+    on_exit(fn -> File.rm_rf(root) end)
+    root
+  end
+
+  defp write_confirmed_receipt(dir, launch_id) do
+    path = Path.join(dir, launch_id <> ".json")
+
+    File.write!(
+      path,
+      Jason.encode!(%{
+        "schema_version" => 1,
+        "launch_id" => launch_id,
+        "tree_drained" => true,
+        "terminal_reason" => "NATURAL_EXIT",
+        "termination_mode" => "graceful"
+      })
+    )
+
+    path
   end
 end

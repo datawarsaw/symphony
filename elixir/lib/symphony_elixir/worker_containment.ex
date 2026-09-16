@@ -45,6 +45,11 @@ defmodule SymphonyElixir.WorkerContainment do
 
   @type status :: :TERMINATED_CONFIRMED | :TERMINATION_UNCONFIRMED | :NOT_APPLICABLE
 
+  # Pre-launch termination expectation owned by the orchestrator's running
+  # entry. It must exist before risky worker execution so the reuse decision
+  # never depends solely on evidence emitted by the shutdown path itself.
+  @type termination_expectation :: :NOT_APPLICABLE | :NEVER_STARTED | :MANAGED_CONFIRMATION_REQUIRED
+
   @type confirmation :: %{
           required(:status) => status(),
           optional(:receipt) => map() | nil,
@@ -63,6 +68,32 @@ defmodule SymphonyElixir.WorkerContainment do
   @spec containment_active?() :: boolean()
   def containment_active? do
     match?({:win32, _}, :os.type()) and Config.settings!().codex.worker_containment_enabled
+  end
+
+  @doc """
+  Canonical containment decision for one launch: true iff the launch is local
+  (no remote worker host) and containment is enabled on this host. The
+  orchestrator's pre-launch termination expectation and AppServer's worker
+  identity creation must consult this same predicate so the two never diverge.
+  """
+  @spec contained_launch?(String.t() | nil) :: boolean()
+  def contained_launch?(nil), do: containment_active?()
+  def contained_launch?(_worker_host), do: false
+
+  @doc """
+  Pre-launch termination expectation for one attempt.
+
+  `:MANAGED_CONFIRMATION_REQUIRED` — the attempt is in the execution class that
+  requires managed containment, so workspace reuse requires positive
+  `:TERMINATED_CONFIRMED` evidence even when no identity/evidence message ever
+  arrives. `:NOT_APPLICABLE` — no managed containment obligation; nil evidence
+  stays compatible with the legacy non-managed behavior. `:NEVER_STARTED` is a
+  refinement published only when a launch conclusively never established a
+  process/port.
+  """
+  @spec termination_expectation(String.t() | nil) :: termination_expectation()
+  def termination_expectation(worker_host) do
+    if contained_launch?(worker_host), do: :MANAGED_CONFIRMATION_REQUIRED, else: :NOT_APPLICABLE
   end
 
   @spec grace_ms() :: pos_integer()
@@ -560,38 +591,47 @@ defmodule SymphonyElixir.WorkerContainment do
   May the runtime proceed with workspace reuse / redispatch / cleanup after the
   previous worker on this workspace ended?
 
-  `worker_identity` is the caller's context: the managed, receipt-carrying
-  identity the runtime holds for this launch (nil for remote, non-Windows, or
-  disabled-containment launches). When a managed identity is present, only
-  positive `TERMINATED_CONFIRMED` evidence allows reuse: nil, unconfirmed,
-  NOT_APPLICABLE, or malformed evidence all fail closed, because a managed
-  worker must be proven drained before its mutable workspace is touched again.
-  Without a managed identity, only explicit `:TERMINATION_UNCONFIRMED` evidence
-  or a malformed confirmation blocks; a nil confirmation keeps the previous
-  behavior for launches that never carried a managed worker (for example a
-  worker that failed before any session could be started).
+  `termination_expectation` is the pre-launch expectation stored on the
+  orchestrator's running entry (set before risky worker execution, refined only
+  on conclusive launch-outcome evidence), NOT evidence emitted by the shutdown
+  path — the reuse decision must hold even when no termination message ever
+  arrives.
+
+  - `:MANAGED_CONFIRMATION_REQUIRED` — only positive `:TERMINATED_CONFIRMED`
+    evidence allows reuse. nil, `:TERMINATION_UNCONFIRMED`, `:NOT_APPLICABLE`,
+    and malformed evidence all fail closed: a managed worker must be proven
+    drained before its mutable workspace is touched again.
+  - `:NEVER_STARTED` — the launch conclusively never established a process or
+    port; no termination confirmation is required.
+  - `:NOT_APPLICABLE` — no managed containment obligation; the legacy gate
+    applies: nil, `:TERMINATED_CONFIRMED`, and `:NOT_APPLICABLE` confirmations
+    keep the previous behavior for launches that never carried a managed worker
+    (for example a worker that failed before any session could be started),
+    while explicit `:TERMINATION_UNCONFIRMED` and malformed confirmations block.
+  - Any other expectation value — including a missing one — fails closed.
   """
   @spec reuse_gate(confirmation() | nil, term()) :: :allowed | {:blocked, :worker_termination_unconfirmed}
-  def reuse_gate(confirmation, worker_identity) when is_map(worker_identity) do
+  def reuse_gate(confirmation, :MANAGED_CONFIRMATION_REQUIRED) do
     case confirmation do
       %{status: :TERMINATED_CONFIRMED} -> :allowed
       _ -> {:blocked, :worker_termination_unconfirmed}
     end
   end
 
-  def reuse_gate(nil, _no_managed_identity), do: :allowed
+  def reuse_gate(_confirmation, :NEVER_STARTED), do: :allowed
 
-  def reuse_gate(%{status: :TERMINATED_CONFIRMED}, _no_managed_identity), do: :allowed
-
-  def reuse_gate(%{status: :NOT_APPLICABLE}, _no_managed_identity), do: :allowed
-
-  def reuse_gate(%{status: :TERMINATION_UNCONFIRMED}, _no_managed_identity) do
-    {:blocked, :worker_termination_unconfirmed}
+  def reuse_gate(confirmation, :NOT_APPLICABLE) do
+    case confirmation do
+      nil -> :allowed
+      %{status: :TERMINATED_CONFIRMED} -> :allowed
+      %{status: :NOT_APPLICABLE} -> :allowed
+      _other -> {:blocked, :worker_termination_unconfirmed}
+    end
   end
 
-  # Malformed and unexpected shapes (maps without a known status, garbage
-  # terms) must never default to allowed.
-  def reuse_gate(_unexpected, _no_managed_identity) do
+  # Unknown or missing expectations (legacy/manual entries and garbage) must
+  # never default to allowed.
+  def reuse_gate(_confirmation, _unexpected_expectation) do
     {:blocked, :worker_termination_unconfirmed}
   end
 end

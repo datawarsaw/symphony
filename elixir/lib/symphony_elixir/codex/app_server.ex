@@ -51,6 +51,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         run_turn(session, prompt, issue, opts)
       after
         confirmation = stop_session(session)
+        publish_session_termination(Keyword.get(opts, :worker_termination_publisher), session, confirmation)
         maybe_warn_unconfirmed(issue, confirmation)
       end
     end
@@ -59,6 +60,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    termination_publisher = Keyword.get(opts, :worker_termination_publisher)
     dynamic_tool_binding = DynamicTool.bind()
     discovery_route = Keyword.get(opts, :discovery_route)
     dynamic_tool_binding = if discovery_route, do: Map.put(dynamic_tool_binding, :tool_specs, []), else: dynamic_tool_binding
@@ -99,7 +101,20 @@ defmodule SymphonyElixir.Codex.AppServer do
          }}
       else
         {:error, reason} ->
-          stop_and_confirm_session_port(port, worker_identity)
+          # MIC-223 partial-start seam: the port was created, so a managed
+          # process may have entered execution. stop_and_confirm already ran;
+          # publishing its discarded confirmation through the same
+          # :worker_termination message the shutdown path uses keeps the reuse
+          # gate from falling back to legacy nil semantics on evidence the
+          # runtime provably holds.
+          confirmation = stop_and_confirm_session_port(port, worker_identity)
+
+          publish_worker_termination(termination_publisher, %{
+            worker_identity: worker_identity,
+            worker_termination: confirmation,
+            termination_expectation: WorkerContainment.termination_expectation(worker_host)
+          })
+
           {:error, reason}
       end
     end
@@ -309,6 +324,24 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp extract_reset_after_ms(%{retry_after_ms: ms}) when is_integer(ms) and ms >= 0, do: ms
   defp extract_reset_after_ms(_payload), do: nil
 
+  # MIC-223: the stop confirmation of a fully started session is evidence too.
+  # Discovery launches through this entry point, and without publication its
+  # reuse decisions would fall back to legacy nil semantics even though the
+  # session was managed and stopped.
+  defp publish_session_termination(publisher, session, confirmation) do
+    publish_worker_termination(publisher, %{
+      worker_identity: Map.get(session, :worker_identity),
+      worker_termination: confirmation
+    })
+  end
+
+  defp publish_worker_termination(publisher, info) when is_function(publisher, 1) do
+    publisher.(info)
+    :ok
+  end
+
+  defp publish_worker_termination(_publisher, _info), do: :ok
+
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
     expanded_root = Config.local_workspace_root()
@@ -417,11 +450,11 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp jobrun_charlist(jobrun) when is_binary(jobrun), do: String.to_charlist(jobrun)
 
-  # MIC-223 worker identity exists only for contained local Windows launches.
-  defp new_worker_identity(_workspace, _issue, _opts, worker_host) when is_binary(worker_host), do: nil
-
-  defp new_worker_identity(workspace, issue, opts, nil) do
-    if WorkerContainment.containment_active?() do
+  # MIC-223 worker identity exists only for contained local Windows launches;
+  # the decision is the canonical WorkerContainment.contained_launch? predicate
+  # shared with the orchestrator's pre-launch termination expectation.
+  defp new_worker_identity(workspace, issue, opts, worker_host) do
+    if WorkerContainment.contained_launch?(worker_host) do
       WorkerContainment.new_identity(
         issue_id: issue && Map.get(issue, :id),
         attempt_id: Keyword.get(opts, :attempt_id),
@@ -444,12 +477,13 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp stop_and_confirm_session_port(port, nil) when is_port(port) do
     stop_port(port)
-    :ok
+    %{status: :NOT_APPLICABLE}
   end
 
   defp stop_and_confirm_session_port(port, identity) when is_port(port) and is_map(identity) do
     confirmation = WorkerContainment.stop_and_confirm(port, identity, WorkerContainment.grace_ms())
     maybe_warn_unconfirmed(nil, confirmation)
+    confirmation
   end
 
   defp maybe_warn_unconfirmed(issue, %{status: :TERMINATION_UNCONFIRMED} = confirmation) do

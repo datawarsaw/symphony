@@ -225,44 +225,101 @@ defmodule SymphonyElixir.WorkerContainmentTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Reuse gate
+  # Pre-launch termination expectation (MIC-223 final hardening)
   # ---------------------------------------------------------------------------
 
-  test "reuse gate without a managed identity keeps legacy semantics" do
-    assert WorkerContainment.reuse_gate(nil, nil) == :allowed
-    assert WorkerContainment.reuse_gate(%{status: :NOT_APPLICABLE}, nil) == :allowed
-    assert WorkerContainment.reuse_gate(%{status: :TERMINATED_CONFIRMED}, nil) == :allowed
+  test "pre-launch expectation follows the canonical containment predicate" do
+    # Remote launches are never managed, regardless of host containment.
+    assert WorkerContainment.termination_expectation("worker-1.example") == :NOT_APPLICABLE
 
-    assert WorkerContainment.reuse_gate(%{status: :TERMINATION_UNCONFIRMED, receipt: nil}, nil) ==
+    # Local launches are managed exactly when containment is active, which is
+    # also the predicate AppServer uses to create the worker identity.
+    expected = if WorkerContainment.containment_active?(), do: :MANAGED_CONFIRMATION_REQUIRED, else: :NOT_APPLICABLE
+    assert WorkerContainment.termination_expectation(nil) == expected
+    assert WorkerContainment.contained_launch?("worker-1.example") == false
+    assert WorkerContainment.contained_launch?(nil) == WorkerContainment.containment_active?()
+  end
+
+  test "containment-disabled host keeps NOT_APPLICABLE expectation" do
+    workflow_path = Workflow.workflow_file_path()
+    content = File.read!(workflow_path)
+
+    File.write!(workflow_path, String.replace(content, "codex:\n", "codex:\n  worker_containment_enabled: false\n"))
+    Workflow.set_workflow_file_path(workflow_path)
+
+    if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+
+    try do
+      assert WorkerContainment.containment_active?() == false
+      assert WorkerContainment.contained_launch?(nil) == false
+      assert WorkerContainment.termination_expectation(nil) == :NOT_APPLICABLE
+    after
+      Workflow.set_workflow_file_path(workflow_path)
+      File.write!(workflow_path, content)
+
+      if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Reuse gate (expectation-aware)
+  # ---------------------------------------------------------------------------
+
+  test "reuse gate without a managed obligation keeps legacy semantics" do
+    assert WorkerContainment.reuse_gate(nil, :NOT_APPLICABLE) == :allowed
+    assert WorkerContainment.reuse_gate(%{status: :NOT_APPLICABLE}, :NOT_APPLICABLE) == :allowed
+    assert WorkerContainment.reuse_gate(%{status: :TERMINATED_CONFIRMED}, :NOT_APPLICABLE) == :allowed
+
+    assert WorkerContainment.reuse_gate(%{status: :TERMINATION_UNCONFIRMED, receipt: nil}, :NOT_APPLICABLE) ==
              {:blocked, :worker_termination_unconfirmed}
   end
 
-  test "reuse gate with a managed identity allows only positive confirmation" do
-    identity = %{"launch_id" => "l-1", "receipt_path" => Path.join(tmp_receipt_root(), "l-1.json")}
-
-    assert WorkerContainment.reuse_gate(%{status: :TERMINATED_CONFIRMED, receipt: %{}, exit_code: 0}, identity) ==
+  test "reuse gate with a managed expectation allows only positive confirmation" do
+    assert WorkerContainment.reuse_gate(%{status: :TERMINATED_CONFIRMED, receipt: %{}, exit_code: 0}, :MANAGED_CONFIRMATION_REQUIRED) ==
              :allowed
 
     # Missing, unconfirmed, not-applicable, and malformed evidence all fail
     # closed while a managed worker termination is expected.
-    assert WorkerContainment.reuse_gate(nil, identity) == {:blocked, :worker_termination_unconfirmed}
-
-    assert WorkerContainment.reuse_gate(%{status: :TERMINATION_UNCONFIRMED, receipt: nil}, identity) ==
+    assert WorkerContainment.reuse_gate(nil, :MANAGED_CONFIRMATION_REQUIRED) ==
              {:blocked, :worker_termination_unconfirmed}
 
-    assert WorkerContainment.reuse_gate(%{status: :NOT_APPLICABLE}, identity) ==
+    assert WorkerContainment.reuse_gate(%{status: :TERMINATION_UNCONFIRMED, receipt: nil}, :MANAGED_CONFIRMATION_REQUIRED) ==
              {:blocked, :worker_termination_unconfirmed}
 
-    assert WorkerContainment.reuse_gate(%{}, identity) == {:blocked, :worker_termination_unconfirmed}
-    assert WorkerContainment.reuse_gate(%{status: :SOMETHING_ELSE}, identity) == {:blocked, :worker_termination_unconfirmed}
-    assert WorkerContainment.reuse_gate("garbage", identity) == {:blocked, :worker_termination_unconfirmed}
+    assert WorkerContainment.reuse_gate(%{status: :NOT_APPLICABLE}, :MANAGED_CONFIRMATION_REQUIRED) ==
+             {:blocked, :worker_termination_unconfirmed}
+
+    assert WorkerContainment.reuse_gate(%{}, :MANAGED_CONFIRMATION_REQUIRED) == {:blocked, :worker_termination_unconfirmed}
+
+    assert WorkerContainment.reuse_gate(%{status: :SOMETHING_ELSE}, :MANAGED_CONFIRMATION_REQUIRED) ==
+             {:blocked, :worker_termination_unconfirmed}
+
+    assert WorkerContainment.reuse_gate("garbage", :MANAGED_CONFIRMATION_REQUIRED) ==
+             {:blocked, :worker_termination_unconfirmed}
   end
 
-  test "reuse gate fails closed on malformed evidence without a managed identity" do
-    assert WorkerContainment.reuse_gate(%{}, nil) == {:blocked, :worker_termination_unconfirmed}
-    assert WorkerContainment.reuse_gate(%{status: :NOT_A_REAL_STATUS}, nil) == {:blocked, :worker_termination_unconfirmed}
-    assert WorkerContainment.reuse_gate("garbage", nil) == {:blocked, :worker_termination_unconfirmed}
-    assert WorkerContainment.reuse_gate(42, nil) == {:blocked, :worker_termination_unconfirmed}
+  test "reuse gate allows never-started launches without termination evidence" do
+    assert WorkerContainment.reuse_gate(nil, :NEVER_STARTED) == :allowed
+    assert WorkerContainment.reuse_gate(%{status: :TERMINATED_CONFIRMED}, :NEVER_STARTED) == :allowed
+  end
+
+  test "reuse gate fails closed on unexpected expectation values" do
+    assert WorkerContainment.reuse_gate(nil, nil) == {:blocked, :worker_termination_unconfirmed}
+    assert WorkerContainment.reuse_gate(nil, :SOMETHING_ELSE) == {:blocked, :worker_termination_unconfirmed}
+
+    assert WorkerContainment.reuse_gate(%{status: :TERMINATED_CONFIRMED}, "MANAGED_CONFIRMATION_REQUIRED") ==
+             {:blocked, :worker_termination_unconfirmed}
+
+    assert WorkerContainment.reuse_gate(nil, 42) == {:blocked, :worker_termination_unconfirmed}
+
+    # Malformed confirmations stay denied on every legacy-compatible path.
+    assert WorkerContainment.reuse_gate(%{}, :NOT_APPLICABLE) == {:blocked, :worker_termination_unconfirmed}
+
+    assert WorkerContainment.reuse_gate(%{status: :NOT_A_REAL_STATUS}, :NOT_APPLICABLE) ==
+             {:blocked, :worker_termination_unconfirmed}
+
+    assert WorkerContainment.reuse_gate("garbage", :NOT_APPLICABLE) == {:blocked, :worker_termination_unconfirmed}
+    assert WorkerContainment.reuse_gate(42, :NOT_APPLICABLE) == {:blocked, :worker_termination_unconfirmed}
   end
 
   # ---------------------------------------------------------------------------
@@ -614,10 +671,12 @@ defmodule SymphonyElixir.WorkerContainmentTest do
       issue = workflow_issue("MT-NOIDENT")
       state = %Orchestrator.State{task_supervisor: SymphonyElixir.TaskSupervisor}
 
-      # Neither evidence nor a managed identity: the launch never carried
-      # containment (for example a pre-session failure), so the MIC-195 retry
-      # semantics are unchanged.
-      entry = base_running_entry(issue, root, nil, nil)
+      # Neither evidence nor a managed identity: the launch conclusively never
+      # started (for example a pre-session failure refined by the AgentRunner
+      # boundary), so the MIC-195 retry semantics are unchanged.
+      entry =
+        base_running_entry(issue, root, nil, nil)
+        |> Map.put(:termination_expectation, :NEVER_STARTED)
 
       state = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-1", failure_reason())
 

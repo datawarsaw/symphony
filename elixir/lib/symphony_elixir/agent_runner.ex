@@ -5,10 +5,16 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Discovery, PromptBuilder, RepositoryRouter, Steering, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Discovery, PromptBuilder, RepositoryRouter, Steering, Tracker, WorkerContainment, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
+
+  # MIC-223: marks (per agent task process) that a termination-evidence message
+  # was published for this attempt, so a pre-launch failure at the top-level
+  # boundary never overwrites evidence-backed expectation state with
+  # NEVER_STARTED.
+  @termination_evidence_sent_key :mic_223_worker_termination_published
 
   defmodule FailureError do
     @moduledoc """
@@ -63,6 +69,7 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
+        publish_launch_never_started(codex_update_recipient, issue, worker_host)
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         info = AppServer.failure_info({:error, reason})
         class = classify_failure(reason, info)
@@ -142,21 +149,45 @@ defmodule SymphonyElixir.AgentRunner do
   # orchestrator's no-reuse-without-TERMINATED_CONFIRMED gate. It must reach
   # the orchestrator BEFORE the agent task's DOWN message, which holds because
   # the message is sent from the task process before it exits.
-  defp send_worker_termination_info(recipient, %Issue{id: issue_id}, worker_identity, confirmation)
-       when is_binary(issue_id) and is_pid(recipient) do
-    send(
-      recipient,
-      {:worker_termination, issue_id,
-       %{
-         worker_identity: worker_identity,
-         worker_termination: confirmation
-       }}
-    )
+  defp send_worker_termination_info(recipient, %Issue{id: issue_id}, info)
+       when is_binary(issue_id) and is_pid(recipient) and is_map(info) do
+    Process.put(@termination_evidence_sent_key, true)
+    send(recipient, {:worker_termination, issue_id, info})
+    :ok
+  end
+
+  defp send_worker_termination_info(_recipient, _issue, _info), do: :ok
+
+  @doc false
+  @spec worker_termination_publisher(pid() | nil, Issue.t() | map()) :: (map() -> :ok)
+  def worker_termination_publisher(recipient, issue) do
+    fn info when is_map(info) ->
+      send_worker_termination_info(recipient, issue, info)
+      :ok
+    end
+  end
+
+  # MIC-223: an attempt that failed without ever reaching a worker launch — and
+  # without any termination-evidence publication — conclusively never started,
+  # so the pre-launch MANAGED_CONFIRMATION_REQUIRED expectation is refined to
+  # NEVER_STARTED and legacy retry semantics are preserved. Failures that DID
+  # publish evidence never reach the refinement, and crashes after a launch
+  # escape as raises, which skip this boundary entirely.
+  defp publish_launch_never_started(recipient, issue, worker_host) do
+    if WorkerContainment.contained_launch?(worker_host) and not termination_evidence_sent?() do
+      send_worker_termination_info(recipient, issue, %{
+        worker_identity: nil,
+        worker_termination: nil,
+        termination_expectation: :NEVER_STARTED
+      })
+    end
 
     :ok
   end
 
-  defp send_worker_termination_info(_recipient, _issue, _worker_identity, _confirmation), do: :ok
+  defp termination_evidence_sent? do
+    Process.get(@termination_evidence_sent_key) == true
+  end
 
   defp log_workspace_provenance(issue, provenance) do
     Logger.info("Workspace provenance captured for #{issue_context(issue)} evidence=#{Jason.encode!(provenance)}")
@@ -173,7 +204,13 @@ defmodule SymphonyElixir.AgentRunner do
       max_turns: Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     }
 
-    session_opts = [worker_host: worker_host, issue: issue, workspace_root: workspace_root] ++ opts
+    session_opts =
+      [
+        worker_host: worker_host,
+        issue: issue,
+        workspace_root: workspace_root,
+        worker_termination_publisher: worker_termination_publisher(codex_update_recipient, issue)
+      ] ++ opts
 
     with {:ok, session} <- AppServer.start_session(workspace, session_opts) do
       {outcome, confirmation} = run_turns_and_stop(session, issue, context)
@@ -208,7 +245,12 @@ defmodule SymphonyElixir.AgentRunner do
       end
 
     confirmation = AppServer.stop_session(session)
-    send_worker_termination_info(context.codex_update_recipient, issue, session[:worker_identity], confirmation)
+
+    send_worker_termination_info(context.codex_update_recipient, issue, %{
+      worker_identity: session[:worker_identity],
+      worker_termination: confirmation
+    })
+
     {outcome, confirmation}
   end
 

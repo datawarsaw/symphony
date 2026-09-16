@@ -1007,7 +1007,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_message: nil,
       last_codex_timestamp: started_at,
       last_codex_event: nil,
-      started_at: started_at
+      started_at: started_at,
+      # MIC-223: remote launches carry NOT_APPLICABLE, exactly as
+      # spawn_issue_on_worker_host records for production entries.
+      termination_expectation: :NOT_APPLICABLE
     }
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])
