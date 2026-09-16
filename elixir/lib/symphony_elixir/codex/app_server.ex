@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   alias SymphonyElixir.PathSafety
   alias SymphonyElixir.SSH
   alias SymphonyElixir.Steering
+  alias SymphonyElixir.WorkerContainment
 
   @initialize_id 1
   @thread_start_id 2
@@ -39,13 +40,19 @@ defmodule SymphonyElixir.Codex.AppServer do
           dynamic_tool_binding: map()
         }
 
+  # MIC-223: contained sessions additionally carry `worker_identity` (string-keyed,
+  # RetryStore-persistable). Kept off the informal type above because the type mixes
+  # keyword shorthand.
+
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
     with {:ok, session} <- start_session(workspace, opts) do
       try do
         run_turn(session, prompt, issue, opts)
       after
-        stop_session(session)
+        confirmation = stop_session(session)
+        publish_session_termination(Keyword.get(opts, :worker_termination_publisher), session, confirmation)
+        maybe_warn_unconfirmed(issue, confirmation)
       end
     end
   end
@@ -53,15 +60,18 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    termination_publisher = Keyword.get(opts, :worker_termination_publisher)
     dynamic_tool_binding = DynamicTool.bind()
     discovery_route = Keyword.get(opts, :discovery_route)
     dynamic_tool_binding = if discovery_route, do: Map.put(dynamic_tool_binding, :tool_specs, []), else: dynamic_tool_binding
     issue = Keyword.get(opts, :issue)
+    worker_identity = new_worker_identity(workspace, issue, opts, worker_host)
 
     with {:ok, worker_route} <- worker_route_for(opts, issue, discovery_route),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding, worker_identity) do
       metadata = port_metadata(port, worker_host)
+      worker_identity = attach_wrapper_pid(worker_identity, port)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, discovery_route),
            {:ok, thread_id, evidence} <-
@@ -82,6 +92,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            dynamic_tool_binding: dynamic_tool_binding,
            steering: steering_context(opts, worker_host),
            discovery_route: discovery_route,
+           worker_identity: worker_identity,
            model: evidence[:model],
            reasoning_effort: evidence[:reasoning_effort],
            model_source: evidence[:model_source],
@@ -90,7 +101,20 @@ defmodule SymphonyElixir.Codex.AppServer do
          }}
       else
         {:error, reason} ->
-          stop_port(port)
+          # MIC-223 partial-start seam: the port was created, so a managed
+          # process may have entered execution. stop_and_confirm already ran;
+          # publishing its discarded confirmation through the same
+          # :worker_termination message the shutdown path uses keeps the reuse
+          # gate from falling back to legacy nil semantics on evidence the
+          # runtime provably holds.
+          confirmation = stop_and_confirm_session_port(port, worker_identity)
+
+          publish_worker_termination(termination_publisher, %{
+            worker_identity: worker_identity,
+            worker_termination: confirmation,
+            termination_expectation: WorkerContainment.termination_expectation(worker_host)
+          })
+
           {:error, reason}
       end
     end
@@ -119,6 +143,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
+
         Logger.info(
           "Codex session started for #{issue_context(issue)} session_id=#{session_id} model=#{app_session[:model]} reasoning_effort=#{app_session[:reasoning_effort]} route_source=#{app_session[:route_source]}"
         )
@@ -216,9 +241,26 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
-    stop_port(port)
+  @doc """
+  Stops the worker session and returns a termination confirmation.
+
+  MIC-223: on a contained local Windows launch, `Port.close` is only a stop
+  request. The returned confirmation is `:TERMINATED_CONFIRMED` only when the
+  jobrun receipt positively proves the process tree drained; otherwise it is
+  `:TERMINATION_UNCONFIRMED` and callers must not reuse or clean the
+  workspace. Non-contained launches (remote, non-Windows, disabled) return
+  `:NOT_APPLICABLE` after the legacy port close.
+  """
+  @spec stop_session(session()) :: WorkerContainment.confirmation()
+  def stop_session(%{port: port} = session) when is_port(port) do
+    case Map.get(session, :worker_identity) do
+      nil ->
+        stop_port(port)
+        %{status: :NOT_APPLICABLE}
+
+      identity ->
+        WorkerContainment.stop_and_confirm(port, identity, WorkerContainment.grace_ms())
+    end
   end
 
   @doc """
@@ -282,6 +324,24 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp extract_reset_after_ms(%{retry_after_ms: ms}) when is_integer(ms) and ms >= 0, do: ms
   defp extract_reset_after_ms(_payload), do: nil
 
+  # MIC-223: the stop confirmation of a fully started session is evidence too.
+  # Discovery launches through this entry point, and without publication its
+  # reuse decisions would fall back to legacy nil semantics even though the
+  # session was managed and stopped.
+  defp publish_session_termination(publisher, session, confirmation) do
+    publish_worker_termination(publisher, %{
+      worker_identity: Map.get(session, :worker_identity),
+      worker_termination: confirmation
+    })
+  end
+
+  defp publish_worker_termination(publisher, info) when is_function(publisher, 1) do
+    publisher.(info)
+    :ok
+  end
+
+  defp publish_worker_termination(_publisher, _info), do: :ok
+
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
     expanded_root = Config.local_workspace_root()
@@ -324,33 +384,119 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
- defp start_port(workspace, nil, dynamic_tool_binding) do
-   with {:ok, executable} <- SymphonyElixir.Codex.LocalShell.resolve(Config.settings!().codex.shell_executable),
-        {:ok, worker_environment} <- WorkerEnvironment.prepare(workspace) do
-       port =
-         Port.open(
-           {:spawn_executable, String.to_charlist(executable)},
-           [
-             :binary,
-             :exit_status,
-             :stderr_to_stdout,
-             args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, worker_environment))],
-             cd: String.to_charlist(workspace),
-             env: worker_environment ++ tracker_secret_port_env(dynamic_tool_binding),
-             line: @port_line_bytes
-           ]
-         )
+  # Contained local Windows launch (MIC-223): the port runs the jobrun Job
+  # Object wrapper, which receives the shell as its own absolute-path child.
+  # The wrapper inherits the port's cd/env policy, so workspace, environment,
+  # secret removal, line mode and stdio behavior are unchanged. A missing or
+  # unverified helper fails the launch visibly instead of silently falling
+  # back to an unprotected spawn.
+  defp start_port(workspace, nil, dynamic_tool_binding, identity) when not is_nil(identity) do
+    with {:ok, jobrun} <- WorkerContainment.helper_path(),
+         {:ok, executable} <- SymphonyElixir.Codex.LocalShell.resolve(Config.settings!().codex.shell_executable),
+         {:ok, worker_environment} <- WorkerEnvironment.prepare(workspace) do
+      port =
+        Port.open(
+          {:spawn_executable, jobrun_charlist(jobrun)},
+          [
+            :binary,
+            :exit_status,
+            :stderr_to_stdout,
+            args:
+              WorkerContainment.launch_args(identity, executable, [
+                ~c"-lc",
+                String.to_charlist(local_launch_command(dynamic_tool_binding, worker_environment))
+              ]),
+            cd: String.to_charlist(workspace),
+            env: worker_environment ++ tracker_secret_port_env(dynamic_tool_binding),
+            line: @port_line_bytes
+          ]
+        )
 
-       {:ok, port}
-   end
- rescue
-   error -> {:error, {:local_shell_start_failed, Exception.message(error)}}
- end
+      {:ok, port}
+    end
+  rescue
+    error -> {:error, {:local_shell_start_failed, Exception.message(error)}}
+  end
 
-  defp start_port(workspace, worker_host, dynamic_tool_binding) when is_binary(worker_host) do
+  # Legacy launch: remote workers, non-Windows hosts, and containment disabled
+  # keep the historical direct shell spawn (behaviorally unchanged).
+  defp start_port(workspace, nil, dynamic_tool_binding, nil) do
+    with {:ok, executable} <- SymphonyElixir.Codex.LocalShell.resolve(Config.settings!().codex.shell_executable),
+         {:ok, worker_environment} <- WorkerEnvironment.prepare(workspace) do
+      port =
+        Port.open(
+          {:spawn_executable, String.to_charlist(executable)},
+          [
+            :binary,
+            :exit_status,
+            :stderr_to_stdout,
+            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, worker_environment))],
+            cd: String.to_charlist(workspace),
+            env: worker_environment ++ tracker_secret_port_env(dynamic_tool_binding),
+            line: @port_line_bytes
+          ]
+        )
+
+      {:ok, port}
+    end
+  rescue
+    error -> {:error, {:local_shell_start_failed, Exception.message(error)}}
+  end
+
+  defp start_port(workspace, worker_host, dynamic_tool_binding, _identity) when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace, dynamic_tool_binding)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
+
+  defp jobrun_charlist(jobrun) when is_binary(jobrun), do: String.to_charlist(jobrun)
+
+  # MIC-223 worker identity exists only for contained local Windows launches;
+  # the decision is the canonical WorkerContainment.contained_launch? predicate
+  # shared with the orchestrator's pre-launch termination expectation.
+  defp new_worker_identity(workspace, issue, opts, worker_host) do
+    if WorkerContainment.contained_launch?(worker_host) do
+      WorkerContainment.new_identity(
+        issue_id: issue && Map.get(issue, :id),
+        attempt_id: Keyword.get(opts, :attempt_id),
+        workspace: workspace,
+        worker_host: nil
+      )
+    else
+      nil
+    end
+  end
+
+  defp attach_wrapper_pid(nil, _port), do: nil
+
+  defp attach_wrapper_pid(identity, port) when is_map(identity) do
+    case :erlang.port_info(port, :os_pid) do
+      {:os_pid, os_pid} -> Map.put(identity, "wrapper_pid", to_string(os_pid))
+      _ -> identity
+    end
+  end
+
+  defp stop_and_confirm_session_port(port, nil) when is_port(port) do
+    stop_port(port)
+    %{status: :NOT_APPLICABLE}
+  end
+
+  defp stop_and_confirm_session_port(port, identity) when is_port(port) and is_map(identity) do
+    confirmation = WorkerContainment.stop_and_confirm(port, identity, WorkerContainment.grace_ms())
+    maybe_warn_unconfirmed(nil, confirmation)
+    confirmation
+  end
+
+  defp maybe_warn_unconfirmed(issue, %{status: :TERMINATION_UNCONFIRMED} = confirmation) do
+    issue_context =
+      case issue do
+        %{id: issue_id, identifier: identifier} -> "issue_id=#{issue_id} issue_identifier=#{identifier}"
+        _ -> "issue_unknown"
+      end
+
+    Logger.error("Worker termination UNCONFIRMED for #{issue_context}; workspace reuse/cleanup must fail closed confirmation=#{inspect(confirmation)}")
+  end
+
+  defp maybe_warn_unconfirmed(_issue, _confirmation), do: :ok
 
   defp local_launch_command(dynamic_tool_binding, worker_environment) do
     [
@@ -543,6 +689,7 @@ defmodule SymphonyElixir.Codex.AppServer do
                     reasoning_source: :discovery,
                     route_source: :discovery
                   }
+
                   {:ok, thread_id, evidence}
 
                 other ->

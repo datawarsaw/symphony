@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
 
   alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Steering, Tracker, Workspace}
-  alias SymphonyElixir.{DispatchRouter, FailureClass, RetryPolicy, RetryStore, WorkerFence}
+  alias SymphonyElixir.{DispatchRouter, FailureClass, RetryPolicy, RetryStore, WorkerContainment, WorkerFence}
   alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Tracker.Issue
 
@@ -180,6 +180,35 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # MIC-223 termination evidence, sent by the agent task before its DOWN
+  # message. Stored on the running entry so the retry/cleanup decisions below
+  # can enforce: no workspace reuse until TERMINATED_CONFIRMED.
+  def handle_info({:worker_termination, issue_id, termination_info}, %{running: running} = state)
+      when is_binary(issue_id) and is_map(termination_info) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        updated_running_entry =
+          running_entry
+          |> maybe_put_runtime_value(:worker_identity, termination_info[:worker_identity])
+          |> maybe_put_runtime_value(:worker_termination, summarize_termination(termination_info[:worker_termination]))
+          |> maybe_put_runtime_value(:termination_expectation, normalize_expectation(termination_info[:termination_expectation]))
+
+        case updated_running_entry[:worker_termination] do
+          %{status: :TERMINATION_UNCONFIRMED} ->
+            Logger.error("Worker termination UNCONFIRMED for issue_id=#{issue_id}; workspace reuse/cleanup will fail closed evidence=#{inspect(updated_running_entry[:worker_termination])}")
+
+          _ ->
+            :ok
+        end
+
+        notify_dashboard()
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
+
   def handle_info(
         {:codex_worker_update, issue_id, %{event: _, timestamp: _} = update},
         %{running: running} = state
@@ -283,6 +312,8 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       workspace_root: Map.get(running_entry, :workspace_root),
+      worker_identity: Map.get(running_entry, :worker_identity),
+      termination_expectation: Map.get(running_entry, :termination_expectation),
       failure_class: FailureClass.to_name(class),
       attempt_count: Map.get(history, :attempt_count, 1),
       identical_failure_count: Map.get(history, :identical_failure_count, 1),
@@ -297,8 +328,25 @@ defmodule SymphonyElixir.Orchestrator do
         park_issue(state, issue_id, running_entry, Map.put(metadata, :stop_reason, stop_reason))
 
       :retry ->
-        next_attempt = next_retry_attempt_from_running(running_entry)
-        schedule_issue_retry(state, issue_id, next_attempt, metadata)
+        # MIC-224/MIC-195 ordering: worker termination must be confirmed
+        # before any retry/fallback worker is scheduled against the same
+        # mutable workspace. Unconfirmed death parks fail-closed (claim, no
+        # timer) and preserves the workspace and its receipt evidence. The
+        # gate is expectation-aware: the running entry's PRE-LAUNCH
+        # termination expectation decides whether nil evidence is compatible
+        # (NOT_APPLICABLE/NEVER_STARTED) or fails closed
+        # (MANAGED_CONFIRMATION_REQUIRED), independently of evidence the
+        # shutdown path may have failed to emit.
+        case WorkerContainment.reuse_gate(Map.get(running_entry, :worker_termination), Map.get(running_entry, :termination_expectation)) do
+          :allowed ->
+            next_attempt = next_retry_attempt_from_running(running_entry)
+            schedule_issue_retry(state, issue_id, next_attempt, metadata)
+
+          {:blocked, :worker_termination_unconfirmed} ->
+            Logger.error("Failing closed for issue_id=#{issue_id}: previous worker termination unconfirmed; parking with claim, preserving workspace, no retry timer")
+
+            park_issue(state, issue_id, running_entry, Map.put(metadata, :stop_reason, :worker_termination_unconfirmed))
+        end
     end
   end
 
@@ -361,6 +409,26 @@ defmodule SymphonyElixir.Orchestrator do
   defp fallback_available?(%Issue{} = issue) do
     match?(%DispatchRouter.Selection{}, DispatchRouter.materialize(:fallback, issue, []))
   end
+
+  # Persist only the bounded decision-relevant termination evidence.
+  defp summarize_termination(%{status: status} = confirmation) when is_atom(status) do
+    %{
+      status: status,
+      exit_code: Map.get(confirmation, :exit_code),
+      reason: Map.get(confirmation, :reason)
+    }
+  end
+
+  defp summarize_termination(_other), do: nil
+
+  # Only the three canonical expectation states may refine the pre-launch
+  # expectation; anything else is ignored. An unexpected value cannot silently
+  # downgrade the gate because reuse_gate fails closed on unknown expectations.
+  defp normalize_expectation(value) when value in [:NOT_APPLICABLE, :NEVER_STARTED, :MANAGED_CONFIRMATION_REQUIRED] do
+    value
+  end
+
+  defp normalize_expectation(_other), do: nil
 
   defp maybe_dispatch(%State{} = state) do
     state =
@@ -1231,6 +1299,12 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: nil,
             workspace_root: nil,
+            # MIC-223: the pre-launch termination expectation. Set BEFORE risky
+            # worker execution via the same canonical predicate AppServer uses
+            # to create the worker identity, so a managed attempt whose
+            # shutdown path crashes still fails closed at the reuse gate
+            # (nil evidence + MANAGED_CONFIRMATION_REQUIRED is denied).
+            termination_expectation: WorkerContainment.termination_expectation(worker_host),
             session_id: nil,
             route: route,
             resumed: resumed?,
@@ -1897,6 +1971,8 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_root: metadata[:workspace_root] || Map.get(runtime, :workspace_root),
       route: metadata[:route] || Map.get(history, :route, :primary),
       primary_failure_count: metadata[:primary_failure_count] || Map.get(history, :primary_failure_count, 0),
+      worker_identity: metadata[:worker_identity] || Map.get(runtime, :worker_identity),
+      termination_expectation: metadata[:termination_expectation] || Map.get(runtime, :termination_expectation),
       parked_at: DateTime.to_iso8601(now_dt)
     }
 
@@ -1937,6 +2013,8 @@ defmodule SymphonyElixir.Orchestrator do
         workspace_root: metadata[:workspace_root],
         route: metadata[:route] || :primary,
         primary_failure_count: metadata[:primary_failure_count] || 0,
+        worker_identity: metadata[:worker_identity],
+        termination_expectation: metadata[:termination_expectation],
         next_retry_in_ms: delay_ms
       }
 
@@ -1963,11 +2041,23 @@ defmodule SymphonyElixir.Orchestrator do
         next_retry_at: next_retry_at_iso(entry),
         last_error: entry.error || "",
         worker_host: entry.worker_host || "",
+        # MIC-223: persisted worker identity (with receipt_path) lets restart
+        # reconciliation positively reconstruct worker death instead of
+        # guessing from PIDs.
+        worker_identity: entry.worker_identity,
         workspace_path: entry.workspace_path || "",
         workspace_root: entry.workspace_root || root,
         route: Map.get(entry, :route, :primary),
         primary_failure_count: Map.get(entry, :primary_failure_count, 0)
       })
+
+    # MIC-223: the pre-launch termination expectation is persisted only when
+    # known, so legacy records keep their exact minimum durable schema.
+    record =
+      case Map.get(entry, :termination_expectation) do
+        nil -> record
+        expectation -> Map.put(record, "termination_expectation", to_string(expectation))
+      end
 
     try do
       RetryStore.write_record(root, record)
@@ -2089,7 +2179,8 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(record, "workspace_path"),
       workspace_root: Map.get(record, "workspace_root", root),
       route: route,
-      primary_failure_count: primary_failure_count
+      primary_failure_count: primary_failure_count,
+      termination_expectation: expectation_from_record(Map.get(record, "termination_expectation"))
     }
 
     state = %{state | retry_history: Map.put(state.retry_history, issue_id, history)}
@@ -2100,7 +2191,7 @@ defmodule SymphonyElixir.Orchestrator do
         %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
 
       "retrying" ->
-        case recover_fence_verdict(Map.get(record, "worker_identity")) do
+        case recover_fence_verdict(Map.get(record, "termination_expectation"), Map.get(record, "worker_identity")) do
           {:ok, :dead} ->
             metadata = %{
               identifier: base_entry.identifier,
@@ -2109,6 +2200,8 @@ defmodule SymphonyElixir.Orchestrator do
               worker_host: base_entry.worker_host,
               workspace_path: base_entry.workspace_path,
               workspace_root: base_entry.workspace_root,
+              worker_identity: Map.get(record, "worker_identity"),
+              termination_expectation: Map.get(record, "termination_expectation"),
               failure_class: class_name,
               attempt_count: count,
               identical_failure_count: identical,
@@ -2136,10 +2229,32 @@ defmodule SymphonyElixir.Orchestrator do
 
   # MIC-223: UNKNOWN -> no cleanup + no redispatch; absence of identity is never
   # evidence of death. Only explicit never-spawned evidence (Port.open never
-  # succeeded for the workspace) is positively proven DEAD and safe to redispatch.
-  @spec recover_fence_verdict(term()) :: WorkerFence.verdict()
-  defp recover_fence_verdict("never_spawned"), do: WorkerFence.confirm_never_spawned(:never_spawned)
-  defp recover_fence_verdict(identity), do: WorkerFence.confirm_dead(identity)
+  # succeeded for the workspace) or a persisted termination receipt that
+  # positively proves the tree drained is DEAD and safe to redispatch. After a
+  # runtime restart the receipt file — not a PID — is the death evidence; a
+  # missing/unproven receipt parks the issue fail-closed.
+  #
+  # MIC-223 termination expectation: a persisted NEVER_STARTED expectation is
+  # explicit evidence that the launch never created a process/port, so
+  # redispatch keeps the same semantics as the "never_spawned" token. A
+  # persisted MANAGED_CONFIRMATION_REQUIRED expectation never downgrades just
+  # because the in-memory worker identity is gone: the receipt (or its absence)
+  # decides, and no receipt parks fail-closed.
+  @spec recover_fence_verdict(term(), term()) :: WorkerFence.verdict()
+  defp recover_fence_verdict("NEVER_STARTED", _identity), do: WorkerFence.confirm_never_spawned(:never_spawned)
+
+  defp recover_fence_verdict(_expectation, "never_spawned"), do: WorkerFence.confirm_never_spawned(:never_spawned)
+
+  defp recover_fence_verdict(_expectation, %{"receipt_path" => _} = identity),
+    do: WorkerFence.confirm_termination_receipt(identity)
+
+  defp recover_fence_verdict(_expectation, identity), do: WorkerFence.confirm_dead(identity)
+
+  defp expectation_from_record(value) when value in ["NOT_APPLICABLE", "NEVER_STARTED", "MANAGED_CONFIRMATION_REQUIRED"] do
+    String.to_existing_atom(value)
+  end
+
+  defp expectation_from_record(_other), do: nil
 
   defp pick_retry_identifier(issue_id, previous_retry, metadata) do
     metadata[:identifier] || Map.get(previous_retry, :identifier) || issue_id

@@ -10,13 +10,23 @@ defmodule SymphonyElixir.WorkerFence do
   Final invariant: UNKNOWN -> no cleanup + no redispatch. Only positively
   proven DEAD permits replacement dispatch or destructive cleanup. Missing,
   malformed, or unverifiable identities are UNKNOWN and fail closed; absence
-  of an identity is never evidence of death. Serialized identities read back
-  from durable records (including pid strings from an earlier boot) cannot be
-  positively verified here, because a stale pid is indistinguishable from a
-  genuinely exited worker; they are UNKNOWN. Full MIC-223 Job Object /
-  process-tree termination and OS-level worker identity capture are out of
-  scope.
+  of an identity is never evidence of death.
+
+  Two positively-proven evidence paths exist:
+
+  - `:never_spawned` — explicit evidence that `Port.open` never succeeded for
+    the workspace.
+  - MIC-223 termination receipts — a persisted worker identity carrying a
+    `receipt_path` into the managed receipt directory is verified against the
+    wrapper's structured termination receipt (job accounting tree-drain
+    evidence bound to the identity's launch id) via
+    `confirm_termination_receipt/1`. Malformed or unproven receipts stay
+    UNKNOWN. Serialized pid-only identities from an earlier boot cannot be
+    positively verified (a stale pid is indistinguishable from a genuinely
+    exited worker) and remain UNKNOWN.
   """
+
+  alias SymphonyElixir.WorkerContainment
 
   @type verdict() :: {:ok, :dead} | {:error, :alive} | {:error, :unknown}
 
@@ -33,6 +43,18 @@ defmodule SymphonyElixir.WorkerFence do
   end
 
   def confirm_dead(_other), do: {:error, :unknown}
+
+  @doc """
+  Verifies a persisted MIC-223 worker identity against its termination
+  receipt. Only a receipt inside the managed receipt directory that parses,
+  proves `tree_drained`, matches the identity's launch id, and carries a
+  conclusive terminal reason is positively DEAD; every other outcome is
+  UNKNOWN and fails closed.
+  """
+  @spec confirm_termination_receipt(term()) :: verdict()
+  def confirm_termination_receipt(identity) do
+    WorkerContainment.verify_identity_receipt(identity)
+  end
 
   @doc """
   Only explicit evidence that `Port.open` never succeeded for the workspace

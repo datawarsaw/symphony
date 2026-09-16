@@ -258,15 +258,15 @@ defmodule SymphonyElixir.Config.Schema do
      field(:default_reasoning_effort, :string, default: "medium")
     field(:shell_executable, :string)
 
-    field(:approval_policy, StringOrMap,
-       default: %{
-         "reject" => %{
-           "sandbox_approval" => true,
-           "rules" => true,
-           "mcp_elicitations" => true
-         }
-       }
-     )
+      field(:approval_policy, StringOrMap,
+        default: %{
+          "reject" => %{
+            "sandbox_approval" => true,
+            "rules" => true,
+            "mcp_elicitations" => true
+          }
+        }
+      )
 
      field(:thread_sandbox, :string, default: "workspace-write")
      field(:turn_sandbox_policy, :map)
@@ -275,60 +275,70 @@ defmodule SymphonyElixir.Config.Schema do
      field(:stall_timeout_ms, :integer, default: 300_000)
 
     embeds_one(:fallback, Fallback, on_replace: :update, defaults_to_struct: true)
-   end
 
-   @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
-   def changeset(schema, attrs) do
-     schema
-    |> cast(
-      attrs,
-      [
-        :command,
-         :default_model,
-         :default_reasoning_effort,
-        :shell_executable,
-        :approval_policy,
-        :thread_sandbox,
-         :turn_sandbox_policy,
-         :turn_timeout_ms,
-         :read_timeout_ms,
-         :stall_timeout_ms
-       ],
-       empty_values: []
-     )
-     |> validate_required([:command])
-     |> validate_change(:command, fn :command, command ->
-      if command != "" and String.trim(command) == "" do
-        [command: "can't be blank"]
-      else
-        []
-      end
-    end)
-     |> validate_change(:default_model, fn :default_model, model ->
-       if model != "" and String.trim(model) == "" do
-         [default_model: "can't be blank"]
-       else
-         []
-       end
-     end)
-     |> validate_change(:default_reasoning_effort, fn :default_reasoning_effort, effort ->
-       if effort != "" and String.trim(effort) == "" do
-         [default_reasoning_effort: "can't be blank"]
-       else
-         []
-       end
-     end)
-    |> validate_change(:shell_executable, fn :shell_executable, executable ->
-      if executable != "" and String.trim(executable) == "" do
-        [shell_executable: "can't be blank"]
-      else
-        []
-      end
-    end)
-     |> validate_number(:turn_timeout_ms, greater_than: 0)
+      # MIC-223: route local Windows worker launches through the jobrun Job
+      # Object wrapper and require positive tree-drain evidence before any
+      # workspace reuse. Disabling restores the legacy unwrapped spawn, which
+      # orphans the worker tree on Port.close/BEAM death.
+      field(:worker_containment_enabled, :boolean, default: true)
+      field(:worker_termination_grace_ms, :integer, default: 5_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :command,
+          :default_model,
+          :default_reasoning_effort,
+          :shell_executable,
+          :approval_policy,
+          :thread_sandbox,
+          :turn_sandbox_policy,
+          :turn_timeout_ms,
+          :read_timeout_ms,
+          :stall_timeout_ms,
+          :worker_containment_enabled,
+          :worker_termination_grace_ms
+        ],
+        empty_values: []
+      )
+      |> validate_required([:command])
+      |> validate_change(:command, fn :command, command ->
+        if command != "" and String.trim(command) == "" do
+          [command: "can't be blank"]
+        else
+          []
+        end
+      end)
+      |> validate_change(:default_model, fn :default_model, model ->
+        if model != "" and String.trim(model) == "" do
+          [default_model: "can't be blank"]
+        else
+          []
+        end
+      end)
+      |> validate_change(:default_reasoning_effort, fn :default_reasoning_effort, effort ->
+        if effort != "" and String.trim(effort) == "" do
+          [default_reasoning_effort: "can't be blank"]
+        else
+          []
+        end
+      end)
+      |> validate_change(:shell_executable, fn :shell_executable, executable ->
+        if executable != "" and String.trim(executable) == "" do
+          [shell_executable: "can't be blank"]
+        else
+          []
+        end
+      end)
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
     |> cast_embed(:fallback, with: &Fallback.changeset/2)
+      |> validate_number(:worker_termination_grace_ms, greater_than: 0)
     end
   end
 

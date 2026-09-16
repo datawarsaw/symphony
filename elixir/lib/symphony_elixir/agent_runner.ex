@@ -5,10 +5,16 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Discovery, PromptBuilder, RepositoryRouter, Steering, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Discovery, PromptBuilder, RepositoryRouter, Steering, Tracker, WorkerContainment, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
+
+  # MIC-223: marks (per agent task process) that a termination-evidence message
+  # was published for this attempt, so a pre-launch failure at the top-level
+  # boundary never overwrites evidence-backed expectation state with
+  # NEVER_STARTED.
+  @termination_evidence_sent_key :mic_223_worker_termination_published
 
   defmodule FailureError do
     @moduledoc """
@@ -63,6 +69,7 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
+        publish_launch_never_started(codex_update_recipient, issue, worker_host)
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         info = AppServer.failure_info({:error, reason})
         class = classify_failure(reason, info)
@@ -138,6 +145,50 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _workspace_root), do: :ok
 
+  # MIC-223: the termination confirmation is the evidence channel for the
+  # orchestrator's no-reuse-without-TERMINATED_CONFIRMED gate. It must reach
+  # the orchestrator BEFORE the agent task's DOWN message, which holds because
+  # the message is sent from the task process before it exits.
+  defp send_worker_termination_info(recipient, %Issue{id: issue_id}, info)
+       when is_binary(issue_id) and is_pid(recipient) and is_map(info) do
+    Process.put(@termination_evidence_sent_key, true)
+    send(recipient, {:worker_termination, issue_id, info})
+    :ok
+  end
+
+  defp send_worker_termination_info(_recipient, _issue, _info), do: :ok
+
+  @doc false
+  @spec worker_termination_publisher(pid() | nil, Issue.t() | map()) :: (map() -> :ok)
+  def worker_termination_publisher(recipient, issue) do
+    fn info when is_map(info) ->
+      send_worker_termination_info(recipient, issue, info)
+      :ok
+    end
+  end
+
+  # MIC-223: an attempt that failed without ever reaching a worker launch — and
+  # without any termination-evidence publication — conclusively never started,
+  # so the pre-launch MANAGED_CONFIRMATION_REQUIRED expectation is refined to
+  # NEVER_STARTED and legacy retry semantics are preserved. Failures that DID
+  # publish evidence never reach the refinement, and crashes after a launch
+  # escape as raises, which skip this boundary entirely.
+  defp publish_launch_never_started(recipient, issue, worker_host) do
+    if WorkerContainment.contained_launch?(worker_host) and not termination_evidence_sent?() do
+      send_worker_termination_info(recipient, issue, %{
+        worker_identity: nil,
+        worker_termination: nil,
+        termination_expectation: :NEVER_STARTED
+      })
+    end
+
+    :ok
+  end
+
+  defp termination_evidence_sent? do
+    Process.get(@termination_evidence_sent_key) == true
+  end
+
   defp log_workspace_provenance(issue, provenance) do
     Logger.info("Workspace provenance captured for #{issue_context(issue)} evidence=#{Jason.encode!(provenance)}")
   end
@@ -153,15 +204,70 @@ defmodule SymphonyElixir.AgentRunner do
       max_turns: Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     }
 
-    session_opts = [worker_host: worker_host, issue: issue, workspace_root: workspace_root] ++ opts
+    session_opts =
+      [
+        worker_host: worker_host,
+        issue: issue,
+        workspace_root: workspace_root,
+        worker_termination_publisher: worker_termination_publisher(codex_update_recipient, issue)
+      ] ++ opts
 
     with {:ok, session} <- AppServer.start_session(workspace, session_opts) do
-      try do
-        do_run_codex_turns(session, issue, 1, context)
-      after
-        AppServer.stop_session(session)
+      {outcome, confirmation} = run_turns_and_stop(session, issue, context)
+
+      case outcome do
+        {:ok, :ok} ->
+          require_termination_confirmed(issue, confirmation)
+          :ok
+
+        {:ok, {:error, _reason} = error} ->
+          error
+
+        {:raise, error} ->
+          raise error
       end
     end
+  end
+
+  # Exactly one stop per session on every path: turns result, turns error, or
+  # turns crash. Stop order is load-bearing (MIC-223): the worker termination
+  # must be positively confirmed BEFORE this function returns, because every
+  # downstream path (continuation, retry, cleanup) may otherwise touch a
+  # workspace a live worker tree can still mutate. The termination report is
+  # sent before returning or re-raising, so it reaches the orchestrator before
+  # the agent task's DOWN message.
+  defp run_turns_and_stop(session, issue, context) do
+    outcome =
+      try do
+        {:ok, do_run_codex_turns(session, issue, 1, context)}
+      rescue
+        error -> {:raise, error}
+      end
+
+    confirmation = AppServer.stop_session(session)
+
+    send_worker_termination_info(context.codex_update_recipient, issue, %{
+      worker_identity: session[:worker_identity],
+      worker_termination: confirmation
+    })
+
+    {outcome, confirmation}
+  end
+
+  # A successful turn sequence with unproven worker death must not hand a live
+  # workspace back to the orchestrator: fail closed into the classified
+  # failure path, where the unconfirmed-termination gate parks the issue.
+  defp require_termination_confirmed(_issue, %{status: status}) when status != :TERMINATION_UNCONFIRMED, do: :ok
+
+  defp require_termination_confirmed(issue, confirmation) do
+    raise FailureError,
+      message: "Worker termination could not be confirmed for #{issue_context(issue)}; blocking workspace reuse",
+      failure_class: :transient_worker_failure,
+      failure_info: %{
+        kind: :worker_termination_unconfirmed,
+        worker_termination: Map.drop(confirmation, [:receipt])
+      },
+      reason: :worker_termination_unconfirmed
   end
 
   defp do_run_codex_turns(app_session, issue, turn_number, context) do
