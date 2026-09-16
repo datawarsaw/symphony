@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
 
   alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Steering, Tracker, Workspace}
-  alias SymphonyElixir.{DispatchRouter, FailureClass, RetryPolicy, RetryStore, WorkerContainment, WorkerFence}
+  alias SymphonyElixir.{DispatchRouter, FailureClass, RetryPolicy, RetryStore, Wake.Ledger, WorkerContainment, WorkerFence}
   alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Tracker.Issue
 
@@ -56,6 +56,7 @@ defmodule SymphonyElixir.Orchestrator do
       resumed_issues: MapSet.new(),
       orphaned_workspaces: [],
       startup_reconciled: false,
+      wake_ledger: nil,
       codex_totals: nil,
       codex_rate_limits: nil,
       # MIC-10 STEER != CONTROL: bounded in-memory ledger of CONTROL receipts
@@ -100,6 +101,11 @@ defmodule SymphonyElixir.Orchestrator do
         }
 
         run_terminal_workspace_cleanup()
+
+        # MIC-10: the wake ledger must be attached before any wake-producing
+        # startup path runs — reconciliation mismatches and retry-record fence
+        # verdicts below observe wakes, and a nil ledger silently drops them.
+        state = recover_wake_ledger(state)
         state = run_startup_reconciliation(state)
         state = recover_retry_records(state)
         state = schedule_tick(state, 0)
@@ -149,6 +155,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
+    state = observe_wake(state, :poll_tick, nil, evidence: "cycle")
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
@@ -309,6 +316,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(:normal, state, issue_id, %{discovery_result: verdict} = entry, _session_id) do
+    state =
+      observe_wake(state, :discovery_needs_decision, issue_id,
+        evidence: "verdict:#{verdict}",
+        attempt_id: running_entry_session_id(entry)
+      )
+
     block_issue_from_entry(state, issue_id, entry, "Discovery #{verdict}; awaiting a separate lifecycle action")
   end
 
@@ -342,6 +355,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
 
+    state = observe_wake(state, :human_decision_required, issue_id, evidence: "input_required", attempt_id: session_id)
+
     Logger.warning("Agent task blocked for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id}: #{error}")
 
     block_issue_from_entry(state, issue_id, running_entry, error)
@@ -370,6 +385,12 @@ defmodule SymphonyElixir.Orchestrator do
       route: Map.get(history, :route, :primary),
       primary_failure_count: Map.get(history, :primary_failure_count, 0)
     }
+
+    state =
+      observe_wake(state, :worker_failed, issue_id,
+        evidence: "class:#{FailureClass.to_name(class)}:attempt:#{Map.get(metadata, :attempt_count)}",
+        attempt_id: Map.get(metadata, :attempt_count)
+      )
 
     case decision do
       {:park, stop_reason} ->
@@ -484,6 +505,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> ensure_startup_reconciled()
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
+      |> reconcile_wake_ledger()
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
@@ -704,6 +726,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
+    state =
+      observe_wake(state, :tracker_state_changed, issue.id,
+        to_state: issue.state,
+        evidence: "state:#{issue.state}:updated:#{tracker_updated_at(issue)}"
+      )
+
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
@@ -739,6 +767,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
+    state =
+      observe_wake(state, :tracker_state_changed, issue.id,
+        to_state: issue.state,
+        evidence: "state:#{issue.state}:updated:#{tracker_updated_at(issue)}"
+      )
+
     cond do
       discovery_result_changed?(Map.get(state.blocked, issue.id), issue) ->
         release_issue_claim(state, issue.id)
@@ -939,6 +973,12 @@ defmodule SymphonyElixir.Orchestrator do
 
         Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; #{error}")
 
+        state =
+          observe_wake(state, :human_decision_required, issue_id,
+            evidence: "stalled_input_required",
+            attempt_id: session_id
+          )
+
         state
         |> record_session_completion_totals(running_entry)
         |> stop_and_block_issue(issue_id, running_entry, error)
@@ -946,6 +986,8 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
 
         next_attempt = next_retry_attempt_from_running(running_entry)
+
+        state = observe_wake(state, :worker_stale, issue_id, evidence: "stall:#{elapsed_ms}", attempt_id: session_id)
 
         state
         |> terminate_running_issue(issue_id, false)
@@ -1743,6 +1785,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, {:workspace_repository_mismatch, target, details}} ->
           error = "workspace repository identity mismatch for target #{target}: #{inspect(details)}"
           Logger.error("Startup reconciliation failed closed for #{issue_context(issue)}: #{error}")
+          state = observe_wake(state, :eligibility_action_required, issue.id, evidence: "reconciliation_mismatch")
           block_reconciliation_mismatch(state, issue, error)
 
         {:error, reason} ->
@@ -1821,6 +1864,80 @@ defmodule SymphonyElixir.Orchestrator do
     StatusDashboard.notify_update()
   end
 
+  # --- MIC-10 wake ledger: event observation and wake eligibility ------------
+
+  # Test seam mirroring the other *_for_test wrappers: drives the same observe
+  # path the runtime callbacks use without booting the GenServer.
+  @doc false
+  @spec observe_wake_for_test(term(), atom(), String.t() | nil, keyword()) :: term()
+  def observe_wake_for_test(%State{} = state, kind, issue_id, opts \\ []) when is_atom(kind) and is_list(opts) do
+    observe_wake(state, kind, issue_id, opts)
+  end
+
+  @doc false
+  @spec reconcile_wake_ledger_for_test(term(), [String.t()]) :: {term(), non_neg_integer()}
+  def reconcile_wake_ledger_for_test(%State{} = state, live_issue_ids) do
+    case state.wake_ledger do
+      nil ->
+        {state, 0}
+
+      ledger ->
+        {ledger, stale_count} = Ledger.reconcile(ledger, live_issue_ids)
+        {%{state | wake_ledger: ledger}, stale_count}
+    end
+  end
+
+  defp observe_wake(%State{wake_ledger: nil} = state, _kind, _issue_id, _opts), do: state
+
+  defp observe_wake(%State{} = state, kind, issue_id, opts) do
+    {ledger, verdict} = Ledger.observe(state.wake_ledger, kind, issue_id, opts)
+
+    case verdict do
+      {:wake, receipt} ->
+        Logger.warning("Wake emitted: kind=#{kind} issue_id=#{inspect(issue_id)} event_id=#{receipt.event_id}")
+        notify_dashboard()
+
+      {:suppress, receipt, reason} ->
+        Logger.debug("Wake suppressed: kind=#{kind} issue_id=#{inspect(issue_id)} event_id=#{receipt.event_id} reason=#{reason}")
+    end
+
+    %{state | wake_ledger: ledger}
+  end
+
+  defp recover_wake_ledger(%State{} = state) do
+    %{state | wake_ledger: Ledger.recover(retry_store_root())}
+  end
+
+  # Pending receipts whose issue left every live set (running/blocked/parked/
+  # retry/claimed) are stale evidence: the transition resolved them.
+  defp reconcile_wake_ledger(%State{wake_ledger: nil} = state), do: state
+
+  defp reconcile_wake_ledger(%State{} = state) do
+    live_issue_ids =
+      Enum.uniq(
+        Map.keys(state.running) ++
+          Map.keys(state.blocked) ++
+          Map.keys(state.parked) ++
+          Map.keys(state.retry_attempts) ++
+          MapSet.to_list(state.claimed)
+      )
+
+    {ledger, _stale_count} = Ledger.reconcile(state.wake_ledger, live_issue_ids)
+    %{state | wake_ledger: ledger}
+  end
+
+  # Releasing the claim resolves whatever the issue was waiting on: pending
+  # receipts are handled so their identities dedup any repeat observation.
+  defp handle_wake_release(%State{wake_ledger: nil} = state, _issue_id), do: state
+
+  defp handle_wake_release(%State{} = state, issue_id) do
+    {ledger, _count} = Ledger.mark_issue_handled(state.wake_ledger, issue_id)
+    %{state | wake_ledger: ledger}
+  end
+
+  defp tracker_updated_at(%Issue{updated_at: %DateTime{} = updated_at}), do: DateTime.to_unix(updated_at)
+  defp tracker_updated_at(_issue), do: "nil"
+
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
@@ -1864,6 +1981,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
+    state = handle_wake_release(state, issue_id)
     delete_retry_record_best_effort(issue_id)
 
     %{
@@ -2006,6 +2124,19 @@ defmodule SymphonyElixir.Orchestrator do
     stop_reason = metadata[:stop_reason] || :max_attempts
 
     Logger.warning("Parking issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id} failure_class=#{class_name} stop_reason=#{inspect(stop_reason)}")
+
+    # `:recovered_parked` is restart rehydration of a park whose receipt already
+    # persisted; re-observing it must not displace the original pending wake.
+    state =
+      if stop_reason == :recovered_parked do
+        state
+      else
+        observe_wake(state, :parked, issue_id,
+          stop_reason: stop_reason,
+          evidence: "stop:#{stop_reason}:attempt:#{metadata[:attempt_count] || Map.get(history, :attempt_count, 1)}",
+          attempt_id: metadata[:attempt_count] || Map.get(history, :attempt_count, 1)
+        )
+      end
 
     entry = %{
       issue_id: issue_id,
@@ -2268,11 +2399,15 @@ defmodule SymphonyElixir.Orchestrator do
 
           {:error, :alive} ->
             Logger.warning("Retry record worker still alive for issue_id=#{issue_id}; failing closed with claim and no timer")
+
+            state = observe_wake(state, :worker_termination_unconfirmed, issue_id, evidence: "fence_alive")
             entry = Map.merge(base_entry, %{stop_reason: :fence_alive, parked_at: DateTime.to_iso8601(now_dt)})
             %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
 
           {:error, :unknown} ->
             Logger.warning("Retry record has no provable worker identity for issue_id=#{issue_id}; failing closed to PARKED with claim and no timer")
+
+            state = observe_wake(state, :worker_termination_unconfirmed, issue_id, evidence: "fence_unknown")
             entry = Map.merge(base_entry, %{stop_reason: :fence_unknown, parked_at: DateTime.to_iso8601(now_dt)})
             %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
         end
@@ -2466,6 +2601,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_call(:wake_snapshot, _from, state) do
+    {:reply, Ledger.snapshot(state.wake_ledger), state}
+  end
+
   def handle_call(:snapshot, _from, state) do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
