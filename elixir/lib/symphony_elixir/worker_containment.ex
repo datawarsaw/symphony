@@ -38,6 +38,10 @@ defmodule SymphonyElixir.WorkerContainment do
   @confirmed_reasons MapSet.new(["NATURAL_EXIT", "COOPERATIVE_EXIT", "HARD_JOB_TERMINATION"])
   # grace + hard-terminate drain budget (helper caps its own drain at 10s) + slack.
   @hard_terminate_budget_ms 20_000
+  # Test seam: lets the bounded-wait deadline be shrunk without touching policy.
+  @hard_terminate_budget_env :worker_termination_hard_budget_ms
+  # Test seam: 1-arity fun replacing the tasklist invocation (returns {output, exit_code}).
+  @tasklist_probe_env :worker_containment_tasklist_probe
 
   @type status :: :TERMINATED_CONFIRMED | :TERMINATION_UNCONFIRMED | :NOT_APPLICABLE
 
@@ -289,12 +293,16 @@ defmodule SymphonyElixir.WorkerContainment do
   def stop_and_confirm(port, identity, grace_ms_value) when is_port(port) do
     os_pid = wrapper_os_pid(identity)
     close_port(port)
-    deadline = System.monotonic_time(:millisecond) + grace_ms_value + @hard_terminate_budget_ms
+    deadline = System.monotonic_time(:millisecond) + grace_ms_value + hard_terminate_budget_ms()
 
     case await_wrapper_completion(os_pid, identity, deadline) do
       :completed -> confirm_from_receipt(identity)
       :timeout -> %{status: :TERMINATION_UNCONFIRMED, receipt: nil, exit_code: nil, reason: :termination_wait_timeout}
     end
+  end
+
+  defp hard_terminate_budget_ms do
+    Application.get_env(:symphony_elixir, @hard_terminate_budget_env, @hard_terminate_budget_ms)
   end
 
   # The wrapper may already be gone (crash, or a mid-run exit whose
@@ -352,13 +360,67 @@ defmodule SymphonyElixir.WorkerContainment do
 
   defp receipt_readable?(_identity), do: false
 
-  defp wrapper_gone?(nil), do: false
+  defp wrapper_gone?(os_pid) do
+    wrapper_liveness(os_pid) == :gone
+  end
 
-  defp wrapper_gone?(os_pid) when is_integer(os_pid) do
-    {output, 0} =
-      System.cmd("tasklist", ["/FI", "PID eq #{os_pid}", "/NH", "/FO", "CSV"], stderr_to_stdout: true)
+  @doc """
+  Tri-state wrapper liveness probe: `:gone`, `:alive`, or `:unknown`.
 
-    not Regex.match?(~r/"#{os_pid}"/, output)
+  This probe only decides when the bounded stop wait may end early; the
+  termination receipt alone decides confirmation, so `:unknown` must never be
+  read as death. The wrapper is declared `:gone` only on positive evidence from
+  a healthy `tasklist` answer; every failure mode of the probe itself (non-zero
+  exit, missing command, exception, malformed output) returns `:unknown`, which
+  keeps the bounded wait running until the receipt appears or the deadline
+  classifies the stop as `TERMINATION_UNCONFIRMED`. Never raises.
+
+  The tasklist invocation is read from the `:worker_containment_tasklist_probe`
+  application env when set (1-arity fun receiving the argv, returning
+  `{output, exit_code}`); production always uses `System.cmd`.
+  """
+  @spec wrapper_liveness(non_neg_integer() | nil) :: :gone | :alive | :unknown
+  def wrapper_liveness(nil), do: :unknown
+
+  def wrapper_liveness(os_pid) when is_integer(os_pid) and os_pid > 0 do
+    args = ["/FI", "PID eq #{os_pid}", "/NH", "/FO", "CSV"]
+
+    probe_result =
+      try do
+        case tasklist_probe().(args) do
+          {output, 0} -> {:ok, output}
+          {_output, _exit_code} -> :probe_failed
+        end
+      rescue
+        _ -> :probe_failed
+      end
+
+    case probe_result do
+      {:ok, output} -> classify_tasklist_output(os_pid, output)
+      :probe_failed -> :unknown
+    end
+  end
+
+  def wrapper_liveness(_other), do: :unknown
+
+  defp tasklist_probe do
+    case Application.get_env(:symphony_elixir, @tasklist_probe_env) do
+      probe when is_function(probe, 1) -> probe
+      _ -> fn args -> System.cmd("tasklist", args, stderr_to_stdout: true) end
+    end
+  end
+
+  # A healthy tasklist answer under a PID filter is either one CSV row per
+  # match (every row quotes the PID) or a no-match message with no rows at all.
+  # Exit 0 with no output, or rows that do not carry the probed PID, is not
+  # trustworthy evidence of absence and must not end the wait as `:gone`.
+  defp classify_tasklist_output(os_pid, output) do
+    cond do
+      Regex.match?(~r/"#{os_pid}"/, output) -> :alive
+      output == "" -> :unknown
+      String.contains?(output, "\"") -> :unknown
+      true -> :gone
+    end
   end
 
   defp confirm_from_receipt(nil) do
@@ -496,19 +558,40 @@ defmodule SymphonyElixir.WorkerContainment do
 
   @doc """
   May the runtime proceed with workspace reuse / redispatch / cleanup after the
-  previous worker on this workspace ended? `nil` confirmations (remote workers,
-  non-Windows hosts, containment disabled) are gate-NOT-APPLICABLE and keep the
-  previous behavior; only explicit `:TERMINATION_UNCONFIRMED` evidence blocks.
-  """
-  @spec reuse_gate(confirmation() | nil) :: :allowed | {:blocked, :worker_termination_unconfirmed}
-  def reuse_gate(nil), do: :allowed
+  previous worker on this workspace ended?
 
-  def reuse_gate(%{status: status}) do
-    case status do
-      :TERMINATION_UNCONFIRMED -> {:blocked, :worker_termination_unconfirmed}
-      _ -> :allowed
+  `worker_identity` is the caller's context: the managed, receipt-carrying
+  identity the runtime holds for this launch (nil for remote, non-Windows, or
+  disabled-containment launches). When a managed identity is present, only
+  positive `TERMINATED_CONFIRMED` evidence allows reuse: nil, unconfirmed,
+  NOT_APPLICABLE, or malformed evidence all fail closed, because a managed
+  worker must be proven drained before its mutable workspace is touched again.
+  Without a managed identity, only explicit `:TERMINATION_UNCONFIRMED` evidence
+  or a malformed confirmation blocks; a nil confirmation keeps the previous
+  behavior for launches that never carried a managed worker (for example a
+  worker that failed before any session could be started).
+  """
+  @spec reuse_gate(confirmation() | nil, term()) :: :allowed | {:blocked, :worker_termination_unconfirmed}
+  def reuse_gate(confirmation, worker_identity) when is_map(worker_identity) do
+    case confirmation do
+      %{status: :TERMINATED_CONFIRMED} -> :allowed
+      _ -> {:blocked, :worker_termination_unconfirmed}
     end
   end
 
-  def reuse_gate(_other), do: :allowed
+  def reuse_gate(nil, _no_managed_identity), do: :allowed
+
+  def reuse_gate(%{status: :TERMINATED_CONFIRMED}, _no_managed_identity), do: :allowed
+
+  def reuse_gate(%{status: :NOT_APPLICABLE}, _no_managed_identity), do: :allowed
+
+  def reuse_gate(%{status: :TERMINATION_UNCONFIRMED}, _no_managed_identity) do
+    {:blocked, :worker_termination_unconfirmed}
+  end
+
+  # Malformed and unexpected shapes (maps without a known status, garbage
+  # terms) must never default to allowed.
+  def reuse_gate(_unexpected, _no_managed_identity) do
+    {:blocked, :worker_termination_unconfirmed}
+  end
 end

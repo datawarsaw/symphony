@@ -228,13 +228,136 @@ defmodule SymphonyElixir.WorkerContainmentTest do
   # Reuse gate
   # ---------------------------------------------------------------------------
 
-  test "reuse gate blocks only unconfirmed termination evidence" do
-    assert WorkerContainment.reuse_gate(nil) == :allowed
-    assert WorkerContainment.reuse_gate(%{status: :NOT_APPLICABLE}) == :allowed
-    assert WorkerContainment.reuse_gate(%{status: :TERMINATED_CONFIRMED}) == :allowed
+  test "reuse gate without a managed identity keeps legacy semantics" do
+    assert WorkerContainment.reuse_gate(nil, nil) == :allowed
+    assert WorkerContainment.reuse_gate(%{status: :NOT_APPLICABLE}, nil) == :allowed
+    assert WorkerContainment.reuse_gate(%{status: :TERMINATED_CONFIRMED}, nil) == :allowed
 
-    assert WorkerContainment.reuse_gate(%{status: :TERMINATION_UNCONFIRMED, receipt: nil}) ==
+    assert WorkerContainment.reuse_gate(%{status: :TERMINATION_UNCONFIRMED, receipt: nil}, nil) ==
              {:blocked, :worker_termination_unconfirmed}
+  end
+
+  test "reuse gate with a managed identity allows only positive confirmation" do
+    identity = %{"launch_id" => "l-1", "receipt_path" => Path.join(tmp_receipt_root(), "l-1.json")}
+
+    assert WorkerContainment.reuse_gate(%{status: :TERMINATED_CONFIRMED, receipt: %{}, exit_code: 0}, identity) ==
+             :allowed
+
+    # Missing, unconfirmed, not-applicable, and malformed evidence all fail
+    # closed while a managed worker termination is expected.
+    assert WorkerContainment.reuse_gate(nil, identity) == {:blocked, :worker_termination_unconfirmed}
+
+    assert WorkerContainment.reuse_gate(%{status: :TERMINATION_UNCONFIRMED, receipt: nil}, identity) ==
+             {:blocked, :worker_termination_unconfirmed}
+
+    assert WorkerContainment.reuse_gate(%{status: :NOT_APPLICABLE}, identity) ==
+             {:blocked, :worker_termination_unconfirmed}
+
+    assert WorkerContainment.reuse_gate(%{}, identity) == {:blocked, :worker_termination_unconfirmed}
+    assert WorkerContainment.reuse_gate(%{status: :SOMETHING_ELSE}, identity) == {:blocked, :worker_termination_unconfirmed}
+    assert WorkerContainment.reuse_gate("garbage", identity) == {:blocked, :worker_termination_unconfirmed}
+  end
+
+  test "reuse gate fails closed on malformed evidence without a managed identity" do
+    assert WorkerContainment.reuse_gate(%{}, nil) == {:blocked, :worker_termination_unconfirmed}
+    assert WorkerContainment.reuse_gate(%{status: :NOT_A_REAL_STATUS}, nil) == {:blocked, :worker_termination_unconfirmed}
+    assert WorkerContainment.reuse_gate("garbage", nil) == {:blocked, :worker_termination_unconfirmed}
+    assert WorkerContainment.reuse_gate(42, nil) == {:blocked, :worker_termination_unconfirmed}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Wrapper liveness probe (fail-closed tri-state)
+  # ---------------------------------------------------------------------------
+
+  defp with_tasklist_probe(fun, test_fun) do
+    Application.put_env(:symphony_elixir, :worker_containment_tasklist_probe, fun)
+
+    try do
+      test_fun.()
+    after
+      Application.delete_env(:symphony_elixir, :worker_containment_tasklist_probe)
+    end
+  end
+
+  @os_pid 424_242
+
+  test "tasklist non-zero exit is unknown, never gone" do
+    with_tasklist_probe(fn _args -> {"ERROR: The RPC server is unavailable.", 1726} end, fn ->
+      assert WorkerContainment.wrapper_liveness(@os_pid) == :unknown
+    end)
+  end
+
+  test "tasklist command exception is unknown, never gone" do
+    with_tasklist_probe(
+      fn _args -> raise ErlangError, message: "enoent" end,
+      fn ->
+        assert WorkerContainment.wrapper_liveness(@os_pid) == :unknown
+      end
+    )
+  end
+
+  test "malformed tasklist output is unknown, never gone" do
+    # Exit 0 with no output at all is anomalous: tasklist always writes rows
+    # or a no-match message.
+    with_tasklist_probe(fn _args -> {"", 0} end, fn ->
+      assert WorkerContainment.wrapper_liveness(@os_pid) == :unknown
+    end)
+
+    # CSV rows that do not carry the probed PID mean the filter was mangled.
+    with_tasklist_probe(fn _args -> {"\"unrelated.exe\",\"99\",\"Console\",1", 0} end, fn ->
+      assert WorkerContainment.wrapper_liveness(@os_pid) == :unknown
+    end)
+  end
+
+  test "tasklist exit 0 classifies presence and absence positively" do
+    with_tasklist_probe(fn _args -> {"\"worker.exe\",\"#{@os_pid}\",\"Console\",1", 0} end, fn ->
+      assert WorkerContainment.wrapper_liveness(@os_pid) == :alive
+    end)
+
+    with_tasklist_probe(fn _args -> {"INFO: No tasks are running which match the specified criteria.", 0} end, fn ->
+      assert WorkerContainment.wrapper_liveness(@os_pid) == :gone
+    end)
+
+    assert WorkerContainment.wrapper_liveness(nil) == :unknown
+    assert WorkerContainment.wrapper_liveness("not-a-pid") == :unknown
+  end
+
+  test "unprovable wrapper liveness reaches the bounded deadline and stays unconfirmed" do
+    # A missing receipt and a probe that cannot classify liveness must never
+    # infer death: the wait runs to its bounded deadline and the stop stays
+    # TERMINATION_UNCONFIRMED.
+    port = Port.open({:spawn, "cmd /c exit 0"}, [:binary])
+
+    identity = %{
+      "launch_id" => "l-probe-timeout",
+      "receipt_path" => Path.join(tmp_receipt_root(), "never-written.json"),
+      "wrapper_pid" => "999999999"
+    }
+
+    original_budget = Application.get_env(:symphony_elixir, :worker_termination_hard_budget_ms)
+    original_probe = Application.get_env(:symphony_elixir, :worker_containment_tasklist_probe)
+
+    Application.put_env(:symphony_elixir, :worker_termination_hard_budget_ms, 50)
+    Application.put_env(:symphony_elixir, :worker_containment_tasklist_probe, fn _args -> {"", 1} end)
+
+    try do
+      confirmation = WorkerContainment.stop_and_confirm(port, identity, 1)
+
+      assert %{status: :TERMINATION_UNCONFIRMED, receipt: nil, exit_code: nil} = confirmation
+      assert confirmation.reason == :termination_wait_timeout
+    after
+      restore_app_env(:worker_termination_hard_budget_ms, original_budget)
+      restore_app_env(:worker_containment_tasklist_probe, original_probe)
+      File.rm_rf(identity["receipt_path"] |> Path.dirname())
+    end
+  end
+
+  defp restore_app_env(key, value) do
+    if value == nil do
+      Application.delete_env(:symphony_elixir, key)
+    else
+      Application.put_env(:symphony_elixir, key, value)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -448,6 +571,59 @@ defmodule SymphonyElixir.WorkerContainmentTest do
       assert {:ok, record} = RetryStore.read_record(root, issue.id)
       assert record["status"] == "parked"
       assert record["worker_identity"]["launch_id"] == "l-unconf"
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  test "missing termination evidence with a known managed identity parks fail-closed" do
+    root = workflow_test_root()
+
+    try do
+      write_test_workflow!(root)
+      pin_retry_store_root!(root)
+      issue = workflow_issue("MT-NOEVID")
+      state = %Orchestrator.State{task_supervisor: SymphonyElixir.TaskSupervisor}
+
+      identity = identity_for(Path.join(root, "l-noevid.json"), "l-noevid")
+
+      # Evidence never arrived (for example a stop-path crash); the managed
+      # identity on the running entry must force the closed verdict.
+      entry = base_running_entry(issue, root, nil, identity)
+
+      state = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-1", failure_reason())
+
+      assert MapSet.member?(state.claimed, issue.id)
+      assert %{stop_reason: :worker_termination_unconfirmed} = state.parked[issue.id]
+      assert state.retry_attempts == %{}
+
+      assert {:ok, record} = RetryStore.read_record(root, issue.id)
+      assert record["status"] == "parked"
+      assert record["worker_identity"]["launch_id"] == "l-noevid"
+    after
+      File.rm_rf(root)
+    end
+  end
+
+  test "failure without a managed identity or evidence keeps the retry path" do
+    root = workflow_test_root()
+
+    try do
+      write_test_workflow!(root)
+      pin_retry_store_root!(root)
+      issue = workflow_issue("MT-NOIDENT")
+      state = %Orchestrator.State{task_supervisor: SymphonyElixir.TaskSupervisor}
+
+      # Neither evidence nor a managed identity: the launch never carried
+      # containment (for example a pre-session failure), so the MIC-195 retry
+      # semantics are unchanged.
+      entry = base_running_entry(issue, root, nil, nil)
+
+      state = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-1", failure_reason())
+
+      assert Map.fetch!(state.retry_attempts, issue.id)
+      refute MapSet.member?(state.claimed, issue.id)
+      assert state.parked == %{}
     after
       File.rm_rf(root)
     end

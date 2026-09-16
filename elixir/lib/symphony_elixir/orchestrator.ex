@@ -329,8 +329,11 @@ defmodule SymphonyElixir.Orchestrator do
         # MIC-224/MIC-195 ordering: worker termination must be confirmed
         # before any retry/fallback worker is scheduled against the same
         # mutable workspace. Unconfirmed death parks fail-closed (claim, no
-        # timer) and preserves the workspace and its receipt evidence.
-        case WorkerContainment.reuse_gate(Map.get(running_entry, :worker_termination)) do
+        # timer) and preserves the workspace and its receipt evidence. The
+        # entry's worker identity supplies the gate's context: when the
+        # runtime holds a managed identity, missing/malformed evidence is
+        # treated as unconfirmed instead of falling back to allowed.
+        case WorkerContainment.reuse_gate(Map.get(running_entry, :worker_termination), Map.get(running_entry, :worker_identity)) do
           :allowed ->
             next_attempt = next_retry_attempt_from_running(running_entry)
             schedule_issue_retry(state, issue_id, next_attempt, metadata)
