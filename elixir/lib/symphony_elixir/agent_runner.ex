@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Discovery, PromptBuilder, RepositoryRouter, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Discovery, PromptBuilder, RepositoryRouter, Steering, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -66,6 +66,7 @@ defmodule SymphonyElixir.AgentRunner do
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         info = AppServer.failure_info({:error, reason})
         class = classify_failure(reason, info)
+
         raise FailureError,
           message: "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}",
           failure_class: class,
@@ -95,7 +96,7 @@ defmodule SymphonyElixir.AgentRunner do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host, route),
                {:ok, provenance} <- Workspace.capture_provenance(workspace, issue, worker_host, route) do
             log_workspace_provenance(issue, provenance)
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, provenance)
+            run_codex_turns(workspace, workspace_root, issue, codex_update_recipient, opts, worker_host, provenance)
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -141,9 +142,10 @@ defmodule SymphonyElixir.AgentRunner do
     Logger.info("Workspace provenance captured for #{issue_context(issue)} evidence=#{Jason.encode!(provenance)}")
   end
 
-  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, provenance) do
+  defp run_codex_turns(workspace, workspace_root, issue, codex_update_recipient, opts, worker_host, provenance) do
     context = %{
       workspace: workspace,
+      workspace_root: workspace_root,
       codex_update_recipient: codex_update_recipient,
       opts: opts,
       issue_state_fetcher: Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1),
@@ -151,7 +153,7 @@ defmodule SymphonyElixir.AgentRunner do
       max_turns: Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     }
 
-    session_opts = [worker_host: worker_host, issue: issue] ++ opts
+    session_opts = [worker_host: worker_host, issue: issue, workspace_root: workspace_root] ++ opts
 
     with {:ok, session} <- AppServer.start_session(workspace, session_opts) do
       try do
@@ -164,7 +166,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp do_run_codex_turns(app_session, issue, turn_number, context) do
     %{
-      workspace: workspace,
+      workspace_root: workspace_root,
       codex_update_recipient: codex_update_recipient,
       opts: opts,
       issue_state_fetcher: issue_state_fetcher,
@@ -172,17 +174,29 @@ defmodule SymphonyElixir.AgentRunner do
       max_turns: max_turns
     } = context
 
-    prompt = build_turn_prompt(issue, opts, provenance, turn_number, max_turns)
+    inbox = steering_inbox(workspace_root, issue, opts)
+    claimed_ids = Enum.map(inbox.deliverable, & &1["steer_id"])
+
+    prompt =
+      build_turn_prompt(issue, opts, provenance, turn_number, max_turns) <> inbox.prompt_section
+
+    on_message =
+      steering_message_handler(
+        codex_message_handler(codex_update_recipient, issue),
+        workspace_root,
+        claimed_ids,
+        app_session
+      )
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: on_message
            ) do
       Logger.info(
-        "Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} model=#{turn_session[:model]} reasoning_effort=#{turn_session[:reasoning_effort]} route_source=#{turn_session[:route_source]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}"
+        "Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} model=#{turn_session[:model]} reasoning_effort=#{turn_session[:reasoning_effort]} route_source=#{turn_session[:route_source]} workspace=#{context.workspace} turn=#{turn_number}/#{max_turns}"
       )
 
       case continue_with_issue?(issue, issue_state_fetcher) do
@@ -202,7 +216,58 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason} ->
           {:error, reason}
       end
+    else
+      {:error, reason} = error ->
+        # No :session_started proof for this turn: claimed steers were not
+        # provably delivered. Bounded resend bookkeeping only — steers already
+        # marked DELIVERED inside this turn are preserved by the state guards.
+        Enum.each(claimed_ids, &Steering.record_delivery_failure(workspace_root, &1, reason))
+        error
     end
+  end
+
+  defp steering_inbox(workspace_root, issue, opts) when is_binary(workspace_root) and workspace_root != "" do
+    attempt_id = Steering.normalize_attempt(Keyword.get(opts, :attempt))
+
+    Steering.prepare_turn_inbox(workspace_root, issue.id, attempt_id)
+  rescue
+    error ->
+      Logger.warning("Steering inbox unavailable for #{issue_context(issue)}: #{inspect(error)}")
+      %{deliverable: [], prompt_section: "", unreadable: [], staled: []}
+  end
+
+  defp steering_inbox(_workspace_root, _issue, _opts), do: %{deliverable: [], prompt_section: "", unreadable: [], staled: []}
+
+  defp steering_message_handler(inner, _workspace_root, [], _app_session), do: inner
+
+  defp steering_message_handler(inner, workspace_root, claimed_ids, app_session) do
+    thread_id = Map.get(app_session, :thread_id)
+
+    fn message ->
+      if Map.get(message, :event) == :session_started do
+        mark_steering_delivered(workspace_root, claimed_ids, thread_id, message)
+      end
+
+      inner.(message)
+    end
+  end
+
+  defp mark_steering_delivered(workspace_root, claimed_ids, thread_id, message) do
+    delivery = %{
+      thread_id: thread_id,
+      turn_id: Map.get(message, :turn_id),
+      session_id: Map.get(message, :session_id)
+    }
+
+    Enum.each(claimed_ids, fn steer_id ->
+      case Steering.mark_delivered(workspace_root, steer_id, delivery) do
+        {:ok, _record} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("Steering delivery marking failed steer_id=#{steer_id}: #{inspect(reason)}")
+      end
+    end)
   end
 
   @doc false

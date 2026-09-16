@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Orchestrator do
   use GenServer
   require Logger
 
-  alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Steering, Tracker, Workspace}
   alias SymphonyElixir.{DispatchRouter, FailureClass, RetryPolicy, RetryStore, WorkerFence}
   alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Tracker.Issue
@@ -1561,6 +1561,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp ensure_startup_reconciled(%State{} = state), do: run_startup_reconciliation(state)
 
   defp run_startup_reconciliation(%State{} = state) do
+    reconcile_steering_inbox()
+
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
       {:ok, active_issues} ->
         state = reconcile_startup_candidates(state, active_issues)
@@ -1571,6 +1573,29 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Skipping startup active issue reconciliation; failed to fetch active issues: #{inspect(reason)}")
         state
     end
+  end
+
+  # MIC-10 steering inbox: PENDING steers survive restart; DELIVERED-but-
+  # unacknowledged steers are retained durably but invalidated (STALE) because
+  # their delivery session is gone and must never be re-delivered.
+  defp reconcile_steering_inbox do
+    summary = Steering.reconcile_after_restart(Config.local_workspace_root())
+
+    if Enum.any?(Map.values(summary), &(&1 > 0)) do
+      Logger.info("Steering inbox reconciled after restart: #{inspect(summary)}")
+    end
+
+    :ok
+  rescue
+    error ->
+      Logger.warning("Steering inbox reconciliation skipped: #{inspect(error)}")
+      :ok
+  end
+
+  defp steering_snapshot do
+    Steering.snapshot_summary(Config.local_workspace_root())
+  rescue
+    _ -> %{entries: [], counts: %{}}
   end
 
   defp reconcile_startup_candidates(state, active_issues) do
@@ -2370,6 +2395,7 @@ defmodule SymphonyElixir.Orchestrator do
        retrying: retrying,
        blocked: blocked,
        parked: parked,
+       steering: steering_snapshot(),
        operational_status: operational_status,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
