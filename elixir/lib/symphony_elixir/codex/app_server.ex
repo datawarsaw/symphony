@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   alias SymphonyElixir.Discovery.Session
   alias SymphonyElixir.PathSafety
   alias SymphonyElixir.SSH
+  alias SymphonyElixir.Steering
 
   @initialize_id 1
   @thread_start_id 2
@@ -25,6 +26,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           optional(:reasoning_source) => atom() | nil,
           optional(:route_source) => atom() | nil,
           optional(:discovery_route) => map() | nil,
+          optional(:steering) => map() | nil,
           port: port(),
           metadata: map(),
           approval_policy: String.t() | map(),
@@ -78,6 +80,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            workspace: expanded_workspace,
            worker_host: worker_host,
            dynamic_tool_binding: dynamic_tool_binding,
+           steering: steering_context(opts, worker_host),
            discovery_route: discovery_route,
            model: evidence[:model],
            reasoning_effort: evidence[:reasoning_effort],
@@ -180,10 +183,37 @@ defmodule SymphonyElixir.Codex.AppServer do
     fn _, _ -> %{"success" => false, "output" => "Discovery tool execution denied"} end
   end
 
-  defp session_tool_executor(_session, opts, binding, issue) do
-    Keyword.get(opts, :tool_executor, fn tool, arguments ->
-      DynamicTool.execute(tool, arguments, binding, issue: issue)
-    end)
+  defp session_tool_executor(session, opts, binding, issue) do
+    default_executor =
+      Keyword.get(opts, :tool_executor, fn tool, arguments ->
+        DynamicTool.execute(tool, arguments, binding, issue: issue)
+      end)
+
+    fn tool, arguments ->
+      case tool do
+        # MIC-10 deterministic steering acknowledgement: a named tool call
+        # validated against the session's steering identity. Worker prose is
+        # never parsed.
+        "symphony_steer_ack" -> Steering.ack_tool_response(session[:steering], session[:thread_id], arguments)
+        _ -> default_executor.(tool, arguments)
+      end
+    end
+  end
+
+  defp steering_context(opts, worker_host) do
+    workspace_root = Keyword.get(opts, :workspace_root)
+    issue = Keyword.get(opts, :issue)
+
+    if is_binary(workspace_root) and workspace_root != "" and match?(%SymphonyElixir.Tracker.Issue{}, issue) do
+      %{
+        workspace_root: workspace_root,
+        issue_id: issue.id,
+        attempt_id: Steering.normalize_attempt(Keyword.get(opts, :attempt)),
+        worker_host: worker_host
+      }
+    else
+      nil
+    end
   end
 
   @spec stop_session(session()) :: :ok

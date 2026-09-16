@@ -28,6 +28,7 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
+          steering: steering_payload(Map.get(snapshot, :steering, %{entries: [], counts: %{}})),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -124,6 +125,34 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp operational_status_name(status) when is_binary(status), do: String.upcase(status)
+
+  # MIC-10: read-only projection of the durable steering inbox. Instruction
+  # text never leaves workspace-owned state.
+  defp steering_payload(%{entries: entries, counts: counts}) do
+    %{counts: counts, entries: Enum.map(entries || [], &steering_entry_payload/1)}
+  end
+
+  defp steering_payload(_other), do: %{counts: %{}, entries: []}
+
+  defp steering_entry_payload(entry) when is_map(entry) do
+    %{
+      steer_id: entry[:steer_id],
+      issue_id: entry[:issue_id],
+      issue_identifier: entry[:issue_identifier],
+      attempt_id: entry[:attempt_id],
+      sequence: entry[:sequence],
+      status: entry[:status],
+      delivery_attempts: entry[:delivery_attempts],
+      worker_host: entry[:worker_host],
+      thread_id: entry[:thread_id],
+      created_at: entry[:created_at],
+      delivered_at: entry[:delivered_at],
+      acknowledged_at: entry[:acknowledged_at],
+      handled_at: entry[:handled_at],
+      failure_reason: entry[:failure_reason],
+      unreadable: Map.get(entry, :unreadable, false)
+    }
+  end
 
   defp running_entry_payload(entry) do
     %{
