@@ -5,6 +5,9 @@ defmodule SymphonyElixir.LaneLeaseTest do
 
   @issue "MIC-999"
   @kind "delivery"
+  # mirrors the private per-process seam SymphonyElixir.LaneLease uses for the destructive
+  # removal in force_release/4; lets these tests plant deterministic removal outcomes
+  @rm_hook :"$lane_lease_force_rm_hook"
 
   setup do
     root = Path.join(System.tmp_dir!(), "mic-lane-lease-#{:erlang.unique_integer([:positive])}")
@@ -254,25 +257,241 @@ defmodule SymphonyElixir.LaneLeaseTest do
     assert {:ok, _} = LaneLease.inspect(root, @kind, @issue)
   end
 
+  # remediation 1: ordinary force_release refuses an ACTIVE lease, destroying nothing
+  test "ordinary force_release refuses an active lease with evidence and clears nothing", %{root: root} do
+    {:ok, lease} = LaneLease.claim(root, claim_attrs())
+
+    assert {:error, {:active_lease, evidence}} =
+             LaneLease.force_release(root, @kind, @issue,
+               confirm: true,
+               reason: "operator: routine cleanup",
+               forced_by: "operator-console"
+             )
+
+    assert evidence["class"] == "active"
+    assert evidence["owner_id"] == "executor-a"
+    refute Map.has_key?(evidence, "owner_token")
+
+    # nothing was destroyed: the owner still holds the lane, no recovery evidence written
+    assert raw_lease(root)["owner_token"] == lease["owner_token"]
+    assert {:ok, _} = LaneLease.renew(root, @kind, @issue, lease["owner_token"])
+    refute File.exists?(Path.join(LaneLease.lanes_dir(root), "delivery_mic-999.recovery.json"))
+  end
+
+  # remediation 2: destroying an active lease requires the explicit force_active override
   test "force_release clears a held lane, preserves evidence, and unblocks a new claim", %{root: root} do
-    {:ok, _} = LaneLease.claim(root, claim_attrs())
+    {:ok, lease} = LaneLease.claim(root, claim_attrs())
 
     assert {:ok, record} =
              LaneLease.force_release(root, @kind, @issue,
                confirm: true,
                reason: "operator: owner host lost mid-delivery",
-               forced_by: "operator-console"
+               forced_by: "operator-console",
+               force_active: true
              )
 
     assert record["reason"] == "operator: owner host lost mid-delivery"
     assert record["prior_state"]["owner_id"] == "executor-a"
     assert record["prior_state"]["accepted_sha"] == String.duplicate("a", 40)
+    # remediation 8: evidence records the lease actually targeted
+    assert record["prior_state"]["owner_token"] == lease["owner_token"]
+    assert record["prior_class"] == "active"
+    assert record["force_active"] == true
 
     recovery_path = Path.join(LaneLease.lanes_dir(root), "delivery_mic-999.recovery.json")
     assert File.exists?(recovery_path)
     assert {:error, :not_found} = LaneLease.inspect(root, @kind, @issue)
 
     assert {:ok, _} = LaneLease.claim(root, claim_attrs(%{owner_id: "executor-b"}))
+  end
+
+  # remediation 2: the override itself never bypasses confirm + reason
+  test "force_active override still requires confirm and a non-empty reason", %{root: root} do
+    {:ok, lease} = LaneLease.claim(root, claim_attrs())
+
+    assert {:error, :recovery_unconfirmed} =
+             LaneLease.force_release(root, @kind, @issue, force_active: true, reason: "operator: r")
+
+    assert {:error, :recovery_reason_required} =
+             LaneLease.force_release(root, @kind, @issue, force_active: true, confirm: true)
+
+    assert {:error, :recovery_reason_required} =
+             LaneLease.force_release(root, @kind, @issue, force_active: true, confirm: true, reason: "")
+
+    assert raw_lease(root)["owner_token"] == lease["owner_token"]
+  end
+
+  # remediation 3: a failed removal must never return success
+  test "force_release reports removal failure instead of success and leaves the lease intact", %{root: root} do
+    {:ok, lease} = LaneLease.claim(root, claim_attrs())
+    Process.put(@rm_hook, fn _path -> {:error, :eacces} end)
+
+    assert {:error, {:lease_remove_failed, record}} =
+             LaneLease.force_release(root, @kind, @issue,
+               confirm: true,
+               reason: "operator: host lost",
+               force_active: true
+             )
+
+    assert record["remove_error"] == :eacces
+    assert record["prior_state"]["owner_token"] == lease["owner_token"]
+
+    assert raw_lease(root)["owner_token"] == lease["owner_token"]
+    assert {:ok, _} = LaneLease.renew(root, @kind, @issue, lease["owner_token"])
+  after
+    Process.delete(@rm_hook)
+  end
+
+  # remediation 4: a lease surviving removal (same/replacement/corrupt) can never yield success
+  test "force_release fails closed on a lease that survives removal", %{root: root} do
+    for {expected_kind, plant} <- [
+          {:same_lease, fn lease -> lease end},
+          {:newer_lease, fn lease -> %{lease | "owner_token" => String.duplicate("9", 32), "owner_id" => "executor-b"} end},
+          {:corrupt_state, fn _lease -> :garbage end}
+        ] do
+      issue = "MIC-S5-#{expected_kind}"
+      {:ok, lease} = LaneLease.claim(root, claim_attrs(%{issue_id: issue}))
+      path = LaneLease.lease_path(root, @kind, issue)
+      planted = plant.(lease)
+
+      Process.put(@rm_hook, fn _p ->
+        File.rm!(path)
+        if planted == :garbage, do: File.write!(path, "garbage{{{"), else: File.write!(path, Jason.encode!(planted, pretty: true))
+        :ok
+      end)
+
+      assert {:error, {:lease_survived, ^expected_kind, _evidence}} =
+               LaneLease.force_release(root, @kind, issue, confirm: true, reason: "operator: probe", force_active: true),
+             "expected #{inspect(expected_kind)} survivor classification"
+
+      # fail closed means fail closed: whatever survives stays on disk, unharmed
+      assert File.exists?(path)
+    end
+  after
+    Process.delete(@rm_hook)
+  end
+
+  # remediation 5: force-release racing a live renewer can never falsely succeed
+  test "force_release racing renew never reports success while the owner survives", %{root: root} do
+    for round <- 1..10 do
+      issue = "MIC-R6-#{round}"
+      {:ok, lease} = LaneLease.claim(root, claim_attrs(%{issue_id: issue}))
+      token = lease["owner_token"]
+      renewer = spawn(fn -> renew_loop(root, issue, token) end)
+
+      # ordinary recovery must refuse the actively-owned lane
+      assert {:error, {:active_lease, _}} = LaneLease.force_release(root, @kind, issue, confirm: true, reason: "operator: probe")
+      assert {:ok, _} = LaneLease.renew(root, @kind, issue, token)
+
+      # explicit override may destroy it, but then it must really be gone
+      assert {:ok, _} = LaneLease.force_release(root, @kind, issue, confirm: true, reason: "operator: probe", force_active: true)
+      send(renewer, :stop)
+      assert {:error, :not_found} = LaneLease.inspect(root, @kind, issue)
+      assert {:error, :lease_missing} = LaneLease.renew(root, @kind, issue, token)
+    end
+  end
+
+  # remediation 5/8: a replacement lease appearing during recovery is never destroyed,
+  # and the written evidence still names the lease actually targeted
+  test "force_release cannot destroy a new owner's lease that appears during recovery", %{root: root} do
+    {:ok, lease_a} = LaneLease.claim(root, claim_attrs())
+    path = LaneLease.lease_path(root, @kind, @issue)
+
+    new_lease =
+      raw_lease(root)
+      |> Map.put("owner_token", String.duplicate("9", 32))
+      |> Map.put("owner_id", "executor-b")
+
+    Process.put(@rm_hook, fn _p ->
+      File.rm!(path)
+      File.write!(path, Jason.encode!(new_lease, pretty: true))
+      :ok
+    end)
+
+    assert {:error, {:lease_survived, :newer_lease, survivor}} =
+             LaneLease.force_release(root, @kind, @issue,
+               confirm: true,
+               reason: "operator: host lost",
+               force_active: true
+             )
+
+    assert survivor["owner_id"] == "executor-b"
+    assert raw_lease(root)["owner_token"] == new_lease["owner_token"]
+
+    # the new owner's lease is fully functional; the old token is dead
+    assert {:ok, _} = LaneLease.renew(root, @kind, @issue, new_lease["owner_token"])
+    assert {:error, :not_owner} = LaneLease.renew(root, @kind, @issue, lease_a["owner_token"])
+
+    # the evidence file recorded the targeted lease (A), not the survivor (B)
+    {:ok, evidence_raw} = File.read(Path.join(LaneLease.lanes_dir(root), "delivery_mic-999.recovery.json"))
+    record = Jason.decode!(evidence_raw)
+    assert record["prior_state"]["owner_token"] == lease_a["owner_token"]
+    assert record["prior_state"]["owner_id"] == "executor-a"
+  after
+    Process.delete(@rm_hook)
+  end
+
+  # remediation: repeated recovery stays bounded and idempotent
+  test "repeated recovery is idempotent and leaves the first evidence intact", %{root: root} do
+    {:ok, lease} = LaneLease.claim(root, claim_attrs())
+
+    assert {:ok, first} =
+             LaneLease.force_release(root, @kind, @issue,
+               confirm: true,
+               reason: "operator: first recovery",
+               force_active: true
+             )
+
+    assert first["prior_state"]["owner_token"] == lease["owner_token"]
+    recovery_path = Path.join(LaneLease.lanes_dir(root), "delivery_mic-999.recovery.json")
+
+    for reason <- ["operator: second recovery", "operator: third recovery"] do
+      assert {:error, :lease_missing} = LaneLease.force_release(root, @kind, @issue, confirm: true, reason: reason, force_active: true)
+    end
+
+    # a free lane stays free; nothing was rewritten by the no-op recoveries
+    assert {:ok, evidence_raw} = File.read(recovery_path)
+    assert Jason.decode!(evidence_raw)["reason"] == "operator: first recovery"
+    assert {:ok, _} = LaneLease.claim(root, claim_attrs(%{owner_id: "executor-b"}))
+  end
+
+  test "an unavailable recovery lock fails closed without touching the lease", %{root: root} do
+    {:ok, lease} = LaneLease.claim(root, claim_attrs())
+    lock_path = Path.join(LaneLease.lanes_dir(root), "delivery_mic-999.op-lock")
+    File.write!(lock_path, "{}")
+
+    assert {:error, {:lease_op_lock_unavailable, :timeout}} =
+             LaneLease.force_release(root, @kind, @issue,
+               confirm: true,
+               reason: "operator: r",
+               force_active: true,
+               lock_timeout_ms: 50
+             )
+
+    assert raw_lease(root)["owner_token"] == lease["owner_token"]
+
+    File.rm!(lock_path)
+
+    assert {:ok, _} =
+             LaneLease.force_release(root, @kind, @issue, confirm: true, reason: "operator: r", force_active: true)
+  end
+
+  # stale/releasable recovery needs no override: the active refusal covers live owners only
+  test "force_release recovers stale and releasable leases without force_active", %{root: root} do
+    for {minutes_ago, expected_class} <- [{60, "stale_unconfirmed"}, {13 * 60, "releasable"}] do
+      issue = "MIC-STALE-#{minutes_ago}"
+      {:ok, lease} = LaneLease.claim(root, claim_attrs(%{issue_id: issue}))
+
+      path = LaneLease.lease_path(root, @kind, issue)
+      stale = File.read!(path) |> Jason.decode!() |> Map.put("heartbeat_at", iso(minutes_ago * 60))
+      File.write!(path, Jason.encode!(stale, pretty: true))
+
+      assert {:ok, record} = LaneLease.force_release(root, @kind, issue, confirm: true, reason: "operator: abandoned lane")
+      assert record["prior_class"] == expected_class
+      assert record["force_active"] == false
+      assert record["prior_state"]["owner_token"] == lease["owner_token"]
+      assert {:error, :not_found} = LaneLease.inspect(root, @kind, issue)
+    end
   end
 
   test "force_release recovers corrupt state (the only way through it)", %{root: root} do
@@ -365,4 +584,14 @@ defmodule SymphonyElixir.LaneLeaseTest do
   end
 
   defp rev(dir), do: String.trim(git!(dir, ["rev-parse", "HEAD"]))
+
+  defp renew_loop(root, issue, token) do
+    _ = LaneLease.renew(root, @kind, issue, token)
+
+    receive do
+      :stop -> :ok
+    after
+      1 -> renew_loop(root, issue, token)
+    end
+  end
 end

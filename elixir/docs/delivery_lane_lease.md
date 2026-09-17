@@ -74,13 +74,33 @@ LaneLease.force_release(root, "delivery", "MIC-10",
 )
 ```
 
-It requires explicit `confirm: true` and a non-empty `reason`, writes the pre-recovery
-state (or the corrupt raw bytes) to `<safe-lane>.recovery.json` as evidence, then removes
-the lease. Before forcing, the operator should classify the lane (`inspect/3`,
-`classify/3`) and positively confirm abandonment (owner host gone, worktree untouched).
-Forcing while an owner is live violates the single-owner contract and is on the operator,
-by design. The lease never auto-deletes worktrees or branches — recovery clears ownership
-only.
+Ordinary recovery **refuses an `:active` lease** with
+`{:error, {:active_lease, evidence}}`. The lane is classified from its heartbeat before
+anything destructive happens, and a live heartbeat alone never grants takeover authority —
+`force_active: true` must be passed explicitly to destroy an active lease, and even that
+override still requires `confirm: true` and a non-empty `reason`. There is no call shape
+that destroys an active lease by accident.
+
+Recovery is **serialized**: `force_release/4`, `claim/2`, `renew/4`, and `release/4` all
+hold a per-lane operation lock (`<safe-lane>.op-lock`, created atomically) across their
+read-modify-write, so a recovery that has begun can never delete a lease created by a new
+owner, and claimants cannot slip in between recovery's classification and removal. Lock
+acquisition waits a bounded time (5s by default, `lock_timeout_ms` on `force_release/4`)
+and fails closed with `{:error, {:lease_op_lock_unavailable, reason}}`. If a host dies
+inside the millisecond-scale critical section, the `.op-lock` file can be left behind; an
+operator removes it manually — this is the same operator-trusted-file model as the lease
+itself.
+
+Recovery success means the lease was **actually removed and verified gone**: the removal
+result is checked (a failed removal returns `{:error, {:lease_remove_failed, ...}}`), the
+lane path is re-read afterwards, and a surviving lease — the same one, a replacement, or
+corrupt bytes — fails closed with `{:error, {:lease_survived, kind, evidence}}` where
+`kind` is `:same_lease`, `:newer_lease`, `:corrupt_state`, or `:unreadable_state`. The
+pre-recovery state (or the corrupt raw bytes), its classification, and whether the active
+override was used are preserved to `<safe-lane>.recovery.json` before removal. Before
+forcing, the operator should positively confirm abandonment (owner host gone, worktree
+untouched) or knowingly accept breaking a live owner via `force_active: true`. The lease
+never auto-deletes worktrees or branches — recovery clears ownership only.
 
 ## Failure semantics (fail closed)
 

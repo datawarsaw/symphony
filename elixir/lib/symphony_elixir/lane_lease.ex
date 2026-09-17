@@ -19,7 +19,11 @@ defmodule SymphonyElixir.LaneLease do
   `:releasable` for humans and tooling, but `claim/2` still refuses while the file exists:
   a dead heartbeat is not authority to destroy a lane whose owner may be mid-delivery.
   Recovery is `force_release/4` — explicit operator confirmation plus a written reason, with
-  the pre-recovery state preserved to a `.recovery.json` evidence file.
+  the pre-recovery state preserved to a `.recovery.json` evidence file. Ordinary recovery
+  refuses an `:active` lease; destroying an active lease additionally requires
+  `force_active: true`. Destructive lease mutation is serialized against `claim/2`,
+  `renew/4`, and `release/4` by a per-lane lock file, and recovery success means the
+  targeted lease was verified absent after removal.
 
   Executor cycle: `claim/2` → `renew/4` periodically (heartbeat) →
   `verify_live_state/2` immediately before push/PR → `release/4`.
@@ -34,7 +38,12 @@ defmodule SymphonyElixir.LaneLease do
   @schema_version 1
   @default_stale_after_seconds 15 * 60
   @default_abandoned_after_seconds 12 * 60 * 60
+  @default_op_lock_timeout_ms 5_000
+  @op_lock_poll_ms 5
   @required_fields ~w(lane_id lane_kind issue_id owner_token owner_id worktree_path branch accepted_sha base_sha created_at heartbeat_at)
+  # Private deterministic-test seam (per-process, unset in production): override for the
+  # destructive removal inside force_release/4. Deliberately not a general filesystem hook.
+  @force_rm_test_hook :"$lane_lease_force_rm_hook"
 
   @type lease :: map()
   @type evidence :: map()
@@ -109,6 +118,7 @@ defmodule SymphonyElixir.LaneLease do
           | {:error, {:lease_write_failed, term()}}
           | {:error, {:lease_vanished, :retry}}
           | {:error, {:lease_unavailable, term()}}
+          | {:error, {:lease_op_lock_unavailable, term()}}
           | {:error, :invalid_attrs}
   def claim(workspace_root, attrs) do
     with {:ok, lease} <- validate_claim_attrs(attrs),
@@ -116,24 +126,26 @@ defmodule SymphonyElixir.LaneLease do
       path = lease_path(workspace_root, lease["lane_kind"], lease["issue_id"])
       payload = Jason.encode!(lease, pretty: true)
 
-      case :file.open(path, [:raw, :write, :exclusive]) do
-        {:ok, io} ->
-          result =
-            case :file.write(io, payload) do
-              :ok -> {:ok, lease}
-              {:error, reason} -> {:error, {:lease_write_failed, reason}}
-            end
+      with_op_lock(workspace_root, lease["lane_kind"], lease["issue_id"], @default_op_lock_timeout_ms, fn ->
+        case :file.open(path, [:raw, :write, :exclusive]) do
+          {:ok, io} ->
+            result =
+              case :file.write(io, payload) do
+                :ok -> {:ok, lease}
+                {:error, reason} -> {:error, {:lease_write_failed, reason}}
+              end
 
-          :file.close(io)
-          if match?({:error, {:lease_write_failed, _}}, result), do: _ = File.rm(path)
-          result
+            :file.close(io)
+            if match?({:error, {:lease_write_failed, _}}, result), do: _ = File.rm(path)
+            result
 
-        {:error, :eexist} ->
-          reject_claim(workspace_root, lease["lane_kind"], lease["issue_id"])
+          {:error, :eexist} ->
+            reject_claim(workspace_root, lease["lane_kind"], lease["issue_id"])
 
-        {:error, reason} ->
-          {:error, {:lease_unavailable, reason}}
-      end
+          {:error, reason} ->
+            {:error, {:lease_unavailable, reason}}
+        end
+      end)
     else
       {:error, :invalid_attrs} -> {:error, :invalid_attrs}
       {:error, reason} -> {:error, {:lease_unavailable, reason}}
@@ -145,40 +157,63 @@ defmodule SymphonyElixir.LaneLease do
   are immutable here by construction. Lost or corrupt lease fails closed.
   """
   @spec renew(String.t(), lane_kind(), issue_id(), owner_token()) ::
-          {:ok, lease()} | {:error, :lease_missing} | {:error, :not_owner} | {:error, read_error()}
+          {:ok, lease()}
+          | {:error, :lease_missing}
+          | {:error, :not_owner}
+          | {:error, read_error()}
+          | {:error, {:lease_op_lock_unavailable, term()}}
   def renew(workspace_root, lane_kind, issue_id, owner_token) do
-    with {:ok, lease} <- read_lease(workspace_root, lane_kind, issue_id),
-         :ok <- authorize(lease, owner_token) do
-      updated = Map.put(lease, "heartbeat_at", now_iso())
-      :ok = write_lease(workspace_root, lane_kind, issue_id, updated)
-      {:ok, updated}
+    if File.dir?(lanes_dir(workspace_root)) do
+      with_op_lock(workspace_root, lane_kind, issue_id, @default_op_lock_timeout_ms, fn ->
+        with {:ok, lease} <- read_lease(workspace_root, lane_kind, issue_id),
+             :ok <- authorize(lease, owner_token) do
+          updated = Map.put(lease, "heartbeat_at", now_iso())
+          :ok = write_lease(workspace_root, lane_kind, issue_id, updated)
+          {:ok, updated}
+        else
+          {:error, :not_found} -> {:error, :lease_missing}
+          {:error, reason} -> {:error, reason}
+        end
+      end)
     else
-      {:error, :not_found} -> {:error, :lease_missing}
-      {:error, reason} -> {:error, reason}
+      {:error, :lease_missing}
     end
   end
 
   @doc """
   Releases the lease. Only the current owner token may release; a foreign token is refused and
   the lease is left intact. Release by the owner is idempotent (already-free lane is `:ok`).
+  A failed removal is reported, never reported as success.
   """
   @spec release(String.t(), lane_kind(), issue_id(), owner_token()) ::
-          :ok | {:error, :not_owner} | {:error, read_error()}
-  def release(workspace_root, lane_kind, issue_id, owner_token) do
-    case read_lease(workspace_root, lane_kind, issue_id) do
-      {:ok, lease} ->
-        if valid_token?(lease, owner_token) do
-          _ = File.rm(lease_path(workspace_root, lane_kind, issue_id))
           :ok
-        else
-          {:error, :not_owner}
+          | {:error, :not_owner}
+          | {:error, read_error()}
+          | {:error, {:lease_remove_failed, term()}}
+          | {:error, {:lease_op_lock_unavailable, term()}}
+  def release(workspace_root, lane_kind, issue_id, owner_token) do
+    if File.dir?(lanes_dir(workspace_root)) do
+      with_op_lock(workspace_root, lane_kind, issue_id, @default_op_lock_timeout_ms, fn ->
+        case read_lease(workspace_root, lane_kind, issue_id) do
+          {:ok, lease} ->
+            if valid_token?(lease, owner_token) do
+              case File.rm(lease_path(workspace_root, lane_kind, issue_id)) do
+                :ok -> :ok
+                {:error, reason} -> {:error, {:lease_remove_failed, reason}}
+              end
+            else
+              {:error, :not_owner}
+            end
+
+          {:error, :not_found} ->
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
         end
-
-      {:error, :not_found} ->
-        :ok
-
-      {:error, reason} ->
-        {:error, reason}
+      end)
+    else
+      :ok
     end
   end
 
@@ -224,12 +259,31 @@ defmodule SymphonyElixir.LaneLease do
 
   @doc """
   Explicit operator recovery: force-clears a lane after human decision. Requires
-  `confirm: true` and a non-empty `reason`. Preserves the prior state (or the corrupt raw
-  bytes) to `<safe-lane>.recovery.json` before removal. This is the only sanctioned way to
-  clear a lease without the owner token, and the only way through a corrupt lease file.
+  `confirm: true` and a non-empty `reason`. The current lease is classified first: an
+  `:active` lease is refused with `{:error, {:active_lease, evidence}}` unless
+  `force_active: true` is also passed — heartbeat classification is diagnostic evidence,
+  never takeover authority on its own. Recovery of stale/releasable/corrupt state needs no
+  override.
+
+  Destructive recovery runs under a per-lane operation lock shared with `claim/2`,
+  `renew/4`, and `release/4`, so a new owner's lease can never be destroyed by a recovery
+  that started earlier. The prior state (or the corrupt raw bytes) is preserved to
+  `<safe-lane>.recovery.json` before removal; the removal result is checked and the lane is
+  re-read afterwards: success is returned only when the targeted lease is verifiably gone.
+  A surviving lease (same, replacement, or corrupt) or a failed removal fails closed.
+  Options: `forced_by`, `lock_timeout_ms` (default #{@default_op_lock_timeout_ms}ms).
   """
   @spec force_release(String.t(), lane_kind(), issue_id(), keyword()) ::
-          {:ok, map()} | {:error, :recovery_unconfirmed} | {:error, :recovery_reason_required} | {:error, :lease_missing}
+          {:ok, map()}
+          | {:error, :recovery_unconfirmed}
+          | {:error, :recovery_reason_required}
+          | {:error, :lease_missing}
+          | {:error, {:active_lease, evidence()}}
+          | {:error, {:lease_remove_failed, map()}}
+          | {:error, {:lease_survived, :same_lease | :newer_lease | :corrupt_state | :unreadable_state, map()}}
+          | {:error, {:recovery_evidence_write_failed, term()}}
+          | {:error, {:lease_op_lock_unavailable, term()}}
+          | {:error, read_error()}
   def force_release(workspace_root, lane_kind, issue_id, opts) do
     reason = Keyword.get(opts, :reason)
 
@@ -241,31 +295,11 @@ defmodule SymphonyElixir.LaneLease do
         {:error, :recovery_reason_required}
 
       true ->
-        path = lease_path(workspace_root, lane_kind, issue_id)
+        File.mkdir_p(lanes_dir(workspace_root))
 
-        case File.read(path) do
-          {:ok, raw} ->
-            record = %{
-              "schema_version" => @schema_version,
-              "lane_id" => lane_id(lane_kind, issue_id),
-              "recovered_at" => now_iso(),
-              "reason" => reason,
-              "forced_by" => Keyword.get(opts, :forced_by, ""),
-              "prior_state" => decode_or_raw(raw)
-            }
-
-            evidence_path = Path.join(lanes_dir(workspace_root), recovery_name(lane_kind, issue_id))
-            _ = File.rm(evidence_path)
-            File.write!(evidence_path, Jason.encode!(record, pretty: true))
-            _ = File.rm(path)
-            {:ok, record}
-
-          {:error, :enoent} ->
-            {:error, :lease_missing}
-
-          {:error, _} ->
-            {:error, {:lease_state_invalid, :unreadable_state}}
-        end
+        with_op_lock(workspace_root, lane_kind, issue_id, lock_timeout(opts), fn ->
+          recover_locked(workspace_root, lane_kind, issue_id, reason, Keyword.get(opts, :force_active) == true, opts)
+        end)
     end
   end
 
@@ -339,6 +373,213 @@ defmodule SymphonyElixir.LaneLease do
   end
 
   # -- internals --
+
+  # Operator recovery, run under the lane's operation lock. The lease read here is the one
+  # that gets removed: no claim/renew/release can interleave inside the critical section.
+  defp recover_locked(workspace_root, lane_kind, issue_id, reason, force_active, opts) do
+    case read_lease(workspace_root, lane_kind, issue_id) do
+      {:ok, lease} ->
+        class = class_of(lease)
+
+        if class == :active and not force_active do
+          {:error, {:active_lease, evidence(lease)}}
+        else
+          record = recovery_record(lane_kind, issue_id, lease, Atom.to_string(class), reason, force_active, opts)
+          remove_and_verify(workspace_root, lane_kind, issue_id, record, lease["owner_token"])
+        end
+
+      # Corrupt/ambiguous/schema-invalid/foreign content: explicit operator recovery remains
+      # the only way through. The raw bytes (or best-effort decode) become the evidence.
+      {:error, {:lease_state_invalid, invalid}} ->
+        case File.read(lease_path(workspace_root, lane_kind, issue_id)) do
+          {:ok, raw} ->
+            record = recovery_record(lane_kind, issue_id, decode_or_raw(raw), Atom.to_string(invalid), reason, force_active, opts)
+            remove_and_verify(workspace_root, lane_kind, issue_id, record, nil)
+
+          {:error, :enoent} ->
+            {:error, :lease_missing}
+
+          {:error, _} ->
+            {:error, {:lease_state_invalid, :unreadable_state}}
+        end
+
+      {:error, :not_found} ->
+        {:error, :lease_missing}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp recovery_record(lane_kind, issue_id, prior_state, prior_class, reason, force_active, opts) do
+    %{
+      "schema_version" => @schema_version,
+      "lane_id" => lane_id(lane_kind, issue_id),
+      "recovered_at" => now_iso(),
+      "reason" => reason,
+      "forced_by" => Keyword.get(opts, :forced_by, ""),
+      "force_active" => force_active,
+      "prior_class" => prior_class,
+      "prior_state" => prior_state
+    }
+  end
+
+  defp remove_and_verify(workspace_root, lane_kind, issue_id, record, target_token) do
+    case write_evidence(workspace_root, lane_kind, issue_id, record) do
+      :ok ->
+        path = lease_path(workspace_root, lane_kind, issue_id)
+
+        case fs_rm(path) do
+          :ok -> verify_removed(path, target_token, record)
+          {:error, rm_reason} -> {:error, {:lease_remove_failed, Map.put(record, "remove_error", rm_reason)}}
+        end
+
+      {:error, write_reason} ->
+        {:error, {:recovery_evidence_write_failed, write_reason}}
+    end
+  end
+
+  defp verify_removed(path, target_token, record) do
+    case File.read(path) do
+      {:error, :enoent} ->
+        {:ok, record}
+
+      {:ok, raw} ->
+        {:error, survivor_error(raw, target_token)}
+
+      {:error, read_reason} ->
+        {:error, {:lease_survived, :unreadable_state, Map.put(record, "verify_error", read_reason)}}
+    end
+  end
+
+  defp survivor_error(raw, target_token) do
+    case Jason.decode(raw) do
+      {:ok, %{"owner_token" => token} = survivor} when is_binary(token) ->
+        kind = if survivor["owner_token"] == target_token, do: :same_lease, else: :newer_lease
+        {:lease_survived, kind, evidence(survivor)}
+
+      _ ->
+        {:lease_survived, :corrupt_state, %{"raw" => raw}}
+    end
+  end
+
+  defp write_evidence(workspace_root, lane_kind, issue_id, record) do
+    evidence_path = Path.join(lanes_dir(workspace_root), recovery_name(lane_kind, issue_id))
+    _ = File.rm(evidence_path)
+
+    case File.write(evidence_path, Jason.encode!(record, pretty: true)) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp class_of(lease) do
+    case classify(lease) do
+      {:ok, class} -> class
+      {:error, _} -> :corrupt_state
+    end
+  end
+
+  # Deterministic-test seam for the destructive removal above. Plain File.rm everywhere else.
+  defp fs_rm(path) do
+    case Process.get(@force_rm_test_hook) do
+      nil -> File.rm(path)
+      fun when is_function(fun, 1) -> fun.(path)
+    end
+  end
+
+  defp lock_timeout(opts) do
+    case Keyword.get(opts, :lock_timeout_ms) do
+      t when is_integer(t) and t >= 0 -> t
+      _ -> @default_op_lock_timeout_ms
+    end
+  end
+
+  # Per-lane mutual exclusion over lease mutation: claim, renew, release, and destructive
+  # operator recovery all hold this lock across their read-modify-write. Acquired via the
+  # same atomic exclusive-create primitive as the initial claim. Bounded wait, fail-closed.
+  defp with_op_lock(workspace_root, lane_kind, issue_id, timeout_ms, fun) do
+    path = op_lock_path(workspace_root, lane_kind, issue_id)
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    case acquire_op_lock(path, deadline) do
+      {:ok, io} ->
+        try do
+          fun.()
+        after
+          :file.close(io)
+          remove_op_lock(path)
+        end
+
+      {:error, :timeout} ->
+        {:error, {:lease_op_lock_unavailable, :timeout}}
+
+      {:error, reason} ->
+        {:error, {:lease_op_lock_unavailable, reason}}
+    end
+  end
+
+  defp acquire_op_lock(path, deadline) do
+    case :file.open(path, [:raw, :write, :exclusive]) do
+      {:ok, io} ->
+        case :file.write(io, op_lock_payload()) do
+          :ok ->
+            {:ok, io}
+
+          {:error, reason} ->
+            :file.close(io)
+            _ = File.rm(path)
+            {:error, reason}
+        end
+
+      {:error, :eexist} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :timeout}
+        else
+          Process.sleep(@op_lock_poll_ms)
+          acquire_op_lock(path, deadline)
+        end
+
+      # On Windows, a create-race against a holder's open handle surfaces as a sharing
+      # violation (:eacces) rather than :eexist; both mean "someone holds it, wait".
+      {:error, :eacces} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :timeout}
+        else
+          Process.sleep(@op_lock_poll_ms)
+          acquire_op_lock(path, deadline)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # A lock that cannot be released would wedge the lane forever; retry briefly before
+  # giving up. Residual leak (host crash mid-critical-section) requires manual removal of
+  # the .op-lock file — documented in docs/delivery_lane_lease.md.
+  defp remove_op_lock(path), do: remove_op_lock(path, 5)
+
+  defp remove_op_lock(_path, 0), do: :error
+
+  defp remove_op_lock(path, attempts) do
+    case File.rm(path) do
+      :ok ->
+        :ok
+
+      {:error, _} ->
+        Process.sleep(@op_lock_poll_ms)
+        remove_op_lock(path, attempts - 1)
+    end
+  end
+
+  defp op_lock_path(workspace_root, lane_kind, issue_id) do
+    Path.join(lanes_dir(workspace_root), safe_lane_name(lane_id(lane_kind, issue_id)) <> ".op-lock")
+  end
+
+  defp op_lock_payload do
+    Jason.encode!(%{"holder" => inspect(self()), "node" => to_string(node()), "acquired_at" => now_iso()})
+  end
 
   defp ancestry_mismatches(worktree_path, checks) do
     Enum.flat_map(checks, fn {name, ancestor, descendant} ->
