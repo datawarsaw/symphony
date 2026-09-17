@@ -1050,8 +1050,7 @@ defmodule SymphonyElixir.Workspace do
             if normalize_git_dir(workspace_common_dir) == normalize_git_dir(source_common_dir) do
               :ok
             else
-              {:error,
-               {:workspace_repository_mismatch, route.target, {:git_common_dir, workspace_common_dir, source_common_dir}}}
+              {:error, {:workspace_repository_mismatch, route.target, {:git_common_dir, workspace_common_dir, source_common_dir}}}
             end
 
           {:error, :git_read_failed} ->

@@ -251,12 +251,12 @@ defmodule SymphonyElixir.Config.Schema do
       end
     end
 
-   @primary_key false
-  embedded_schema do
-    field(:command, :string, default: "codex app-server")
-     field(:default_model, :string, default: "gpt-6-astra")
-     field(:default_reasoning_effort, :string, default: "medium")
-    field(:shell_executable, :string)
+    @primary_key false
+    embedded_schema do
+      field(:command, :string, default: "codex app-server")
+      field(:default_model, :string, default: "gpt-6-astra")
+      field(:default_reasoning_effort, :string, default: "medium")
+      field(:shell_executable, :string)
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -268,13 +268,13 @@ defmodule SymphonyElixir.Config.Schema do
         }
       )
 
-     field(:thread_sandbox, :string, default: "workspace-write")
-     field(:turn_sandbox_policy, :map)
-     field(:turn_timeout_ms, :integer, default: 3_600_000)
-     field(:read_timeout_ms, :integer, default: 5_000)
-     field(:stall_timeout_ms, :integer, default: 300_000)
+      field(:thread_sandbox, :string, default: "workspace-write")
+      field(:turn_sandbox_policy, :map)
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+      field(:read_timeout_ms, :integer, default: 5_000)
+      field(:stall_timeout_ms, :integer, default: 300_000)
 
-    embeds_one(:fallback, Fallback, on_replace: :update, defaults_to_struct: true)
+      embeds_one(:fallback, Fallback, on_replace: :update, defaults_to_struct: true)
 
       # MIC-223: route local Windows worker launches through the jobrun Job
       # Object wrapper and require positive tree-drain evidence before any
@@ -337,7 +337,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
-    |> cast_embed(:fallback, with: &Fallback.changeset/2)
+      |> cast_embed(:fallback, with: &Fallback.changeset/2)
       |> validate_number(:worker_termination_grace_ms, greater_than: 0)
     end
   end

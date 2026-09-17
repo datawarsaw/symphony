@@ -367,6 +367,13 @@ The observability UI now runs on a minimal Phoenix stack:
 
 ## Testing
 
+For normal and full validation, use the canonical entry point
+([validation.md](docs/validation.md)):
+
+```bash
+mix symphony.validate
+```
+
 ```bash
 make all
 ```

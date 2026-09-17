@@ -166,8 +166,7 @@ defmodule SymphonyElixir.SourceSyncTest do
 
       configure_workspace_workflow!(second, workspace_root: first.workspace_root)
 
-      assert {:error,
-              {:workspace_repository_mismatch, "symphony-runtime", {:git_common_dir, _actual, _expected}}} =
+      assert {:error, {:workspace_repository_mismatch, "symphony-runtime", {:git_common_dir, _actual, _expected}}} =
                Workspace.create_for_issue(issue)
 
       assert String.trim(File.read!(Path.join(workspace, "README.md"))) == "initial content"

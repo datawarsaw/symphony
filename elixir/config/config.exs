@@ -23,6 +23,5 @@ if config_env() == :test do
     # per-run retry store root; TestSupport narrows this to a per-test root
     # while each test executes. The default workspace root must never hold
     # durable retry records during tests.
-    retry_store_root:
-      Path.join(System.tmp_dir!(), "symphony-elixir-retries-run-#{System.unique_integer([:positive])}")
+    retry_store_root: Path.join(System.tmp_dir!(), "symphony-elixir-retries-run-#{System.unique_integer([:positive])}")
 end
