@@ -193,6 +193,182 @@ defmodule SymphonyElixir.SourceSyncTest do
     end)
   end
 
+  test "binary path sync/2 fast-forwards and defaults to the main branch when no options are given" do
+    with_source_fixture("binary-path-ff", fn fixture ->
+      new_remote_commit = advance_remote!(fixture, "remote content for binary path\n", "feat: binary path")
+
+      assert {:ok, :fast_forwarded} = SourceSync.sync(fixture.source_repo)
+      assert get_head_sha(fixture.source_repo) == new_remote_commit
+      assert get_branch_sha(fixture.source_repo, "main") == new_remote_commit
+      # The binary clause configures no expected remote, so origin verification is skipped.
+      assert get_remote_head_sha(fixture.source_repo, "main") == new_remote_commit
+    end)
+  end
+
+  test "binary path sync/2 classifies a directory that is not a git repository" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-source-sync-not-a-repo-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      plain_dir = Path.join(test_root, "plain") |> String.replace("\\", "/")
+      File.mkdir_p!(plain_dir)
+      File.write!(Path.join(plain_dir, "notes.txt"), "not version controlled\n")
+
+      assert {:error, :not_a_git_repository} = SourceSync.sync(plain_dir)
+      assert SourceSync.reason_code_string(:not_a_git_repository) == "NOT_A_GIT_REPOSITORY"
+      refute File.exists?(Path.join(plain_dir, ".git"))
+      assert File.read!(Path.join(plain_dir, "notes.txt")) == "not version controlled\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "missing local default branch is created from origin without touching the checked-out branch" do
+    with_source_fixture("create-default-branch", fn fixture ->
+      git!(["-C", fixture.source_repo, "checkout", "-b", "topic"])
+      git!(["-C", fixture.source_repo, "branch", "-D", "main"])
+      topic_sha = get_head_sha(fixture.source_repo)
+      new_remote_commit = advance_remote!(fixture, "remote seeding main\n", "feat: seed remote main")
+
+      assert {:ok, :fast_forwarded} = SourceSync.sync(fixture.route)
+      assert get_branch_sha(fixture.source_repo, "main") == new_remote_commit
+      assert get_current_branch(fixture.source_repo) == "topic"
+      assert get_head_sha(fixture.source_repo) == topic_sha
+      assert get_branch_sha(fixture.source_repo, "topic") == topic_sha
+      assert get_remote_head_sha(fixture.source_repo, "main") == new_remote_commit
+    end)
+  end
+
+  test "fast-forward moves the default branch while another branch stays checked out" do
+    with_source_fixture("off-branch-fast-forward", fn fixture ->
+      git!(["-C", fixture.source_repo, "checkout", "-b", "topic"])
+      File.write!(Path.join(fixture.source_repo, "topic_file.txt"), "topic work\n")
+      git!(["-C", fixture.source_repo, "add", "topic_file.txt"])
+      git!(["-C", fixture.source_repo, "commit", "-m", "feat: topic work"])
+      topic_sha = get_head_sha(fixture.source_repo)
+      new_remote_commit = advance_remote!(fixture, "remote update\n", "feat: remote update")
+
+      assert {:ok, :fast_forwarded} = SourceSync.sync(fixture.route)
+      assert get_branch_sha(fixture.source_repo, "main") == new_remote_commit
+      assert get_current_branch(fixture.source_repo) == "topic"
+      assert get_head_sha(fixture.source_repo) == topic_sha
+      assert get_branch_sha(fixture.source_repo, "topic") == topic_sha
+      assert File.read!(Path.join(fixture.source_repo, "topic_file.txt")) == "topic work\n"
+      assert get_remote_head_sha(fixture.source_repo, "main") == new_remote_commit
+    end)
+  end
+
+  test "diverged failure preserves the local commit and mutates nothing but the remote-tracking ref" do
+    with_source_fixture("diverged-state-preserved", fn fixture ->
+      local_commit = commit_local!(fixture, "local diverged content\n", "feat: local diverged")
+      remote_commit = advance_remote!(fixture, "remote diverged content\n", "feat: remote diverged")
+
+      assert {:error, :diverged} = SourceSync.sync(fixture.route)
+      assert SourceSync.reason_code_string(:diverged) == "DIVERGED"
+      assert get_head_sha(fixture.source_repo) == local_commit
+      assert get_branch_sha(fixture.source_repo, "main") == local_commit
+      # The fetch itself still happened before classification; only the remote-tracking ref moved.
+      assert get_remote_head_sha(fixture.source_repo, "main") == remote_commit
+      assert File.read!(Path.join(fixture.source_repo, "local_file.txt")) == "local diverged content\n"
+      assert get_bare_branch_sha(fixture.remote_repo, "main") == remote_commit
+    end)
+  end
+
+  test "unmerged index fails closed as unmerged and leaves the conflict state intact" do
+    with_source_fixture("unmerged-state-preserved", fn fixture ->
+      create_unmerged_conflict!(fixture)
+      conflicted_head = get_head_sha(fixture.source_repo)
+
+      assert {:error, :unmerged} = SourceSync.sync(fixture.route)
+      assert SourceSync.reason_code_string(:unmerged) == "UNMERGED"
+      assert get_head_sha(fixture.source_repo) == conflicted_head
+
+      {unmerged_files, 0} =
+        System.cmd("git", ["-c", "safe.directory=#{fixture.source_repo}", "-C", fixture.source_repo, "ls-files", "--unmerged"])
+
+      assert unmerged_files =~ "conflict.txt"
+    end)
+  end
+
+  test "fetch failure and remote mismatch fail closed as remote_unavailable without mutation" do
+    with_source_fixture("fetch-failure", fn fixture ->
+      mismatch_route = %{fixture.route | remote: "https://example.invalid/other.git"}
+
+      assert {:error, {:remote_unavailable, {:remote_mismatch, _, _}}} = SourceSync.sync(mismatch_route)
+      assert SourceSync.reason_code_string({:remote_unavailable, {:remote_mismatch, nil, nil}}) == "REMOTE_UNAVAILABLE"
+
+      File.rm_rf!(fixture.remote_repo)
+
+      assert {:error, :remote_unavailable} = SourceSync.sync(fixture.route)
+      assert SourceSync.reason_code_string(:remote_unavailable) == "REMOTE_UNAVAILABLE"
+      assert get_head_sha(fixture.source_repo) == fixture.initial_commit
+      assert get_branch_sha(fixture.source_repo, "main") == fixture.initial_commit
+    end)
+  end
+
+  test "default branch checked out in a linked worktree blocks the fast-forward and mutates nothing" do
+    with_source_fixture("fast-forward-blocked-by-worktree", fn fixture ->
+      advance_remote!(fixture, "remote r1\n", "feat: remote r1")
+      git!(["-C", fixture.source_repo, "checkout", "-b", "topic"])
+      topic_sha = get_head_sha(fixture.source_repo)
+      main_holder = Path.join(fixture.test_root, "main-holder") |> String.replace("\\", "/")
+      git!(["-C", fixture.source_repo, "worktree", "add", main_holder, "main"])
+      second_remote_commit = advance_remote!(fixture, "remote r2\n", "feat: remote r2")
+
+      assert {:error, :fast_forward_failed} = SourceSync.sync(fixture.route)
+      assert SourceSync.reason_code_string(:fast_forward_failed) == "FAST_FORWARD_FAILED"
+      # The refused ref update leaves local main exactly where it started,
+      # still two commits behind the remote.
+      assert get_branch_sha(fixture.source_repo, "main") == fixture.initial_commit
+      assert get_current_branch(fixture.source_repo) == "topic"
+      assert get_head_sha(fixture.source_repo) == topic_sha
+      assert get_remote_head_sha(fixture.source_repo, "main") == second_remote_commit
+    end)
+  end
+
+  test "binary path sync/2 classifies a missing remote default branch" do
+    with_source_fixture("binary-path-missing-branch", fn fixture ->
+      assert {:error, :default_branch_missing} = SourceSync.sync(fixture.source_repo, default_branch: "ghost-branch")
+      assert SourceSync.reason_code_string(:default_branch_missing) == "DEFAULT_BRANCH_MISSING"
+      assert get_head_sha(fixture.source_repo) == fixture.initial_commit
+    end)
+  end
+
+  test "reason_code_string exposes the stable uppercase mapping contract" do
+    # Literal mapping contract for callers such as Workspace logging and
+    # receipts. Every classification that ordinary repository states can
+    # produce is additionally asserted from a real sync result in the
+    # failure-state tests above; :head_verification_failed is only reachable
+    # through git states inconsistent with the checks that precede it, so the
+    # mapping arm is exercised directly here.
+    mappings = [
+      {:current, "CURRENT"},
+      {:fast_forwarded, "FAST_FORWARDED"},
+      {:dirty_tracked, "DIRTY_TRACKED"},
+      {:dirty_index, "DIRTY_INDEX"},
+      {:unmerged, "UNMERGED"},
+      {:local_ahead, "LOCAL_AHEAD"},
+      {:diverged, "DIVERGED"},
+      {:remote_unavailable, "REMOTE_UNAVAILABLE"},
+      {:default_branch_missing, "DEFAULT_BRANCH_MISSING"},
+      {:fast_forward_failed, "FAST_FORWARD_FAILED"},
+      {:head_verification_failed, "HEAD_VERIFICATION_FAILED"},
+      {:not_a_git_repository, "NOT_A_GIT_REPOSITORY"}
+    ]
+
+    Enum.each(mappings, fn {reason, expected} ->
+      assert SourceSync.reason_code_string(reason) == expected
+      assert SourceSync.reason_code_string({reason, %{details: 1}}) == expected
+    end)
+
+    # The tuple arm keeps only atom reasons; anything else falls through to the
+    # uppercase escape hatch for unrecognized classifications.
+    assert SourceSync.reason_code_string(:unrecognized_future_code) == "UNRECOGNIZED_FUTURE_CODE"
+  end
+
   defp with_source_fixture(name, fun) do
     test_root = test_root_path(name)
 
@@ -247,6 +423,7 @@ defmodule SymphonyElixir.SourceSyncTest do
       remote_repo: remote_repo,
       route: route,
       source_repo: source_repo,
+      test_root: test_root,
       workspace_root: workspace_root
     }
   end
@@ -307,6 +484,32 @@ defmodule SymphonyElixir.SourceSyncTest do
   defp get_head_sha(repo_path) do
     {sha, 0} = System.cmd("git", ["-c", "safe.directory=#{repo_path}", "-C", repo_path, "rev-parse", "HEAD"])
     String.trim(sha)
+  end
+
+  defp get_branch_sha(repo_path, branch) do
+    {sha, 0} =
+      System.cmd("git", [
+        "-c",
+        "safe.directory=#{repo_path}",
+        "-C",
+        repo_path,
+        "rev-parse",
+        "refs/heads/#{branch}"
+      ])
+
+    String.trim(sha)
+  end
+
+  defp get_bare_branch_sha(repo_path, branch) do
+    {sha, 0} = System.cmd("git", ["-C", repo_path, "rev-parse", branch])
+    String.trim(sha)
+  end
+
+  defp get_current_branch(repo_path) do
+    {branch, 0} =
+      System.cmd("git", ["-c", "safe.directory=#{repo_path}", "-C", repo_path, "branch", "--show-current"])
+
+    String.trim(branch)
   end
 
   defp git_common_dir(repo_path) do
