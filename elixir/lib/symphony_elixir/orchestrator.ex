@@ -14,6 +14,18 @@ defmodule SymphonyElixir.Orchestrator do
   @continuation_retry_delay_ms 1_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  # MIC-10 STEER != CONTROL: bounded in-memory ledger of CONTROL receipts.
+  # CONTROL is the host-owned lifecycle authority (SymphonyElixir.Control);
+  # STEER is operator text for the running worker (SymphonyElixir.Steering)
+  # delivered at turn boundaries. The ledger is not a durable store — restart
+  # loses operator convenience state, never the MIC-223 fail-closed boundary.
+  @control_ledger_limit 50
+  # Bounded wait for a managed worker's termination receipt after a CONTROL
+  # stop. Defaults to the MIC-223 stop budget (grace + hard-terminate drain);
+  # the env seam mirrors WorkerContainment's own test seam so tests can
+  # shrink the deadline without touching policy.
+  @control_evidence_budget_env :control_termination_evidence_budget_ms
+  @control_evidence_poll_ms 50
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -45,7 +57,12 @@ defmodule SymphonyElixir.Orchestrator do
       orphaned_workspaces: [],
       startup_reconciled: false,
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      # MIC-10 STEER != CONTROL: bounded in-memory ledger of CONTROL receipts
+      # (SymphonyElixir.Control). Operator convenience state, not a safety
+      # store: losing it across a restart can only ever deny a relaunch
+      # (fail closed), never grant one.
+      control_ledger: []
     ]
   end
 
@@ -206,6 +223,37 @@ defmodule SymphonyElixir.Orchestrator do
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
+
+  # MIC-10 STEER != CONTROL: asynchronous finalization of a CONTROL terminate
+  # against the attempt's MIC-223 termination evidence. The watcher only
+  # collects evidence; the fail-closed decision itself is made here, through
+  # WorkerContainment.reuse_gate/2 — the single workspace-reuse authority.
+  def handle_info({:control_termination_evidence, control_id, issue_id, attempt_id, confirmation}, state) do
+    case find_pending_control_receipt(state, control_id, issue_id, attempt_id) do
+      nil ->
+        Logger.warning("Discarding stale CONTROL termination evidence: control_id=#{control_id} issue_id=#{inspect(issue_id)} attempt_id=#{inspect(attempt_id)}")
+
+        {:noreply, state}
+
+      receipt ->
+        expectation = Map.get(receipt.evidence, :termination_expectation)
+        verdict = WorkerContainment.reuse_gate(confirmation, expectation)
+        outcome = if verdict == :allowed, do: :terminated, else: :termination_unconfirmed
+
+        finalized =
+          receipt
+          |> Map.put(:outcome, outcome)
+          |> Map.put(:completed_at, DateTime.utc_now())
+          |> Map.put(:evidence, Map.merge(receipt.evidence, %{worker_termination: summarize_termination(confirmation), reuse_gate: verdict}))
+
+        Logger.info(
+          "Control termination finalized: control_id=#{control_id} issue_id=#{issue_id} attempt_id=#{inspect(attempt_id)} " <>
+            "outcome=#{inspect(outcome)} reuse_gate=#{inspect(verdict)}"
+        )
+
+        {:noreply, replace_control_receipt(state, finalized)}
     end
   end
 
@@ -1036,6 +1084,10 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       workspace_root: Map.get(running_entry, :workspace_root),
+      # MIC-10 CONTROL: the attempt identity of the stopped worker, so a
+      # blocked (operator-held or stalled) issue still resolves `:current`
+      # to the exact attempt its evidence binds to.
+      retry_attempt: Map.get(running_entry, :retry_attempt),
       session_id: running_entry_session_id(running_entry),
       error: error,
       discovery_result: Map.get(running_entry, :discovery_result),
@@ -2514,6 +2566,9 @@ defmodule SymphonyElixir.Orchestrator do
        operational_status: operational_status,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       # MIC-10 STEER != CONTROL observability: what control was requested
+       # against which attempt and how it completed.
+       controls: Enum.take(state.control_ledger, 20),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -2540,6 +2595,485 @@ defmodule SymphonyElixir.Orchestrator do
        operations: ["poll", "reconcile"]
      }, state}
   end
+
+  # ── MIC-10 STEER != CONTROL: host-owned lifecycle authority ────────────────
+  #
+  # CONTROL requests arrive only through SymphonyElixir.Control (trusted
+  # host/operator code inside the BEAM). No worker/model output path reaches
+  # these handlers: worker updates are handle_info messages that only feed
+  # observability projections, and steering text is delivered to the worker
+  # prompt by the durable steering inbox — the orchestrator never parses
+  # steering or model text for lifecycle commands. Every request — executed
+  # or rejected — is recorded in the bounded control ledger.
+  def handle_call({:control_request, %{action: action} = request}, _from, state)
+      when action in [:terminate, :relaunch] do
+    {reply, state} = execute_control_request(state, request)
+    {:reply, reply, state}
+  end
+
+  def handle_call({:control_request, %{action: :interrupt} = request}, _from, state) do
+    # Fail closed: the provider surface this runtime implements has no
+    # host-initiated turn interruption, and interrupt is never mapped onto
+    # terminate. Recorded so the operator sees what was requested.
+    attempt_id = resolve_target_attempt_id(state, request)
+
+    {receipt, state} =
+      record_control(
+        state,
+        request,
+        :rejected_interrupt_not_supported,
+        %{reason: :no_host_initiated_turn_interrupt_on_provider_surface, running_attempt_id: attempt_id},
+        attempt_id: attempt_id
+      )
+
+    {:reply, {:ok, receipt}, state}
+  end
+
+  def handle_call({:control_request, request}, _from, state) do
+    {_receipt, state} = record_control(state, request, {:invalid_request, :unsupported_action}, %{})
+    {:reply, {:error, {:invalid_request, :unsupported_action}}, state}
+  end
+
+  def handle_call(:control_receipts, _from, state) do
+    {:reply, state.control_ledger, state}
+  end
+
+  # ── CONTROL execution ──────────────────────────────────────────────────────
+
+  defp execute_control_request(state, %{action: :terminate} = request) do
+    control_terminate(state, request)
+  end
+
+  defp execute_control_request(state, %{action: :relaunch} = request) do
+    control_relaunch(state, request)
+  end
+
+  # TERMINATE = the orchestrator's existing task-level stop, the same
+  # primitive the stall/reconcile paths use: the task's death closes the
+  # app-server port it owns (stdin EOF to the MIC-223 jobrun wrapper for
+  # contained launches). Task death is never treated as the confirmation —
+  # the wrapper's termination receipt, evaluated against the attempt's
+  # predeclared termination expectation through WorkerContainment.reuse_gate/2,
+  # decides between :terminated and :termination_unconfirmed (fail closed).
+  defp control_terminate(state, request) do
+    case Map.get(state.running, request.issue_id) do
+      nil ->
+        {receipt, state} =
+          record_control(state, request, :rejected_worker_not_running, %{running?: false}, attempt_id: resolve_target_attempt_id(state, request))
+
+        {{:ok, receipt}, state}
+
+      entry ->
+        running_attempt = Map.get(entry, :retry_attempt)
+
+        if stale_attempt_request?(request.attempt_id, running_attempt) do
+          {receipt, state} =
+            record_control(state, request, :rejected_stale_attempt, %{running_attempt_id: running_attempt}, attempt_id: resolve_target_attempt_id(state, request))
+
+          {{:ok, receipt}, state}
+        else
+          perform_control_terminate(state, request, entry, running_attempt)
+        end
+    end
+  end
+
+  defp perform_control_terminate(state, request, entry, attempt) do
+    evidence = %{
+      stop_primitive: :task_supervisor_stop,
+      worker_task_stop_requested: true,
+      identifier: Map.get(entry, :identifier),
+      issue_url: issue_url_from_entry(entry),
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      workspace_root: Map.get(entry, :workspace_root),
+      # MIC-223 authoritative inputs, frozen at stop time: the reuse decision
+      # is made from the attempt's predeclared expectation plus the wrapper
+      # receipt evidence, never from task death alone.
+      termination_expectation: Map.get(entry, :termination_expectation),
+      worker_identity: Map.get(entry, :worker_identity),
+      worker_termination: nil,
+      reuse_gate: nil
+    }
+
+    stop_running_task(Map.get(entry, :pid), Map.get(entry, :ref), state.task_supervisor)
+
+    {receipt, state} = record_control(state, request, :termination_pending, evidence, attempt_id: attempt)
+
+    # Operator-held: blocked (and still claimed) so the dispatch poller does
+    # not silently redispatch — TERMINATE alone never implies RELAUNCH. This
+    # runs synchronously with the stop, before the task's DOWN is processed,
+    # so the DOWN finds no running entry and no retry/park decision fires.
+    state = block_issue_from_entry(state, request.issue_id, entry, "terminated by operator control (control_id=#{receipt.control_id})")
+
+    # The abrupt stop cannot run the agent task's shutdown path (the
+    # after-block that publishes :worker_termination dies with the task), so
+    # a detached watcher collects the attempt-bound termination evidence and
+    # the receipt is finalized in handle_info. The GenServer never blocks.
+    spawn_control_evidence_watch(self(), receipt.control_id, request.issue_id, attempt, evidence)
+
+    {{:ok, receipt}, state}
+  end
+
+  # RELAUNCH = the orchestrator's existing "start replacement attempt"
+  # semantic (the retry envelope with tracker revalidation), gated on
+  # confirmed termination evidence bound to the CURRENT attempt. Duplicate
+  # relaunches collapse on the existing retry schedule; a still-running
+  # worker is never raced.
+  defp control_relaunch(state, request) do
+    cond do
+      Map.has_key?(state.running, request.issue_id) ->
+        running_attempt = state.running |> Map.get(request.issue_id) |> Map.get(:retry_attempt)
+
+        {receipt, state} =
+          record_control(state, request, :rejected_worker_still_running, %{running_attempt_id: running_attempt}, attempt_id: running_attempt)
+
+        {{:ok, receipt}, state}
+
+      Map.has_key?(state.retry_attempts, request.issue_id) ->
+        # Idempotent bound: a replacement is already scheduled on the retry
+        # envelope; relaunch collapses onto it.
+        scheduled = Map.get(state.retry_attempts, request.issue_id)
+
+        {receipt, state} =
+          record_control(state, request, :already_scheduled, %{scheduled_retry_attempt: Map.get(scheduled, :attempt)}, attempt_id: resolve_current_attempt(state, request.issue_id))
+
+        {{:ok, receipt}, state}
+
+      true ->
+        control_relaunch_after_termination(state, request)
+    end
+  end
+
+  defp control_relaunch_after_termination(state, request) do
+    issue_id = request.issue_id
+    current_attempt = resolve_current_attempt(state, issue_id)
+
+    cond do
+      is_nil(current_attempt) ->
+        deny_relaunch(state, request, nil, :rejected_no_terminated_attempt, %{
+          requirement: :confirmed_terminate_receipt_for_current_attempt,
+          current_attempt_id: nil
+        })
+
+      request.attempt_id != :current and request.attempt_id != current_attempt ->
+        # An older attempt's receipt can never authorize a newer attempt, and
+        # a superseded lineage must not be resurrected: only the current
+        # attempt is relaunchable.
+        deny_relaunch(state, request, current_attempt, :rejected_stale_attempt, %{
+          current_attempt_id: current_attempt,
+          requested_attempt_id: request.attempt_id
+        })
+
+      true ->
+        case current_attempt_terminate_receipt(state, issue_id, current_attempt) do
+          nil ->
+            deny_relaunch(state, request, current_attempt, :rejected_no_terminated_attempt, %{
+              requirement: :confirmed_terminate_receipt_for_current_attempt,
+              current_attempt_id: current_attempt
+            })
+
+          prior_receipt when prior_receipt.outcome != :terminated ->
+            # The current attempt's termination is unconfirmed (or still
+            # pending): fail closed, preserving claim/workspace.
+            deny_relaunch(state, request, current_attempt, :rejected_no_terminated_attempt, %{
+              requirement: :confirmed_terminate_receipt_for_current_attempt,
+              current_attempt_id: current_attempt,
+              prior_terminate_control_id: prior_receipt.control_id,
+              prior_outcome: prior_receipt.outcome,
+              reason: :termination_unconfirmed
+            })
+
+          prior_receipt ->
+            case control_relaunch_gate(prior_receipt) do
+              {:denied, denial_reason} ->
+                deny_relaunch(state, request, current_attempt, :rejected_no_terminated_attempt, %{
+                  requirement: :confirmed_terminate_receipt_for_current_attempt,
+                  current_attempt_id: current_attempt,
+                  prior_terminate_control_id: prior_receipt.control_id,
+                  reason: denial_reason
+                })
+
+              :allowed ->
+                schedule_control_relaunch(state, request, prior_receipt, current_attempt)
+            end
+        end
+    end
+  end
+
+  # F1 fail-closed ladder for a managed attempt's relaunch. The receipt-backed
+  # fence verdict must positively prove the OS worker tree dead before the
+  # MIC-223 gate is consulted: :alive and :unknown deny, {:ok, :dead} falls
+  # through to the existing reuse_gate. (For receipt-verified identities the
+  # fence returns dead/unknown only — the wrapper writes its receipt at exit —
+  # the :alive branch is retained as fail-closed defense.) Non-managed
+  # expectations have no containment obligation and skip the ladder.
+  defp control_relaunch_gate(prior_receipt) do
+    evidence = prior_receipt.evidence
+
+    if Map.get(evidence, :termination_expectation) == :MANAGED_CONFIRMATION_REQUIRED do
+      case WorkerFence.confirm_termination_receipt(Map.get(evidence, :worker_identity)) do
+        {:ok, :dead} -> :allowed
+        {:error, :alive} -> {:denied, :worker_fence_alive}
+        {:error, :unknown} -> {:denied, :worker_fence_unknown}
+      end
+    else
+      :allowed
+    end
+  end
+
+  defp deny_relaunch(state, request, attempt_id, outcome, evidence) do
+    {receipt, state} = record_control(state, request, outcome, evidence, attempt_id: attempt_id)
+    {{:ok, receipt}, state}
+  end
+
+  defp schedule_control_relaunch(state, request, prior_receipt, current_attempt) do
+    evidence = prior_receipt.evidence
+    next_attempt = if is_integer(current_attempt) and current_attempt > 0, do: current_attempt + 1, else: nil
+
+    # MIC-223 gate, re-evaluated at relaunch time from the receipt's
+    # attempt-bound termination evidence: this is the only path to
+    # schedule_issue_retry, and it fails closed on anything but the gate's
+    # own :allowed — the operator hold is released only once the gate has
+    # allowed workspace reuse.
+    case WorkerContainment.reuse_gate(Map.get(evidence, :worker_termination), Map.get(evidence, :termination_expectation)) do
+      :allowed ->
+        metadata = %{
+          identifier: Map.get(evidence, :identifier) || request.issue_id,
+          issue_url: Map.get(evidence, :issue_url),
+          error: "relaunched by operator control (control_id=#{prior_receipt.control_id})",
+          worker_host: Map.get(evidence, :worker_host),
+          workspace_path: Map.get(evidence, :workspace_path),
+          workspace_root: Map.get(evidence, :workspace_root)
+        }
+
+        # Narrow hold release for operator relaunch: unlike release_issue_claim/2
+        # it preserves the MIC-195 failure sequence, durable records, and
+        # envelope — the scheduled retry rides the existing machinery untouched.
+        state = release_control_hold(state, request.issue_id)
+        state = schedule_issue_retry(state, request.issue_id, next_attempt, metadata)
+        # The envelope resolved the replacement attempt (nil delegates to the
+        # existing retry schedule); the receipt reports what was scheduled.
+        replacement = state.retry_attempts |> Map.get(request.issue_id) |> Map.get(:attempt)
+
+        {receipt, state} =
+          record_control(
+            state,
+            request,
+            :relaunch_scheduled,
+            %{
+              prior_terminate_control_id: prior_receipt.control_id,
+              resolved_attempt_id: current_attempt,
+              replacement_retry_attempt: replacement,
+              reuse_gate: :allowed
+            },
+            attempt_id: current_attempt
+          )
+
+        {{:ok, receipt}, state}
+
+      {:blocked, :worker_termination_unconfirmed} ->
+        # Unreachable while the ledger is consistent (finalization marks a
+        # receipt :terminated only under an :allowed gate) — kept fail closed:
+        # the operator hold stays in place, claim and workspace untouched.
+        deny_relaunch(state, request, current_attempt, :rejected_no_terminated_attempt, %{
+          requirement: :confirmed_terminate_receipt_for_current_attempt,
+          current_attempt_id: current_attempt,
+          prior_terminate_control_id: prior_receipt.control_id,
+          reason: :worker_termination_unconfirmed
+        })
+    end
+  end
+
+  # ── CONTROL receipt bookkeeping ────────────────────────────────────────────
+
+  # F2 repair: `:current` resolves the current/latest authoritative attempt
+  # and then binds evidence to THAT attempt only. It never searches the
+  # ledger backwards for the newest successful receipt.
+  defp resolve_current_attempt(state, issue_id) do
+    cond do
+      entry = Map.get(state.running, issue_id) ->
+        Map.get(entry, :retry_attempt)
+
+      entry = Map.get(state.blocked, issue_id) ->
+        Map.get(entry, :retry_attempt)
+
+      true ->
+        nil
+    end
+  end
+
+  # The current attempt's own terminate receipt — exact issue + attempt match,
+  # no backwards search over other attempts' outcomes. Within the attempt the
+  # ledger is newest-first, so the LATEST terminate record for this attempt is
+  # authoritative: a later rejection never resurrects an earlier confirmation.
+  defp current_attempt_terminate_receipt(state, issue_id, attempt_id) do
+    Enum.find(state.control_ledger, fn receipt ->
+      receipt.action == :terminate and receipt.issue_id == issue_id and receipt.attempt_id == attempt_id
+    end)
+  end
+
+  defp find_pending_control_receipt(state, control_id, issue_id, attempt_id) do
+    Enum.find(state.control_ledger, fn receipt ->
+      receipt.action == :terminate and receipt.control_id == control_id and receipt.issue_id == issue_id and
+        receipt.attempt_id == attempt_id and receipt.outcome == :termination_pending
+    end)
+  end
+
+  defp replace_control_receipt(state, finalized) do
+    ledger =
+      Enum.map(state.control_ledger, fn receipt ->
+        if receipt.control_id == finalized.control_id, do: finalized, else: receipt
+      end)
+
+    %{state | control_ledger: ledger}
+  end
+
+  defp stale_attempt_request?(:current, _running_attempt), do: false
+  defp stale_attempt_request?(attempt_id, running_attempt), do: attempt_id != running_attempt
+
+  # Observability binding for receipts: :current resolves against the running
+  # worker when one exists; an explicit number is recorded verbatim.
+  defp resolve_target_attempt_id(state, request) do
+    case Map.get(state.running, request.issue_id) do
+      %{retry_attempt: attempt_id} ->
+        if request.attempt_id == :current, do: attempt_id, else: request.attempt_id
+
+      _ ->
+        if request.attempt_id == :current, do: nil, else: request.attempt_id
+    end
+  end
+
+  # Bounded detached evidence watcher: waits for the MIC-223 wrapper receipt
+  # of the stopped attempt (only for managed expectations), classifies it
+  # through WorkerContainment's own parser/classifier, and reports the
+  # confirmation back through handle_info. Never raises into the orchestrator;
+  # any unexpected failure reports an unconfirmed verdict (fail closed).
+  defp spawn_control_evidence_watch(server, control_id, issue_id, attempt_id, evidence) do
+    spawn(fn ->
+      confirmation =
+        try do
+          control_termination_confirmation(evidence)
+        rescue
+          _error -> %{status: :TERMINATION_UNCONFIRMED, receipt: nil, exit_code: nil, reason: :control_evidence_watch_error}
+        end
+
+      send(server, {:control_termination_evidence, control_id, issue_id, attempt_id, confirmation})
+    end)
+
+    :ok
+  end
+
+  # The confirmation for the stopped attempt, derived ONLY from the
+  # attempt's MIC-223 evidence class:
+  #   - managed: wait (bounded) for the wrapper receipt, then classify it;
+  #   - NEVER_STARTED / NOT_APPLICABLE: no termination confirmation exists or
+  #     is required (nil — the gate's accepted semantics for these classes);
+  #   - anything else: fail closed.
+  defp control_termination_confirmation(evidence) do
+    case Map.get(evidence, :termination_expectation) do
+      :MANAGED_CONFIRMATION_REQUIRED -> await_managed_receipt_confirmation(Map.get(evidence, :worker_identity))
+      :NEVER_STARTED -> nil
+      :NOT_APPLICABLE -> nil
+      _other -> %{status: :TERMINATION_UNCONFIRMED, receipt: nil, exit_code: nil, reason: :unknown_termination_expectation}
+    end
+  end
+
+  defp await_managed_receipt_confirmation(identity) do
+    # The deadline is fixed once, before polling: recomputing it inside the
+    # loop would push it forward every iteration and the bounded wait would
+    # never end.
+    await_managed_receipt_confirmation(identity, control_evidence_deadline())
+  end
+
+  defp await_managed_receipt_confirmation(identity, deadline) do
+    cond do
+      confirmation = managed_receipt_confirmation(identity) ->
+        confirmation
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        %{status: :TERMINATION_UNCONFIRMED, receipt: nil, exit_code: nil, reason: :control_termination_evidence_timeout}
+
+      true ->
+        Process.sleep(@control_evidence_poll_ms)
+        await_managed_receipt_confirmation(identity, deadline)
+    end
+  end
+
+  # Reuses WorkerContainment's own receipt parser and classifier — the same
+  # evidence path the natural shutdown confirmation uses; no second
+  # termination classifier exists.
+  defp managed_receipt_confirmation(nil),
+    do: %{status: :TERMINATION_UNCONFIRMED, receipt: nil, exit_code: nil, reason: :no_worker_identity}
+
+  defp managed_receipt_confirmation(identity) do
+    case WorkerContainment.parse_receipt(Map.get(identity, "receipt_path")) do
+      {:ok, receipt} ->
+        %{
+          status: WorkerContainment.classify_receipt(receipt),
+          receipt: receipt,
+          exit_code: receipt["child_exit_code"],
+          reason: receipt["terminal_reason"]
+        }
+
+      {:error, _reason} ->
+        nil
+    end
+  end
+
+  defp control_evidence_deadline do
+    System.monotonic_time(:millisecond) + control_evidence_budget_ms()
+  end
+
+  defp control_evidence_budget_ms do
+    case Application.get_env(:symphony_elixir, @control_evidence_budget_env) do
+      ms when is_integer(ms) and ms >= 0 ->
+        ms
+
+      _other ->
+        hard_budget = Application.get_env(:symphony_elixir, :worker_termination_hard_budget_ms, 20_000)
+        WorkerContainment.grace_ms() + hard_budget
+    end
+  end
+
+  # Narrow hold release for operator relaunch: unlike release_issue_claim/2 it
+  # preserves the MIC-195 failure sequence, durable records, and envelope —
+  # the scheduled retry rides the existing machinery untouched.
+  defp release_control_hold(%State{} = state, issue_id) do
+    %{state | claimed: MapSet.delete(state.claimed, issue_id), blocked: Map.delete(state.blocked, issue_id)}
+  end
+
+  defp issue_url_from_entry(entry) do
+    case Map.get(entry, :issue) do
+      %Issue{} = issue -> issue.url
+      _other -> nil
+    end
+  end
+
+  @spec record_control(%State{}, map(), term(), map(), keyword()) :: {map(), %State{}}
+  defp record_control(state, request, outcome, evidence, overrides \\ []) do
+    now = DateTime.utc_now()
+
+    receipt = %{
+      control_id: new_control_id(),
+      action: Map.get(request, :action),
+      issue_id: overrides[:issue_id] || Map.get(request, :issue_id),
+      attempt_id: overrides[:attempt_id],
+      requested_at: now,
+      requested_by: Map.get(request, :requested_by, :host_operator),
+      completed_at: now,
+      outcome: outcome,
+      evidence: evidence
+    }
+
+    Logger.info(
+      "Control receipt: control_id=#{receipt.control_id} action=#{inspect(receipt.action)} outcome=#{inspect(outcome)} " <>
+        "issue_id=#{inspect(receipt.issue_id)} attempt_id=#{inspect(receipt.attempt_id)} requested_by=#{inspect(receipt.requested_by)}"
+    )
+
+    {receipt, %{state | control_ledger: Enum.take([receipt | state.control_ledger], @control_ledger_limit)}}
+  end
+
+  defp new_control_id, do: "ctl-" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil
