@@ -55,10 +55,11 @@ defmodule SymphonyElixir.LaneLeaseTest do
 
     persisted = raw_lease(root)
 
-    for field <- ~w(lane_id lane_kind issue_id owner_token owner_id worktree_path branch accepted_sha base_sha created_at heartbeat_at) do
+    for field <- ~w(lane_id lane_kind issue_id owner_token owner_id worktree_path workspace_root branch accepted_sha base_sha created_at heartbeat_at) do
       assert is_binary(Map.fetch!(persisted, field)) and Map.fetch!(persisted, field) != "", "field #{field}"
     end
 
+    assert persisted["workspace_root"] == root
     assert persisted["accepted_sha"] == String.duplicate("a", 40)
     assert persisted["base_sha"] == String.duplicate("b", 40)
   end
@@ -152,7 +153,8 @@ defmodule SymphonyElixir.LaneLeaseTest do
     File.mkdir_p!(LaneLease.lanes_dir(root))
 
     # a) truncated mid-write payload (valid JSON prefix, invalid JSON)
-    full = Jason.encode!(LaneLease.build_lease(claim_attrs()), pretty: true)
+    # (build_lease requires :workspace_root; claim/2 injects it from its own root argument)
+    full = Jason.encode!(LaneLease.build_lease(Map.put(claim_attrs(), :workspace_root, root)), pretty: true)
     File.write!(path, binary_part(full, 0, div(byte_size(full), 2)))
     assert {:error, {:lease_state_invalid, :corrupt_state}} = LaneLease.claim(root, claim_attrs(%{owner_id: "executor-b"}))
 
@@ -165,7 +167,7 @@ defmodule SymphonyElixir.LaneLeaseTest do
     assert {:error, {:lease_state_invalid, :schema_invalid}} = LaneLease.claim(root, claim_attrs(%{owner_id: "executor-b"}))
 
     # d) full-format lease naming a different lane parked at this lane's path
-    foreign = LaneLease.build_lease(claim_attrs(%{issue_id: "MIC-OTHER"}))
+    foreign = LaneLease.build_lease(Map.put(claim_attrs(%{issue_id: "MIC-OTHER"}), :workspace_root, root))
     File.write!(path, Jason.encode!(foreign, pretty: true))
     assert {:error, {:lease_state_invalid, :lane_mismatch}} = LaneLease.claim(root, claim_attrs(%{owner_id: "executor-b"}))
     assert {:error, {:lease_state_invalid, :lane_mismatch}} = LaneLease.inspect(root, @kind, @issue)
@@ -533,20 +535,15 @@ defmodule SymphonyElixir.LaneLeaseTest do
       git!(repo, ["-c", "user.name=lane-test", "-c", "user.email=lane@test", "commit", "-m", "accepted"])
       accepted = rev(repo)
 
-      lease =
-        LaneLease.build_lease(%{
-          issue_id: @issue,
-          owner_id: "executor-a",
-          worktree_path: repo,
-          branch: "symphony/delivery-mic-999",
-          accepted_sha: accepted,
-          base_sha: base
-        })
+      # the delivery gate requires a claimed lane: an authoritative lease file must exist
+      binding = %{worktree_path: repo, branch: "symphony/delivery-mic-999", accepted_sha: accepted, base_sha: base}
+      {:ok, lease} = LaneLease.claim(root, claim_attrs(Map.merge(%{owner_id: "executor-a"}, binding)))
 
-      {:ok, repo: repo, lease: lease, base: base, accepted: accepted}
+      {:ok, repo: repo, lease: lease, base: base, accepted: accepted, binding: binding}
     end
 
-    test "matching live state verifies clean", %{lease: lease} do
+    # required: current owner + valid git -> :ok
+    test "matching live state verifies clean for the current owner", %{lease: lease} do
       assert :ok = LaneLease.verify_live_state(lease)
       assert :ok = LaneLease.verify_live_state(lease, accepted_sha: lease["accepted_sha"])
       assert :ok = LaneLease.verify_live_state(lease, require_accepted_in_head: true)
@@ -569,6 +566,128 @@ defmodule SymphonyElixir.LaneLeaseTest do
       git!(repo, ["-c", "user.name=lane-test", "-c", "user.email=lane@test", "commit", "-m", "orphan"])
       assert {:error, {:binding_mismatch, fields}} = LaneLease.verify_live_state(%{lease | "base_sha" => base})
       assert "base_sha" in fields
+    end
+
+    # MANDATORY orphan-owner reproduction: explicit recovery removes A's lease, B claims the
+    # same logical lane with the same git binding, A still holds the stale lease struct —
+    # A's delivery verification must be denied while B's passes.
+    test "orphaned owner fails delivery verification after recovery reassigns the lane", %{
+      root: root,
+      lease: lease_a,
+      binding: binding
+    } do
+      assert {:ok, _} =
+               LaneLease.force_release(root, @kind, @issue,
+                 confirm: true,
+                 reason: "operator: owner host lost mid-delivery",
+                 force_active: true
+               )
+
+      assert {:ok, lease_b} = LaneLease.claim(root, claim_attrs(Map.merge(%{owner_id: "executor-b"}, binding)))
+
+      assert {:error, :not_owner} = LaneLease.verify_live_state(lease_a)
+      assert {:error, :not_owner} = LaneLease.verify_live_state(lease_a, require_accepted_in_head: true)
+      assert :ok = LaneLease.verify_live_state(lease_b)
+      assert :ok = LaneLease.verify_live_state(lease_b, require_accepted_in_head: true)
+    end
+
+    # ownership-first ordering: a missing authoritative lease is reported even when the git
+    # state is also wrong — ownership is authorization, git checks never run without it
+    test "verification fails closed when the lease file is missing", %{root: root, repo: repo, lease: lease} do
+      assert :ok = LaneLease.release(root, @kind, @issue, lease["owner_token"])
+
+      git!(repo, ["checkout", "main"])
+
+      assert {:error, :lease_missing} = LaneLease.verify_live_state(lease)
+      assert {:error, :lease_missing} = LaneLease.verify_live_state(lease, require_accepted_in_head: true)
+    end
+
+    test "verification fails closed on a corrupt authoritative lease", %{root: root, lease: lease} do
+      File.write!(LaneLease.lease_path(root, @kind, @issue), "not json{{{")
+      assert {:error, {:lease_state_invalid, :corrupt_state}} = LaneLease.verify_live_state(lease)
+    end
+
+    test "verification fails closed on an ambiguous lease schema", %{root: root, lease: lease} do
+      path = LaneLease.lease_path(root, @kind, @issue)
+      File.write!(path, Jason.encode!(%{"schema_version" => 2, "lane_id" => "delivery:#{@issue}"}))
+      assert {:error, {:lease_state_invalid, :ambiguous_state}} = LaneLease.verify_live_state(lease)
+    end
+
+    # verification is read-only: the authoritative lease (and the op-lock) must be untouched
+    # afterwards, and the owner remains valid for renew/release
+    test "verification mutates nothing and leaves the current owner valid", %{root: root, lease: lease} do
+      path = LaneLease.lease_path(root, @kind, @issue)
+      before = File.read!(path)
+
+      assert :ok = LaneLease.verify_live_state(lease, require_accepted_in_head: true)
+
+      assert File.read!(path) == before
+      refute File.exists?(Path.join(LaneLease.lanes_dir(root), "delivery_mic-999.op-lock"))
+      assert {:ok, _} = LaneLease.renew(root, @kind, @issue, lease["owner_token"])
+      assert {:ok, _} = LaneLease.inspect(root, @kind, @issue)
+    end
+
+    # deterministic-barrier race: verification and an explicit force_active recovery race for
+    # the per-lane op-lock (probe uses lock_timeout_ms: 0, so whoever acquires first wins
+    # outright). Both interleavings must be safe: if verification holds the lock first, the
+    # recovery is excluded and A finishes :ok as the still-authoritative owner; if recovery
+    # wins, A's verification must be denied once the lane is reassigned to B. Forbidden is
+    # exactly: B authoritative AND A :ok.
+    test "concurrent recovery cannot let an orphaned owner pass delivery verification", %{
+      root: root,
+      repo: repo,
+      base: base,
+      accepted: accepted
+    } do
+      for round <- 1..15 do
+        issue = "MIC-C7-#{round}"
+        binding = %{worktree_path: repo, branch: "symphony/delivery-mic-999", accepted_sha: accepted, base_sha: base}
+        {:ok, lease_a} = LaneLease.claim(root, claim_attrs(Map.merge(%{issue_id: issue, owner_id: "executor-a"}, binding)))
+
+        probe =
+          Task.async(fn ->
+            LaneLease.force_release(root, @kind, issue,
+              confirm: true,
+              reason: "operator: race probe",
+              force_active: true,
+              lock_timeout_ms: 0
+            )
+          end)
+
+        verify_a = LaneLease.verify_live_state(lease_a)
+        probe_result = Task.await(probe)
+
+        case probe_result do
+          {:error, {:lease_op_lock_unavailable, :timeout}} ->
+            # verification owned the lock first: recovery never interleaved, A stayed
+            # authoritative through the whole check
+            assert verify_a == :ok, "round #{round}"
+
+            assert {:ok, _} =
+                     LaneLease.force_release(root, @kind, issue,
+                       confirm: true,
+                       reason: "operator: race probe",
+                       force_active: true
+                     )
+
+            assert {:ok, lease_b} = LaneLease.claim(root, claim_attrs(Map.merge(%{issue_id: issue, owner_id: "executor-b"}, binding)))
+            assert :ok = LaneLease.verify_live_state(lease_b), "round #{round}"
+            assert {:error, :not_owner} = LaneLease.verify_live_state(lease_a), "round #{round}"
+
+          {:ok, _record} ->
+            # recovery completed without ever contending with verification's critical
+            # section: either it truly won the lock (A denied) or it ran entirely after A's
+            # check finished while A was still authoritative (safe, per the brief). Either
+            # way, once B claims, A must be denied and B must pass.
+            assert verify_a in [:ok, {:error, :lease_missing}], "round #{round}"
+            assert {:ok, lease_b} = LaneLease.claim(root, claim_attrs(Map.merge(%{issue_id: issue, owner_id: "executor-b"}, binding)))
+            assert :ok = LaneLease.verify_live_state(lease_b), "round #{round}"
+            assert {:error, :not_owner} = LaneLease.verify_live_state(lease_a), "round #{round}"
+
+          other ->
+            flunk("round #{round}: unexpected recovery probe result: #{inspect(other)}")
+        end
+      end
     end
 
     test "observe_worktree reports branch and HEAD", %{repo: repo, lease: lease} do

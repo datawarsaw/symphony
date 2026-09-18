@@ -26,7 +26,12 @@ defmodule SymphonyElixir.LaneLease do
   targeted lease was verified absent after removal.
 
   Executor cycle: `claim/2` → `renew/4` periodically (heartbeat) →
-  `verify_live_state/2` immediately before push/PR → `release/4`.
+  `verify_live_state/2` immediately before push/PR → `release/4`. Delivery authorization is
+  **current ownership plus Git binding**: `verify_live_state/2` re-reads the authoritative
+  lane file under the per-lane operation lock and succeeds only if the caller's token is
+  still the lane's current owner token AND the live Git state matches the lease binding.
+  Possession of an in-memory lease struct from an earlier `claim/2` is never authority on
+  its own — recovery may have reassigned the lane.
   Changing the accepted artifact requires `release/4` (or operator `force_release/4`) and a
   fresh claim; `renew/4` can never move `accepted_sha`, `branch`, `worktree_path`, or `base_sha`.
 
@@ -40,7 +45,7 @@ defmodule SymphonyElixir.LaneLease do
   @default_abandoned_after_seconds 12 * 60 * 60
   @default_op_lock_timeout_ms 5_000
   @op_lock_poll_ms 5
-  @required_fields ~w(lane_id lane_kind issue_id owner_token owner_id worktree_path branch accepted_sha base_sha created_at heartbeat_at)
+  @required_fields ~w(lane_id lane_kind issue_id owner_token owner_id worktree_path workspace_root branch accepted_sha base_sha created_at heartbeat_at)
   # Private deterministic-test seam (per-process, unset in production): override for the
   # destructive removal inside force_release/4. Deliberately not a general filesystem hook.
   @force_rm_test_hook :"$lane_lease_force_rm_hook"
@@ -76,11 +81,14 @@ defmodule SymphonyElixir.LaneLease do
   @doc """
   Builds a normalized lease payload from claim attributes. Randomizes `owner_token`;
   whitelists fields so claimants cannot smuggle `lane_id`, `owner_token`, or timestamps.
+  `workspace_root` records the state root the lease lives under, so a lease struct can
+  always locate its own authoritative lane file (see `verify_live_state/2`).
   """
   @spec build_lease(%{
           required(:issue_id) => issue_id(),
           required(:owner_id) => String.t(),
           required(:worktree_path) => String.t(),
+          required(:workspace_root) => String.t(),
           required(:branch) => String.t(),
           required(:accepted_sha) => String.t(),
           required(:base_sha) => String.t(),
@@ -98,6 +106,7 @@ defmodule SymphonyElixir.LaneLease do
       "owner_token" => new_owner_token(),
       "owner_id" => Map.fetch!(attrs, :owner_id),
       "worktree_path" => Map.fetch!(attrs, :worktree_path),
+      "workspace_root" => Map.fetch!(attrs, :workspace_root),
       "branch" => Map.fetch!(attrs, :branch),
       "accepted_sha" => Map.fetch!(attrs, :accepted_sha),
       "base_sha" => Map.fetch!(attrs, :base_sha),
@@ -121,7 +130,9 @@ defmodule SymphonyElixir.LaneLease do
           | {:error, {:lease_op_lock_unavailable, term()}}
           | {:error, :invalid_attrs}
   def claim(workspace_root, attrs) do
-    with {:ok, lease} <- validate_claim_attrs(attrs),
+    # The state root is injected from the claim itself, never taken from caller attrs:
+    # the persisted lease must describe the root it was written under.
+    with {:ok, lease} <- attrs |> Map.put(:workspace_root, workspace_root) |> validate_claim_attrs(),
          :ok <- File.mkdir_p(lanes_dir(workspace_root)) do
       path = lease_path(workspace_root, lease["lane_kind"], lease["issue_id"])
       payload = Jason.encode!(lease, pretty: true)
@@ -266,8 +277,10 @@ defmodule SymphonyElixir.LaneLease do
   override.
 
   Destructive recovery runs under a per-lane operation lock shared with `claim/2`,
-  `renew/4`, and `release/4`, so a new owner's lease can never be destroyed by a recovery
-  that started earlier. The prior state (or the corrupt raw bytes) is preserved to
+  `renew/4`, `release/4`, and the `verify_live_state/2` authorization gate, so a new owner's
+  lease can never be destroyed by a recovery
+  that started earlier, and ownership cannot change under an in-progress delivery
+  verification. The prior state (or the corrupt raw bytes) is preserved to
   `<safe-lane>.recovery.json` before removal; the removal result is checked and the lane is
   re-read afterwards: success is returned only when the targeted lease is verifiably gone.
   A surviving lease (same, replacement, or corrupt) or a failed removal fails closed.
@@ -339,14 +352,66 @@ defmodule SymphonyElixir.LaneLease do
   end
 
   @doc """
-  Re-checks that live Git state still matches the lease: worktree path, branch, and that the
-  leased `base_sha` is an ancestor of HEAD. Options: `:worktree_path` (observe an explicit
-  path), `:accepted_sha` (assert the artifact being pushed is the leased one),
-  `:require_accepted_in_head` (accepted SHA must be an ancestor of HEAD — the pre-push gate).
+  Delivery authorization gate: succeeds only if the caller is **still the current
+  authoritative owner** of the lane AND the live Git state matches the lease binding. Both
+  conditions are mandatory; ownership is checked first and a failed ownership check never
+  falls through to the Git checks.
+
+  The authoritative lane file is re-read under the per-lane operation lock (the same lock
+  held by `claim/2`, `renew/4`, `release/4`, and `force_release/4`), so no recovery, renew,
+  release, or competing claim can change ownership between the owner verification and the
+  `:ok` return. The check is read-only: the lease file is never mutated. Lane identity is
+  re-validated by the standard decode path, and the caller's `owner_token` must equal the
+  current file's token — a lease struct retained from an earlier `claim/2` is not authority.
+
+  Ownership failures: missing lease → `{:error, :lease_missing}`; another owner →
+  `{:error, :not_owner}`; corrupt/ambiguous/schema-invalid/unreadable state → the standard
+  `{:error, {:lease_state_invalid, _}}` conventions; contended or broken operation lock →
+  `{:error, {:lease_op_lock_unavailable, reason}}` — all fail closed before any Git check.
+
+  Git checks (unchanged): worktree path, branch, leased `base_sha` is an ancestor of HEAD,
+  optional `:accepted_sha` assertion, and — with `require_accepted_in_head: true` — the
+  leased `accepted_sha` in HEAD (the pre-push gate).
+  Options: `:worktree_path` (observe an explicit path), `:accepted_sha`,
+  `:require_accepted_in_head`, `:lock_timeout_ms` (default #{@default_op_lock_timeout_ms}ms).
   """
   @spec verify_live_state(lease(), keyword()) ::
-          :ok | {:error, {:binding_mismatch, [String.t()]}} | {:error, {:git_failed, String.t()}}
+          :ok
+          | {:error, :lease_missing}
+          | {:error, :not_owner}
+          | {:error, read_error()}
+          | {:error, {:lease_op_lock_unavailable, term()}}
+          | {:error, {:binding_mismatch, [String.t()]}}
+          | {:error, {:git_failed, String.t()}}
   def verify_live_state(lease, opts \\ []) when is_map(lease) do
+    workspace_root = Map.fetch!(lease, "workspace_root")
+    lane_kind = Map.fetch!(lease, "lane_kind")
+    issue_id = Map.fetch!(lease, "issue_id")
+
+    if File.dir?(lanes_dir(workspace_root)) do
+      with_op_lock(workspace_root, lane_kind, issue_id, lock_timeout(opts), fn ->
+        with :ok <- verify_current_owner(workspace_root, lane_kind, issue_id, lease["owner_token"]) do
+          verify_git_state(lease, opts)
+        end
+      end)
+    else
+      {:error, :lease_missing}
+    end
+  end
+
+  # Authorization half of the delivery gate, run under the lane's operation lock: the
+  # authoritative file must exist, decode as this lane, and carry the caller's token.
+  defp verify_current_owner(workspace_root, lane_kind, issue_id, owner_token) do
+    case read_lease(workspace_root, lane_kind, issue_id) do
+      {:ok, current} -> authorize(current, owner_token)
+      {:error, :not_found} -> {:error, :lease_missing}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Git half of the delivery gate: unchanged binding checks (worktree path, branch, base_sha
+  # ancestry, accepted_sha assertions) against the observed worktree.
+  defp verify_git_state(lease, opts) do
     worktree_path = Keyword.get(opts, :worktree_path) || Map.fetch!(lease, "worktree_path")
 
     with {:ok, observed} <- observe_worktree(worktree_path) do
@@ -495,9 +560,10 @@ defmodule SymphonyElixir.LaneLease do
     end
   end
 
-  # Per-lane mutual exclusion over lease mutation: claim, renew, release, and destructive
-  # operator recovery all hold this lock across their read-modify-write. Acquired via the
-  # same atomic exclusive-create primitive as the initial claim. Bounded wait, fail-closed.
+  # Per-lane mutual exclusion: claim, renew, release, destructive operator recovery, and the
+  # read-only verify_live_state authorization gate all hold this lock across their
+  # read-(modify-)write. Acquired via the same atomic exclusive-create primitive as the
+  # initial claim. Bounded wait, fail-closed.
   defp with_op_lock(workspace_root, lane_kind, issue_id, timeout_ms, fun) do
     path = op_lock_path(workspace_root, lane_kind, issue_id)
     deadline = System.monotonic_time(:millisecond) + timeout_ms
@@ -668,7 +734,7 @@ defmodule SymphonyElixir.LaneLease do
   end
 
   defp validate_claim_attrs(attrs) do
-    required = [:issue_id, :owner_id, :worktree_path, :branch, :accepted_sha, :base_sha]
+    required = [:issue_id, :owner_id, :worktree_path, :workspace_root, :branch, :accepted_sha, :base_sha]
     lane_kind = Map.get(attrs, :lane_kind, "delivery")
 
     if Enum.all?(required, fn f -> is_binary(Map.get(attrs, f)) and Map.get(attrs, f) != "" end) and

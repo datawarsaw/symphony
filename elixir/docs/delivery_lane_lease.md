@@ -21,7 +21,10 @@ produce exactly one winner; every loser gets `{:error, {:lease_held, evidence}}`
 equivalent fail-closed error. A lost claim is always visible, never silent.
 
 The lease persists the full binding: `issue_id`, `lane_kind`, `owner_id`, `owner_token`,
-`worktree_path`, `branch`, `accepted_sha`, `base_sha`, `created_at`, `heartbeat_at`.
+`worktree_path`, `workspace_root`, `branch`, `accepted_sha`, `base_sha`, `created_at`,
+`heartbeat_at`. `workspace_root` records the state root the lease was written under, so a
+lease struct can always locate its own authoritative lane file — `claim/2` injects it from
+its own root argument; claimants cannot smuggle a different one.
 
 ## What the lease does NOT protect
 
@@ -50,12 +53,26 @@ classification informs humans and tooling; it never grants authority.
 1. `claim/2` before touching the worktree, branch, or `_build`. On
    `{:error, {:lease_held, evidence}}`, stop: the lane is owned; surface the evidence.
 2. `renew/4` periodically as the heartbeat while the delivery run continues.
-3. `verify_live_state/2` immediately before push/PR/merge: it re-reads live Git state
-   (`observe_worktree/1`) and checks worktree path, branch, that the leased `base_sha`
-   is still an ancestor of HEAD, and — with `require_accepted_in_head: true` — that the
-   leased `accepted_sha` is actually in HEAD (the pre-push gate). `verify_binding/2` is the
-   pure field-comparison helper underneath it.
-4. `release/4` when done. Idempotent for the owner; a foreign token is always refused.
+3. `verify_live_state/2` immediately before the delivery action: it verifies **current
+   ownership plus the Git binding, in that order**, under the per-lane operation lock.
+   The authoritative lane file is re-read, the lane identity is re-validated, and the
+   caller's `owner_token` must match the file's current token — only then are the live
+   Git checks performed: worktree path, branch, that the leased `base_sha` is still an
+   ancestor of HEAD, and — with `require_accepted_in_head: true` — that the leased
+   `accepted_sha` is actually in HEAD (the pre-push gate). `verify_binding/2` is the
+   pure field-comparison helper underneath the Git half.
+4. `push / PR / merge` — only after a `:ok` from step 3.
+5. `release/4` when done. Idempotent for the owner; a foreign token is always refused.
+
+**Possession of a lease struct is not authority.** The struct from an earlier `claim/2`
+proves what was claimed, not who owns the lane now. If operator recovery has reassigned
+the lane, the stale holder's `verify_live_state/2` fails closed with
+`{:error, :not_owner}` (or `{:error, :lease_missing}` when no lease exists) and no
+delivery action may follow; a corrupt or ambiguous authoritative lease fails closed with
+the standard `{:error, {:lease_state_invalid, _}}` errors before any Git check. Because
+the whole gate runs under the same per-lane operation lock as `claim/2`, `renew/4`,
+`release/4`, and `force_release/4`, ownership cannot change between the ownership check
+and the `:ok` return, and the check itself mutates nothing.
 
 Binding fields are immutable while held: `renew/4` carries no binding arguments, and a
 second `claim/2` on a held lane fails. Changing the accepted artifact (accepted SHA A → B)
@@ -81,10 +98,12 @@ anything destructive happens, and a live heartbeat alone never grants takeover a
 override still requires `confirm: true` and a non-empty `reason`. There is no call shape
 that destroys an active lease by accident.
 
-Recovery is **serialized**: `force_release/4`, `claim/2`, `renew/4`, and `release/4` all
-hold a per-lane operation lock (`<safe-lane>.op-lock`, created atomically) across their
-read-modify-write, so a recovery that has begun can never delete a lease created by a new
-owner, and claimants cannot slip in between recovery's classification and removal. Lock
+Recovery is **serialized**: `force_release/4`, `claim/2`, `renew/4`, `release/4`, and the
+`verify_live_state/2` authorization gate all hold a per-lane operation lock
+(`<safe-lane>.op-lock`, created atomically) across their read-(modify-)write, so a recovery
+that has begun can never delete a lease created by a new owner, claimants cannot slip in
+between recovery's classification and removal, and ownership cannot change under a delivery
+verification that is in progress. Lock
 acquisition waits a bounded time (5s by default, `lock_timeout_ms` on `force_release/4`)
 and fails closed with `{:error, {:lease_op_lock_unavailable, reason}}`. If a host dies
 inside the millisecond-scale critical section, the `.op-lock` file can be left behind; an
@@ -109,6 +128,9 @@ never auto-deletes worktrees or branches — recovery clears ownership only.
   (`:lane_mismatch`) fails closed: claims are refused, renew/release refuse, and operator
   `force_release/4` is the recovery path. A truncated partial write can never fabricate
   ownership.
+- The delivery gate (`verify_live_state/2`) additionally refuses a stale holder: a missing
+  lease is `{:error, :lease_missing}`, a foreign token `{:error, :not_owner}` — checked
+  against the authoritative file before any Git state is consulted.
 - Persistence follows the `SymphonyElixir.RetryStore` conventions: bounded JSON with
   `schema_version`, atomic temp + rename for rewrites, local-disk durability. Restart
   reconstruction is inherent — ownership lives entirely in the file; no process holds it.
