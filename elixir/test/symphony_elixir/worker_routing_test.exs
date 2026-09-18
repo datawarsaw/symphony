@@ -115,9 +115,7 @@ defmodule SymphonyElixir.WorkerRoutingTest do
       assert WorkerRouting.parse_model_from_command("codex -m gpt-5.6-sol app-server") ==
                "gpt-5.6-sol"
 
-      assert WorkerRouting.parse_reasoning_from_command(
-               "codex --config model_reasoning_effort=high app-server"
-             ) == "high"
+      assert WorkerRouting.parse_reasoning_from_command("codex --config model_reasoning_effort=high app-server") == "high"
     end
   end
 

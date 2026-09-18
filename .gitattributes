@@ -1,0 +1,26 @@
+# Repository line-ending policy (authoritative; do not rely on core.autocrlf).
+# All repository text is stored and checked out as LF on every platform so
+# mix format, git diff --check, and validation behave identically everywhere.
+# Windows-only batch/scripts (.bat/.cmd) would need "text eol=crlf" if ever
+# added; none exist today. Binary files are intentionally not listed.
+
+*.ex text eol=lf
+*.exs text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.conf text eol=lf
+*.css text eol=lf
+*.py text eol=lf
+*.cs text eol=lf
+*.sh text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+mix.lock text eol=lf
+LICENSE text eol=lf
+NOTICE text eol=lf

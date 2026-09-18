@@ -8,7 +8,8 @@ defmodule SymphonyElixir.RetryPolicyTest do
   end
 
   test "eligible transient failure retries" do
-    assert evaluate(:provider_outage, nil, 1_000) == {:retry, %{attempt_count: 1, identical_failure_count: 1, first_failure_at_ms: 1_000, last_failure_at_ms: 1_000, last_failure_class: :provider_outage}}
+    assert evaluate(:provider_outage, nil, 1_000) ==
+             {:retry, %{attempt_count: 1, identical_failure_count: 1, first_failure_at_ms: 1_000, last_failure_at_ms: 1_000, last_failure_class: :provider_outage}}
   end
 
   test "attempt 9 retries" do

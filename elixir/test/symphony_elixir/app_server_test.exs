@@ -6,176 +6,56 @@ defmodule SymphonyElixir.AppServerTest do
   alias SymphonyElixir.RetryPolicy
   alias SymphonyElixir.TestSupport.FakeSSH
 
- # Symlink escape coverage runs with a real symlink when the host allows it and
- # with a directory junction otherwise; only an unavailable prerequisite skips it.
- @symlink_fixture_skip symlink_fixture_skip_reason()
+  # Symlink escape coverage runs with a real symlink when the host allows it and
+  # with a directory junction otherwise; only an unavailable prerequisite skips it.
+  @symlink_fixture_skip symlink_fixture_skip_reason()
 
- test "local shell resolution failure is returned before app-server initialization" do
-   root = Path.join(System.tmp_dir!(), "symphony-shell-#{System.unique_integer([:positive])}")
-   workspace = Path.join(root, "issue")
-   missing_shell = Path.join(root, "missing-bash.exe")
-   File.mkdir_p!(workspace)
+  test "local shell resolution failure is returned before app-server initialization" do
+    root = Path.join(System.tmp_dir!(), "symphony-shell-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "issue")
+    missing_shell = Path.join(root, "missing-bash.exe")
+    File.mkdir_p!(workspace)
 
-   try do
-     write_workflow_file!(Workflow.workflow_file_path(),
-       workspace_root: root,
-       codex_shell_executable: missing_shell
-     )
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: root,
+        codex_shell_executable: missing_shell
+      )
 
-     assert {:error, {:local_shell_unusable, ^missing_shell, _}} =
-              AppServer.start_session(workspace)
-   after
-     File.rm_rf(root)
-   end
- end
+      assert {:error, {:local_shell_unusable, ^missing_shell, _}} =
+               AppServer.start_session(workspace)
+    after
+      File.rm_rf(root)
+    end
+  end
 
- # MIC-223 partial-start seam: a contained port that was created but then failed
- # session initialization must still publish its stop confirmation through the
- # worker_termination channel, with the managed expectation attached — the
- # caller receives the failure, but the runtime keeps the termination evidence.
- test "partial start publishes the stop confirmation with the managed expectation before failing" do
-   test_root =
-     Path.join(
-       System.tmp_dir!(),
-       "symphony-elixir-partial-start-#{System.unique_integer([:positive])}"
-     )
+  # MIC-223 partial-start seam: a contained port that was created but then failed
+  # session initialization must still publish its stop confirmation through the
+  # worker_termination channel, with the managed expectation attached — the
+  # caller receives the failure, but the runtime keeps the termination evidence.
+  test "partial start publishes the stop confirmation with the managed expectation before failing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-partial-start-#{System.unique_integer([:positive])}"
+      )
 
-   workspace_root = Path.join(test_root, "workspaces")
-   workspace = Path.join(workspace_root, "MT-PARTIAL-START")
-   codex_binary = Path.join(test_root, "fake-codex-refusing")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-PARTIAL-START")
+    codex_binary = Path.join(test_root, "fake-codex-refusing")
 
-   File.mkdir_p!(workspace)
+    File.mkdir_p!(workspace)
 
-   File.write!(codex_binary, """
-   #!/bin/sh
-   count=0
-   while IFS= read -r line; do
-     count=$((count + 1))
-     case "$count" in
-       1) printf '%s\\n' '{"id":1,"result":{}}' ;;
-       2) printf '%s\\n' '{"id":2,"error":{"code":-32000,"message":"thread start refused"}}' ;;
-       *) exit 0 ;;
-     esac
-   done
-   """)
-
-   File.chmod!(codex_binary, 0o755)
-
-   write_workflow_file!(Workflow.workflow_file_path(),
-     workspace_root: workspace_root,
-     codex_command: "#{String.replace(codex_binary, "\\", "/")} app-server"
-   )
-
-   issue = %Issue{
-     id: "issue-partial-start",
-     identifier: "MT-PARTIAL-START",
-     title: "Validate partial start evidence",
-     description: "Port starts, initialization fails, evidence survives",
-     state: "In Progress",
-     url: "https://example.org/issues/MT-PARTIAL-START"
-   }
-
-   parent = self()
-   publisher = fn info -> send(parent, {:published_termination, info}) end
-
-   try do
-     assert {:error, {:response_error, _}} =
-              AppServer.start_session(workspace, issue: issue, worker_termination_publisher: publisher)
-
-     assert_receive {:published_termination, published}
-
-     assert published.termination_expectation == :MANAGED_CONFIRMATION_REQUIRED
-     assert published.worker_termination.status == :TERMINATED_CONFIRMED
-     assert is_map(published.worker_identity)
-     assert is_binary(published.worker_identity["launch_id"])
-     assert published.worker_identity["receipt_path"] != nil
-   after
-     File.rm_rf(test_root)
-   end
- end
-
- # MIC-223: a launch that fails before any process could exist must NOT
- # fabricate termination evidence; the never-started refinement is the
- # orchestrator boundary's job, and the gate relies on its absence of evidence.
- test "pre-spawn launch failure publishes no termination evidence" do
-   test_root =
-     Path.join(
-       System.tmp_dir!(),
-       "symphony-elixir-prespawn-#{System.unique_integer([:positive])}"
-     )
-
-   workspace_root = Path.join(test_root, "workspaces")
-   workspace = Path.join(workspace_root, "MT-PRE-SPAWN")
-   File.mkdir_p!(workspace)
-
-   write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
-
-   previous_helper = Application.get_env(:symphony_elixir, :jobrun_helper_path)
-
-   Application.put_env(:symphony_elixir, :jobrun_helper_path, Path.join(test_root, "missing-jobrun.exe"))
-
-   issue = %Issue{
-     id: "issue-pre-spawn",
-     identifier: "MT-PRE-SPAWN",
-     title: "Validate pre-spawn silence",
-     description: "No helper, no port, no evidence",
-     state: "In Progress",
-     url: "https://example.org/issues/MT-PRE-SPAWN"
-   }
-
-   parent = self()
-   publisher = fn info -> send(parent, {:published_termination, info}) end
-
-   try do
-     assert {:error, {:jobrun_helper_missing, _}} =
-              AppServer.start_session(workspace, issue: issue, worker_termination_publisher: publisher)
-
-     refute_receive {:published_termination, _}
-   after
-     if is_nil(previous_helper) do
-       Application.delete_env(:symphony_elixir, :jobrun_helper_path)
-     else
-       Application.put_env(:symphony_elixir, :jobrun_helper_path, previous_helper)
-     end
-
-     File.rm_rf(test_root)
-   end
- end
-
- test "local launch reaches app-server startup even when PATH has WSL launcher first" do
-   test_root =
-     Path.join(
-       System.tmp_dir!(),
-       "symphony-elixir-app-server-wsl-path-#{System.unique_integer([:positive])}"
-     )
-
-   previous_path = System.get_env("PATH")
-
-   on_exit(fn ->
-     restore_env("PATH", previous_path)
-   end)
-
-   try do
-     System.put_env("PATH", "C:\\Windows\\System32;" <> (previous_path || ""))
-
-     workspace_root = Path.join(test_root, "workspaces")
-     workspace = Path.join(workspace_root, "MT-WSL-PATH")
-     codex_binary = Path.join(test_root, "fake-codex")
-
-     File.mkdir_p!(workspace)
-
-     File.write!(codex_binary, """
-     #!/bin/sh
-     count=0
-     while IFS= read -r line; do
-       count=$((count + 1))
-       case "$count" in
-         1) printf '%s\\n' '{"id":1,"result":{}}' ;;
-         2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-wsl-path"}}}' ;;
-         3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-wsl-path"}}}' ;;
-         4) printf '%s\\n' '{"method":"turn/completed"}'; exit 0 ;;
-         *) exit 0 ;;
-       esac
+    File.write!(codex_binary, """
+    #!/bin/sh
+    count=0
+    while IFS= read -r line; do
+      count=$((count + 1))
+      case "$count" in
+        1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        2) printf '%s\\n' '{"id":2,"error":{"code":-32000,"message":"thread start refused"}}' ;;
+        *) exit 0 ;;
+      esac
     done
     """)
 
@@ -187,22 +67,142 @@ defmodule SymphonyElixir.AppServerTest do
     )
 
     issue = %Issue{
-       id: "issue-wsl-path",
-       identifier: "MT-WSL-PATH",
-       title: "Run with WSL first on PATH",
-       description: "Validate Git Bash selection over WSL launcher",
-       state: "In Progress",
-       url: "https://example.org/issues/MT-WSL-PATH",
-       labels: ["backend"]
-     }
+      id: "issue-partial-start",
+      identifier: "MT-PARTIAL-START",
+      title: "Validate partial start evidence",
+      description: "Port starts, initialization fails, evidence survives",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-PARTIAL-START"
+    }
 
-     assert {:ok, _result} = AppServer.run(workspace, "Run worker", issue)
-   after
-     File.rm_rf(test_root)
-   end
- end
+    parent = self()
+    publisher = fn info -> send(parent, {:published_termination, info}) end
 
- test "app server rejects the workspace root and paths outside workspace root" do
+    try do
+      assert {:error, {:response_error, _}} =
+               AppServer.start_session(workspace, issue: issue, worker_termination_publisher: publisher)
+
+      assert_receive {:published_termination, published}
+
+      assert published.termination_expectation == :MANAGED_CONFIRMATION_REQUIRED
+      assert published.worker_termination.status == :TERMINATED_CONFIRMED
+      assert is_map(published.worker_identity)
+      assert is_binary(published.worker_identity["launch_id"])
+      assert published.worker_identity["receipt_path"] != nil
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  # MIC-223: a launch that fails before any process could exist must NOT
+  # fabricate termination evidence; the never-started refinement is the
+  # orchestrator boundary's job, and the gate relies on its absence of evidence.
+  test "pre-spawn launch failure publishes no termination evidence" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prespawn-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-PRE-SPAWN")
+    File.mkdir_p!(workspace)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+    previous_helper = Application.get_env(:symphony_elixir, :jobrun_helper_path)
+
+    Application.put_env(:symphony_elixir, :jobrun_helper_path, Path.join(test_root, "missing-jobrun.exe"))
+
+    issue = %Issue{
+      id: "issue-pre-spawn",
+      identifier: "MT-PRE-SPAWN",
+      title: "Validate pre-spawn silence",
+      description: "No helper, no port, no evidence",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-PRE-SPAWN"
+    }
+
+    parent = self()
+    publisher = fn info -> send(parent, {:published_termination, info}) end
+
+    try do
+      assert {:error, {:jobrun_helper_missing, _}} =
+               AppServer.start_session(workspace, issue: issue, worker_termination_publisher: publisher)
+
+      refute_receive {:published_termination, _}
+    after
+      if is_nil(previous_helper) do
+        Application.delete_env(:symphony_elixir, :jobrun_helper_path)
+      else
+        Application.put_env(:symphony_elixir, :jobrun_helper_path, previous_helper)
+      end
+
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "local launch reaches app-server startup even when PATH has WSL launcher first" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-wsl-path-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+    end)
+
+    try do
+      System.put_env("PATH", "C:\\Windows\\System32;" <> (previous_path || ""))
+
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-WSL-PATH")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+       #!/bin/sh
+       count=0
+       while IFS= read -r line; do
+         count=$((count + 1))
+         case "$count" in
+           1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+           2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-wsl-path"}}}' ;;
+           3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-wsl-path"}}}' ;;
+           4) printf '%s\\n' '{"method":"turn/completed"}'; exit 0 ;;
+           *) exit 0 ;;
+         esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{String.replace(codex_binary, "\\", "/")} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-wsl-path",
+        identifier: "MT-WSL-PATH",
+        title: "Run with WSL first on PATH",
+        description: "Validate Git Bash selection over WSL launcher",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-WSL-PATH",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Run worker", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
         System.tmp_dir!(),

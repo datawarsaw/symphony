@@ -319,13 +319,14 @@ defmodule SymphonyElixir.RestartReconciliationTest do
         # Simulate issue dispatch into state.running and state.claimed
         state = %{
           state
-          | running: Map.put(state.running, issue.id, %{
-              pid: self(),
-              ref: make_ref(),
-              identifier: issue.identifier,
-              issue: issue,
-              resumed: true
-            }),
+          | running:
+              Map.put(state.running, issue.id, %{
+                pid: self(),
+                ref: make_ref(),
+                identifier: issue.identifier,
+                issue: issue,
+                resumed: true
+              }),
             claimed: MapSet.put(state.claimed, issue.id),
             resumed_issues: MapSet.delete(state.resumed_issues, issue.id)
         }
