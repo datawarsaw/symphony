@@ -33,8 +33,8 @@ defmodule SymphonyElixir.SteerControlTest do
   # ---------------------------------------------------------------------------
 
   test "control surface: recognized verbs, executable verbs, fail-closed shape validation" do
-    assert Control.supported_actions() == [:interrupt, :relaunch, :terminate]
-    assert Control.executable_actions() == [:relaunch, :terminate]
+    assert Control.supported_actions() == [:interrupt, :relaunch, :terminate, :recover_parked]
+    assert Control.executable_actions() == [:relaunch, :terminate, :recover_parked]
 
     assert {:error, {:invalid_request, :malformed_request}} = Control.request(:terminate, "not-a-map")
     assert {:error, {:invalid_request, :issue_id_must_not_be_empty}} = Control.request(:terminate, %{issue_id: "  "})

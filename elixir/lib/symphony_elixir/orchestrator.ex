@@ -2426,6 +2426,16 @@ defmodule SymphonyElixir.Orchestrator do
         expectation -> Map.put(record, "termination_expectation", to_string(expectation))
       end
 
+    # PARKED recovery: the park's stop reason is persisted only when known, so
+    # an operator recovery can objectively classify the park (fence vs policy)
+    # after a restart, when the in-memory reason is lost to :recovered_parked.
+    # Retry records carry stop_reason nil and keep the minimum schema.
+    record =
+      case persisted_stop_reason(Map.get(entry, :stop_reason)) do
+        nil -> record
+        reason -> Map.put(record, "stop_reason", reason)
+      end
+
     try do
       RetryStore.write_record(root, record)
     rescue
@@ -2441,6 +2451,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp next_retry_at_iso(_entry), do: nil
+
+  defp persisted_stop_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp persisted_stop_reason(reason) when is_binary(reason), do: reason
+  defp persisted_stop_reason(_reason), do: nil
 
   @spec delete_retry_record_best_effort(String.t()) :: :ok
   defp delete_retry_record_best_effort(issue_id) do
@@ -2875,6 +2889,11 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(metadata, :workspace_path),
           route: Map.get(metadata, :route),
           parked_at: Map.get(metadata, :parked_at),
+          # PARKED recovery observability: which recovery category the park
+          # falls into (:recovered_parked means the reason lives only in the
+          # durable retry record — liveness itself is re-proven at recovery
+          # time, never projected from this snapshot).
+          recovery_class: recovery_category_from_reason(persisted_stop_reason(Map.get(metadata, :stop_reason))),
           operational_status: Map.get(operational_status, issue_id)
         }
       end)
@@ -2929,7 +2948,7 @@ defmodule SymphonyElixir.Orchestrator do
   # steering or model text for lifecycle commands. Every request — executed
   # or rejected — is recorded in the bounded control ledger.
   def handle_call({:control_request, %{action: action} = request}, _from, state)
-      when action in [:terminate, :relaunch] do
+      when action in [:terminate, :relaunch, :recover_parked] do
     {reply, state} = execute_control_request(state, request)
     {:reply, reply, state}
   end
@@ -2969,6 +2988,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp execute_control_request(state, %{action: :relaunch} = request) do
     control_relaunch(state, request)
+  end
+
+  defp execute_control_request(state, %{action: :recover_parked} = request) do
+    control_recover_parked(state, request)
   end
 
   # TERMINATE = the orchestrator's existing task-level stop, the same
@@ -3209,6 +3232,294 @@ defmodule SymphonyElixir.Orchestrator do
         })
     end
   end
+
+  # ── CONTROL :recover_parked ────────────────────────────────────────────────
+  #
+  # The operator unblock path for PARKED issues. Parking is never overridden:
+  # the command re-reads the durable retry record as fresh evidence, re-runs
+  # the WorkerFence against the receipt file as it exists NOW, and releases the
+  # park only when the fence positively proves the previous worker tree
+  # drained. UNKNOWN and LIVE refuse; corrupt or inconsistent evidence refuses;
+  # policy parks (envelope exhaustion, auth) are refused — they are policy
+  # decisions that need a different operator action, not a fence verdict.
+  # Elapsed time is never consulted: only positive evidence changes the
+  # verdict.
+
+  @fence_park_reasons ["worker_termination_unconfirmed", "fence_unknown", "fence_alive"]
+  @policy_park_reasons ["max_attempts", "max_age", "max_identical", "auth_unavailable"]
+
+  defp control_recover_parked(state, request) do
+    issue_id = request.issue_id
+
+    case Map.get(state.parked, issue_id) do
+      nil ->
+        # Idempotent bound: a second recovery (or a recovery of an issue that
+        # was never parked) observes and changes nothing.
+        deny_recovery(state, request, :rejected_issue_not_parked, %{parked?: false}, nil)
+
+      entry ->
+        control_recover_parked_entry(state, request, issue_id, entry)
+    end
+  end
+
+  # The durable retry record is the recovery evidence source, so a restart
+  # (which rehydrates parks as :recovered_parked and loses the original
+  # in-memory reason) recovers identically to a live park.
+  defp control_recover_parked_entry(state, request, issue_id, entry) do
+    case RetryStore.read_record(retry_store_root(), issue_id) do
+      {:ok, record} ->
+        cond do
+          Map.get(record, "status") in ["parked", "retrying"] ->
+            attempt_id = Map.get(record, "attempt_count")
+            park_reason = recovery_park_reason(entry, record)
+
+            case recovery_category_from_reason(park_reason) do
+              :fence_recoverable ->
+                control_recover_fence_check(state, request, entry, record, park_reason, attempt_id)
+
+              category ->
+                deny_recovery(
+                  state,
+                  request,
+                  :rejected_not_fence_parked,
+                  %{
+                    requirement: :fence_related_park,
+                    park_stop_reason: park_reason,
+                    category: category,
+                    operator_action_required: :different_recovery_path
+                  },
+                  attempt_id
+                )
+            end
+
+          true ->
+            deny_recovery(
+              state,
+              request,
+              :rejected_corrupt_evidence,
+              %{
+                reason: {:unexpected_record_status, Map.get(record, "status")}
+              },
+              nil
+            )
+        end
+
+      {:error, :not_found} ->
+        deny_recovery(state, request, :rejected_corrupt_evidence, %{reason: :retry_record_missing}, nil)
+
+      {:error, reason} ->
+        deny_recovery(state, request, :rejected_corrupt_evidence, %{reason: inspect(reason)}, nil)
+    end
+  end
+
+  defp control_recover_fence_check(state, request, entry, record, park_reason, attempt_id) do
+    expectation = Map.get(record, "termination_expectation")
+    identity = Map.get(record, "worker_identity")
+
+    case recover_fence_verdict(expectation, identity) do
+      {:ok, :dead} ->
+        control_recover_tracker_check(state, request, entry, record, park_reason, attempt_id)
+
+      {:error, :alive} ->
+        deny_recovery(
+          state,
+          request,
+          :rejected_worker_still_running,
+          %{
+            fence_verdict: :alive,
+            worker_launch_id: recovery_launch_id(identity)
+          },
+          attempt_id
+        )
+
+      {:error, :unknown} ->
+        deny_recovery(
+          state,
+          request,
+          :rejected_fence_unknown,
+          %{
+            fence_verdict: :unknown,
+            worker_identity_present: not is_nil(identity),
+            worker_launch_id: recovery_launch_id(identity)
+          },
+          attempt_id
+        )
+    end
+  end
+
+  defp control_recover_tracker_check(state, request, entry, record, park_reason, attempt_id) do
+    case Tracker.fetch_issues_by_ids([request.issue_id]) do
+      {:error, reason} ->
+        # The fence already proved death, but recovery must not resurrect
+        # finished work and cannot verify the issue is still active; the park
+        # stays until the tracker answers.
+        deny_recovery(
+          state,
+          request,
+          :rejected_tracker_unavailable,
+          %{
+            reason: inspect(reason),
+            fence_verdict: :dead,
+            park_stop_reason: park_reason
+          },
+          attempt_id
+        )
+
+      {:ok, issues} ->
+        control_recover_tracker_state(state, request, entry, record, park_reason, attempt_id, issues)
+    end
+  end
+
+  defp control_recover_tracker_state(state, request, entry, record, park_reason, attempt_id, issues) do
+    issue_id = request.issue_id
+    terminal_states = terminal_state_set()
+
+    case find_issue_by_id(issues, issue_id) do
+      nil ->
+        # The tracker no longer knows the issue: the existing nil-lookup rule
+        # applies (release the claim, no redispatch), now safe because the
+        # fence proved the worker dead.
+        recovery_release(state, request, issue_id, record, park_reason, :recovered_issue_gone, attempt_id, nil)
+
+      %Issue{} = issue ->
+        cond do
+          terminal_issue_state?(issue.state, terminal_states) ->
+            # Recovery must not resurrect finished work: normal terminal
+            # reconciliation (workspace cleanup + claim release), safe because
+            # the fence positively proved the previous worker tree drained
+            # before any workspace was touched.
+            evidence = recovery_evidence(record, park_reason, issue.state, :terminal_reconciliation)
+
+            {receipt, state} =
+              record_control(state, request, :recovered_terminal, evidence, attempt_id: attempt_id)
+
+            cleanup_issue_workspace(issue, recovery_workspace_metadata(entry, record))
+            state = release_issue_claim(state, issue_id)
+
+            {{:ok, receipt}, state}
+
+          retry_candidate_issue?(issue, terminal_states) ->
+            evidence = recovery_evidence(record, park_reason, issue.state, :redispatch_scheduled)
+
+            {receipt, state} =
+              record_control(state, request, :recovery_scheduled, evidence, attempt_id: attempt_id)
+
+            # Smallest safe transition: release the parked hold, resolve the
+            # pending park wake, and let the existing retry envelope — with its
+            # preserved failure history, route state, and tracker revalidation
+            # at timer fire — redispatch through the normal scheduler. No
+            # worker is launched from the recovery command, and the issue stays
+            # claimed until the retry dispatches so the poller cannot race it.
+            state = handle_wake_release(state, issue_id)
+            state = %{state | parked: Map.delete(state.parked, issue_id)}
+            state = schedule_issue_retry(state, issue_id, recovery_next_attempt(record), recovery_retry_metadata(record, issue_id, receipt))
+
+            {{:ok, receipt}, state}
+
+          true ->
+            # The issue left every active tracker state without becoming
+            # terminal: the existing rule releases the claim.
+            recovery_release(state, request, issue_id, record, park_reason, :recovered_issue_inactive, attempt_id, issue.state)
+        end
+    end
+  end
+
+  defp recovery_release(state, request, issue_id, record, park_reason, outcome, attempt_id, tracker_state) do
+    evidence = recovery_evidence(record, park_reason, tracker_state, :claim_released)
+    {receipt, state} = record_control(state, request, outcome, evidence, attempt_id: attempt_id)
+    state = release_issue_claim(state, issue_id)
+    {{:ok, receipt}, state}
+  end
+
+  defp deny_recovery(state, request, outcome, evidence, attempt_id) do
+    {receipt, state} = record_control(state, request, outcome, evidence, attempt_id: attempt_id)
+    {{:ok, receipt}, state}
+  end
+
+  # The in-memory stop reason is authoritative for parks from this process
+  # lifetime; :recovered_parked means the original reason only exists in the
+  # durable record. Legacy records predating durable stop reasons cannot be
+  # classified and require a manual decision.
+  defp recovery_park_reason(entry, record) do
+    if Map.get(entry, :stop_reason) == :recovered_parked do
+      Map.get(record, "stop_reason")
+    else
+      persisted_stop_reason(Map.get(entry, :stop_reason))
+    end
+  end
+
+  @spec recovery_category_from_reason(term()) :: :fence_recoverable | :policy_park | :unclassified
+  defp recovery_category_from_reason(reason) do
+    cond do
+      reason in @fence_park_reasons -> :fence_recoverable
+      reason in @policy_park_reasons -> :policy_park
+      true -> :unclassified
+    end
+  end
+
+  defp recovery_launch_id(identity) when is_map(identity), do: Map.get(identity, "launch_id")
+  defp recovery_launch_id(_identity), do: nil
+
+  defp recovery_evidence(record, park_reason, tracker_state, disposition) do
+    %{
+      park_stop_reason: park_reason,
+      fence_verdict: :dead,
+      worker_launch_id: recovery_launch_id(Map.get(record, "worker_identity")),
+      tracker_state: tracker_state,
+      disposition: disposition
+    }
+  end
+
+  defp recovery_workspace_metadata(entry, record) do
+    %{
+      # Durable records store blank strings for absent fields; a blank worker
+      # host must stay nil so cleanup takes the local-removal path.
+      workspace_path: recovery_blank_to_nil(Map.get(record, "workspace_path")) || Map.get(entry, :workspace_path),
+      worker_host: recovery_blank_to_nil(Map.get(record, "worker_host")) || Map.get(entry, :worker_host),
+      workspace_root: recovery_blank_to_nil(Map.get(record, "workspace_root")) || Map.get(entry, :workspace_root)
+    }
+  end
+
+  defp recovery_blank_to_nil(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: nil, else: trimmed
+  end
+
+  defp recovery_blank_to_nil(value), do: value
+
+  defp recovery_next_attempt(record) do
+    case Map.get(record, "attempt_count") do
+      count when is_integer(count) and count >= 0 -> count + 1
+      _ -> nil
+    end
+  end
+
+  # The replacement attempt rides the existing retry envelope: the durable
+  # record's envelope and route state are preserved verbatim (not re-folded),
+  # the durable record transitions "parked" -> "retrying", and the error field
+  # durably records who recovered the issue and why release was allowed.
+  defp recovery_retry_metadata(record, issue_id, receipt) do
+    %{
+      identifier: Map.get(record, "identifier") || issue_id,
+      issue_url: nil,
+      error: "recovered from PARKED by operator control (control_id=#{receipt.control_id}): fence verdict dead",
+      worker_host: recovery_blank_to_nil(Map.get(record, "worker_host")),
+      workspace_path: recovery_blank_to_nil(Map.get(record, "workspace_path")),
+      workspace_root: recovery_blank_to_nil(Map.get(record, "workspace_root")),
+      worker_identity: Map.get(record, "worker_identity"),
+      termination_expectation: expectation_from_record(Map.get(record, "termination_expectation")),
+      failure_class: Map.get(record, "failure_class"),
+      attempt_count: Map.get(record, "attempt_count"),
+      identical_failure_count: Map.get(record, "identical_failure_count", 1),
+      first_failure_at: Map.get(record, "first_failure_at"),
+      reset_in_ms: nil,
+      route: recovery_route(Map.get(record, "route")),
+      primary_failure_count: Map.get(record, "primary_failure_count", 0)
+    }
+  end
+
+  defp recovery_route("fallback"), do: :fallback
+  defp recovery_route(_route), do: :primary
 
   # ── CONTROL receipt bookkeeping ────────────────────────────────────────────
 

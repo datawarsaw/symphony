@@ -188,7 +188,8 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
     issue = test_issue("ISS-SCHEMA-1", "MT-SCHEMA-1")
 
     # A legacy (expectation-less) running entry must still write the exact
-    # minimum durable schema; the MIC-223 expectation is added only when known.
+    # minimum durable schema plus the additive parked stop reason (schema stays
+    # version 1); the MIC-223 expectation is added only when known.
     entry = Map.delete(running_entry(issue), :termination_expectation)
 
     next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-s", :unauthorized)
@@ -197,7 +198,7 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
       assert {:ok, record} = RetryStore.read_record(root, issue.id)
 
       expected_keys =
-        ~w(schema_version issue_id identifier status failure_class attempt_count identical_failure_count first_failure_at last_failure_at next_retry_at last_error worker_host worker_identity workspace_path workspace_root route primary_failure_count)
+        ~w(schema_version issue_id identifier status failure_class attempt_count identical_failure_count first_failure_at last_failure_at next_retry_at last_error worker_host worker_identity workspace_path workspace_root route primary_failure_count stop_reason)
         |> Enum.sort()
 
       assert Map.keys(record) |> Enum.sort() == expected_keys
@@ -205,6 +206,9 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
       assert record["issue_id"] == issue.id
       assert record["status"] == "parked"
       assert record["worker_identity"] == nil
+      # PARKED recovery: the park's stop reason is durable so an operator
+      # recovery can classify the park after a restart.
+      assert record["stop_reason"] == "auth_unavailable"
       # MIC-195 Slice C: durable route state rides in the same version-1
       # schema; a fallback lane label is still not a concept.
       assert record["route"] == "primary"
