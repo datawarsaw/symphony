@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, RepositoryRouter, SourceSync, SSH}
+  alias SymphonyElixir.{Config, PathSafety, RepositoryRouter, SourceSync, SSH, Workspace.Viability}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
   @remote_provenance_marker "__SYMPHONY_PROVENANCE__"
@@ -282,6 +282,14 @@ defmodule SymphonyElixir.Workspace do
 
         :ok
 
+      {:error, {:workspace_not_viable, workspace, reason}} ->
+        Logger.warning(
+          "Preserving workspace for #{issue_log_context(issue_context(issue_or_identifier))}; " <>
+            "workspace is structurally not viable path=#{workspace} reason=#{inspect(reason)}"
+        )
+
+        :ok
+
       {:error, reason} ->
         Logger.warning(
           "Preserving workspace for #{issue_log_context(issue_context(issue_or_identifier))}; " <>
@@ -509,12 +517,12 @@ defmodule SymphonyElixir.Workspace do
          {:ok, workspace} <- workspace_path(issue_or_identifier, worker_host) do
       case workspace_exists?(workspace, worker_host) do
         true ->
-          case verify_workspace_git_identity(workspace, route, worker_host) do
-            :ok ->
-              {:ok, :resume, workspace, route}
-
-            {:error, _reason} = error ->
-              error
+          # Repository identity is necessary but not sufficient: a structurally
+          # broken worktree (interrupted create, gutted directory) must fail
+          # closed instead of classifying as resumable.
+          with :ok <- verify_workspace_git_identity(workspace, route, worker_host),
+               :ok <- verify_workspace_viability(workspace, route, worker_host) do
+            {:ok, :resume, workspace, route}
           end
 
         false ->
@@ -1025,13 +1033,30 @@ defmodule SymphonyElixir.Workspace do
        do: :ok
 
   # A reused workspace is trusted only after its Git repository identity matches the
-  # selected route's source repository. A freshly created workspace is prepared from that
-  # source by the after_create hook, so it needs no re-verification. Unrouted issues keep
-  # their historical reuse behavior.
+  # selected route's source repository and its worktree structure is proven viable.
+  # A freshly created workspace is prepared from that source by the after_create hook,
+  # so it needs no re-verification. Unrouted issues keep their historical reuse behavior.
   defp verify_reused_workspace_repository(_workspace, _route, true, _worker_host), do: :ok
 
   defp verify_reused_workspace_repository(workspace, route, false, worker_host) do
-    verify_workspace_git_identity(workspace, route, worker_host)
+    with :ok <- verify_workspace_git_identity(workspace, route, worker_host) do
+      verify_workspace_viability(workspace, route, worker_host)
+    end
+  end
+
+  @doc false
+  @spec verify_workspace_viability(Path.t(), route(), worker_host()) :: :ok | {:error, term()}
+  # Remote worker hosts keep their historical reuse behavior: the local Git probes
+  # cannot read a remote filesystem, and the configured worker fleet does not use
+  # remote reuse. Tightening this requires a remote probe and is tracked separately.
+  def verify_workspace_viability(_workspace, _route, worker_host) when is_binary(worker_host), do: :ok
+
+  # Unrouted issues keep their historical behavior: their workspaces are not
+  # route-prepared worktrees, so the worktree-structure contract does not apply.
+  def verify_workspace_viability(_workspace, nil, nil), do: :ok
+
+  def verify_workspace_viability(workspace, %RepositoryRouter.Route{}, nil) when is_binary(workspace) do
+    Viability.verify(workspace)
   end
 
   @doc false
