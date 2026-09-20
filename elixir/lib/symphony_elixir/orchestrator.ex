@@ -1353,6 +1353,10 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Dispatch failed closed for #{issue_context(issue)}: #{error}")
         block_reconciliation_mismatch(state, issue, error)
 
+      {:error, {:workspace_not_viable, _workspace, _reason}} = error ->
+        Logger.error("Dispatch failed closed for #{issue_context(issue)}: #{format_workspace_viability_error(error)}")
+        block_workspace_viability(state, issue, error)
+
       {:ok, :resume, _workspace, _route} ->
         resumed? = MapSet.member?(state.resumed_issues, issue.id) or is_nil(attempt)
         spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, resumed?)
@@ -1731,21 +1735,24 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(identifier, worker_host)
 
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
-    if Map.get(metadata, :reconciliation_mismatch) == true do
-      Logger.warning("Preserving reconciliation-mismatch workspace #{inspect(Map.get(metadata, :workspace_path))} for #{inspect(Map.get(metadata, :identifier))}; skipping recorded cleanup")
-      :ok
-    else
-      case Map.get(metadata, :workspace_path) do
-        workspace_path when is_binary(workspace_path) and workspace_path != "" ->
-          Workspace.remove_recorded(
-            workspace_path,
-            Map.get(metadata, :worker_host),
-            Map.get(metadata, :workspace_root)
-          )
+    case workspace_gate_preserved?(metadata) do
+      nil ->
+        case Map.get(metadata, :workspace_path) do
+          workspace_path when is_binary(workspace_path) and workspace_path != "" ->
+            Workspace.remove_recorded(
+              workspace_path,
+              Map.get(metadata, :worker_host),
+              Map.get(metadata, :workspace_root)
+            )
 
-        _ ->
-          cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
-      end
+          _ ->
+            cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
+        end
+
+      gate_name ->
+        Logger.warning("Preserving #{gate_name} workspace #{inspect(Map.get(metadata, :workspace_path))} for #{inspect(Map.get(metadata, :identifier))}; skipping recorded cleanup")
+
+        :ok
     end
   end
 
@@ -1758,6 +1765,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
+
+  # Second cleanup gate, composed UNDER the LaunchMarker/WorkerFence fence in
+  # fenced_workspace_cleanup/3: the fence first proves the previous worker's
+  # death (no destructive cleanup while a launch is LIVE/UNKNOWN), then this
+  # policy preserves workspaces parked by a fail-closed dispatch gate as
+  # evidence for the operator — identity mismatches may hold foreign work, and
+  # non-viable worktrees may need `mix symphony.workspace_repair`. Neither is
+  # removed merely because the issue transition or terminal reconciliation
+  # asks for cleanup; both gates must allow before anything is deleted.
+  defp workspace_gate_preserved?(metadata) do
+    cond do
+      Map.get(metadata, :reconciliation_mismatch) == true -> "reconciliation-mismatch"
+      Map.get(metadata, :viability_error) == true -> "not-viable"
+      true -> nil
+    end
+  end
 
   # ── Hardening slice: fenced destructive workspace cleanup ──────────────────
   #
@@ -1926,6 +1949,11 @@ defmodule SymphonyElixir.Orchestrator do
           state = observe_wake(state, :eligibility_action_required, issue.id, evidence: "reconciliation_mismatch")
           block_reconciliation_mismatch(state, issue, error)
 
+        {:error, {:workspace_not_viable, _workspace, _reason}} = error ->
+          Logger.error("Startup reconciliation failed closed for #{issue_context(issue)}: #{format_workspace_viability_error(error)}")
+          state = observe_wake(state, :eligibility_action_required, issue.id, evidence: "workspace_not_viable")
+          block_workspace_viability(state, issue, error)
+
         {:error, reason} ->
           Logger.warning("Startup reconciliation check failed for #{issue_context(issue)}: #{inspect(reason)}")
           state
@@ -1940,21 +1968,29 @@ defmodule SymphonyElixir.Orchestrator do
       match?({:ok, _route}, RepositoryRouter.resolve(issue, Config.settings!().routing))
   end
 
-  defp block_reconciliation_mismatch(state, issue, error) do
+  defp format_workspace_viability_error({:error, {:workspace_not_viable, workspace, reason}}) do
+    "workspace is structurally not viable path=#{workspace} reason=#{inspect(reason)}"
+  end
+
+  # Fail-closed parking for issues whose workspace failed a dispatch-time gate
+  # (repository identity or structural viability). The marker field drives both
+  # the blocked-issue surface and the cleanup skip in cleanup_issue_workspace/2:
+  # gated workspaces are preserved as evidence for the operator and the bounded
+  # `mix symphony.workspace_repair` command instead of being removed silently.
+  defp block_workspace_gate(state, issue, error, marker) do
     workspace_path =
       case Workspace.workspace_path(issue) do
         {:ok, path} -> path
         _ -> nil
       end
 
-    blocked_entry = %{
+    base_entry = %{
       issue_id: issue.id,
       identifier: issue.identifier,
       issue: issue,
       worker_host: nil,
       workspace_path: workspace_path,
       workspace_root: Config.local_workspace_root(),
-      reconciliation_mismatch: true,
       session_id: nil,
       error: error,
       discovery_result: nil,
@@ -1964,12 +2000,22 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_timestamp: nil
     }
 
+    blocked_entry = Map.put(base_entry, marker, true)
+
     %{
       state
       | blocked: Map.put(state.blocked, issue.id, blocked_entry),
         claimed: MapSet.put(state.claimed, issue.id),
         resumed_issues: MapSet.delete(state.resumed_issues, issue.id)
     }
+  end
+
+  defp block_reconciliation_mismatch(state, issue, error) do
+    block_workspace_gate(state, issue, error, :reconciliation_mismatch)
+  end
+
+  defp block_workspace_viability(state, issue, error) do
+    block_workspace_gate(state, issue, error, :viability_error)
   end
 
   defp scan_orphaned_workspaces(active_issues) do
