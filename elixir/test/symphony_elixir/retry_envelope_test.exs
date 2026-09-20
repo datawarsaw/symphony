@@ -220,6 +220,54 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
     end
   end
 
+  test "retrying records omit stop_reason and never persist a literal nil", %{root: root} do
+    state = fresh_state()
+
+    # The retrying write path carries stop_reason nil. nil is an atom, so the
+    # durable record must omit the key (minimum schema) instead of persisting
+    # the literal string "nil" an atom clause would produce.
+    issue = test_issue("ISS-RETRY-NIL", "MT-RETRY-NIL")
+    entry = running_entry(issue)
+
+    next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-n", :provider_outage)
+
+    try do
+      assert map_size(next.retry_attempts) == 1
+      assert Orchestrator.parked_for_test(next) == %{}
+
+      assert {:ok, record} = RetryStore.read_record(root, issue.id)
+      assert record["status"] == "retrying"
+      refute Map.has_key?(record, "stop_reason")
+
+      expected_keys =
+        ~w(schema_version issue_id identifier status failure_class attempt_count identical_failure_count first_failure_at last_failure_at next_retry_at last_error worker_host worker_identity workspace_path workspace_root route primary_failure_count termination_expectation)
+        |> Enum.sort()
+
+      assert Map.keys(record) |> Enum.sort() == expected_keys
+      refute File.read!(RetryStore.record_path(root, issue.id)) =~ ~s("stop_reason": "nil")
+    after
+      cancel_timers(next)
+    end
+
+    # A real stop reason atom must still persist its atom-derived string: the
+    # nil clause only absorbs nil, never the fence/policy reasons.
+    park_issue = test_issue("ISS-PARK-AUTH", "MT-PARK-AUTH")
+
+    parked_next =
+      Orchestrator.handle_failure_for_test(state, park_issue.id, running_entry(park_issue), "sess-p", :unauthorized)
+
+    try do
+      assert Orchestrator.parked_for_test(parked_next) |> Map.has_key?(park_issue.id)
+
+      assert {:ok, park_record} = RetryStore.read_record(root, park_issue.id)
+      assert park_record["status"] == "parked"
+      assert park_record["stop_reason"] == "auth_unavailable"
+      assert File.read!(RetryStore.record_path(root, park_issue.id)) =~ ~s("stop_reason": "auth_unavailable")
+    after
+      cancel_timers(parked_next)
+    end
+  end
+
   test "parked records recover with claim, preserved workspace, and no timer", %{root: root} do
     now = DateTime.utc_now() |> DateTime.to_iso8601()
 

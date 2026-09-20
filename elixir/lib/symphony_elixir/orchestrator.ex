@@ -2452,6 +2452,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp next_retry_at_iso(_entry), do: nil
 
+  # nil is an atom too, so this clause must precede the generic atom clause or
+  # a retrying record persists the literal string "nil" as its stop reason.
+  defp persisted_stop_reason(nil), do: nil
   defp persisted_stop_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
   defp persisted_stop_reason(reason) when is_binary(reason), do: reason
   defp persisted_stop_reason(_reason), do: nil
