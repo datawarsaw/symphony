@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   alias SymphonyElixir.Codex.WorkerEnvironment
   alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Config
+  alias SymphonyElixir.LaunchMarker
   alias SymphonyElixir.DispatchRouter
   alias SymphonyElixir.Discovery.Session
   alias SymphonyElixir.PathSafety
@@ -67,11 +68,17 @@ defmodule SymphonyElixir.Codex.AppServer do
     issue = Keyword.get(opts, :issue)
     worker_identity = new_worker_identity(workspace, issue, opts, worker_host)
 
-    with {:ok, worker_route} <- worker_route_for(opts, issue, discovery_route),
+    # Hardening slice: the durable launch marker must be on disk BEFORE the
+    # worker becomes materially active — no worker may start unless its
+    # fenceable identity is already recoverable after a BEAM restart. A
+    # failed marker write refuses the launch (fail closed).
+    with :ok <- record_launch_marker(worker_identity, issue, opts),
+         {:ok, worker_route} <- worker_route_for(opts, issue, discovery_route),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding, worker_identity) do
       metadata = port_metadata(port, worker_host)
       worker_identity = attach_wrapper_pid(worker_identity, port)
+      record_launch_wrapper_identity(worker_identity)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, discovery_route),
            {:ok, thread_id, evidence} <-
@@ -109,6 +116,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           # runtime provably holds.
           confirmation = stop_and_confirm_session_port(port, worker_identity)
 
+          maybe_clear_confirmed_launch_marker(worker_identity, confirmation)
+
           publish_worker_termination(termination_publisher, %{
             worker_identity: worker_identity,
             worker_termination: confirmation,
@@ -117,6 +126,15 @@ defmodule SymphonyElixir.Codex.AppServer do
 
           {:error, reason}
       end
+    else
+      {:error, reason} ->
+        # Pre-port failure (routing, cwd validation, or Port.open itself):
+        # no process was ever created, so the pre-launch marker is cleared on
+        # conclusive never-spawned evidence instead of bricking the issue with
+        # an eternally-unprovable marker.
+        clear_launch_marker(worker_identity)
+
+        {:error, reason}
     end
   end
 
@@ -259,7 +277,14 @@ defmodule SymphonyElixir.Codex.AppServer do
         %{status: :NOT_APPLICABLE}
 
       identity ->
-        WorkerContainment.stop_and_confirm(port, identity, WorkerContainment.grace_ms())
+        confirmation = WorkerContainment.stop_and_confirm(port, identity, WorkerContainment.grace_ms())
+
+        # Successful-completion semantics: the marker is cleared only once
+        # termination evidence is durable (the wrapper receipt) and accepted
+        # by the same fence logic — never while a worker might still be alive.
+        maybe_clear_confirmed_launch_marker(identity, confirmation)
+
+        confirmation
     end
   end
 
@@ -465,6 +490,46 @@ defmodule SymphonyElixir.Codex.AppServer do
       nil
     end
   end
+
+  # Hardening slice: the launch marker is keyed by issue because every
+  # orchestrator reuse/cleanup decision is issue-keyed, and every production
+  # launch (AgentRunner, Discovery) carries its issue. A contained launch that
+  # cannot name its issue can never be fenced at those decision points; direct
+  # API use without an issue keeps legacy behavior with a visible warning.
+  # A marker write failure for a keyed launch refuses it (fail closed).
+  defp record_launch_marker(nil, _issue, _opts), do: :ok
+
+  defp record_launch_marker(identity, issue, opts) do
+    case issue && Map.get(issue, :id) do
+      issue_id when is_binary(issue_id) and issue_id != "" ->
+        LaunchMarker.record(identity,
+          identifier: issue && Map.get(issue, :identifier),
+          attempt_id: Keyword.get(opts, :attempt_id) || Keyword.get(opts, :attempt)
+        )
+
+      _unkeyed ->
+        Logger.warning("Contained launch without an issue id cannot be fenced by a launch marker; proceeding unfenced")
+
+        :ok
+    end
+  end
+
+  defp record_launch_wrapper_identity(nil), do: :ok
+  defp record_launch_wrapper_identity(identity), do: LaunchMarker.record_wrapper_identity(identity)
+
+  defp clear_launch_marker(nil), do: :ok
+  defp clear_launch_marker(identity), do: LaunchMarker.clear(identity)
+
+  # Marker clearing is fence-accepted-only: TERMINATED_CONFIRMED means the
+  # wrapper receipt durably proves the tree drained, so the marker cannot be
+  # deleted while a worker may still be alive. Any other status keeps the
+  # marker as evidence for the resume/cleanup gates.
+  defp maybe_clear_confirmed_launch_marker(%{"issue_id" => issue_id}, %{status: :TERMINATED_CONFIRMED})
+       when is_binary(issue_id) and issue_id != "" do
+    LaunchMarker.clear(issue_id)
+  end
+
+  defp maybe_clear_confirmed_launch_marker(_identity, _confirmation), do: :ok
 
   defp attach_wrapper_pid(nil, _port), do: nil
 

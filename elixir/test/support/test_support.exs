@@ -467,6 +467,8 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          codex_worker_containment_enabled: nil,
+          codex_worker_termination_grace_ms: nil,
           codex_fallback_enabled: false,
           codex_fallback_model: nil,
           codex_fallback_reasoning_effort: "medium",
@@ -510,6 +512,8 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    codex_worker_containment_enabled = Keyword.get(config, :codex_worker_containment_enabled)
+    codex_worker_termination_grace_ms = Keyword.get(config, :codex_worker_termination_grace_ms)
     codex_fallback_enabled = Keyword.get(config, :codex_fallback_enabled)
     codex_fallback_model = Keyword.get(config, :codex_fallback_model)
     codex_fallback_reasoning_effort = Keyword.get(config, :codex_fallback_reasoning_effort)
@@ -557,6 +561,11 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        containment_yaml(codex_worker_containment_enabled),
+        if(codex_worker_termination_grace_ms,
+          do: "  worker_termination_grace_ms: #{yaml_value(codex_worker_termination_grace_ms)}",
+          else: nil
+        ),
         "  fallback:",
         "    enabled: #{yaml_value(codex_fallback_enabled)}",
         "    model: #{yaml_value(codex_fallback_model)}",
@@ -614,9 +623,17 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
+  defp containment_yaml(nil), do: nil
+
+  defp containment_yaml(enabled), do: "  worker_containment_enabled: #{yaml_value(enabled)}"
+
   defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host)
        when ssh_hosts in [nil, []] and is_nil(max_concurrent_agents_per_host),
        do: nil
+
+  defp containment_yaml(nil), do: nil
+
+  defp containment_yaml(enabled), do: "  worker_containment_enabled: #{yaml_value(enabled)}"
 
   defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host) do
     [
