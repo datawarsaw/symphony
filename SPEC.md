@@ -1754,6 +1754,19 @@ Operators can control behavior by:
 - Changing issue states in the tracker:
   - terminal state -> running session is stopped and workspace cleaned when reconciled
   - non-active state -> running session is stopped without cleanup
+- Requesting recovery of one PARKED issue through the host-owned CONTROL lifecycle API
+  (`recover_parked` verb targeting one explicit issue). Parking always stays fail-closed:
+  recovery re-reads the durable retry record as fresh evidence, re-runs the worker fence
+  against the termination receipt as it exists at recovery time, and releases the park only
+  when the fence positively proves the previous worker tree drained. Unknown, live, corrupt,
+  unclassifiable, and policy-parked states are refused fail-closed (policy parks such as retry
+  envelope exhaustion or auth unavailability require a different operator decision). A
+  successful recovery transitions the issue back to the normal scheduler (the existing retry
+  envelope redispatches it) after the tracker confirms the issue is still active; terminal
+  issues receive normal terminal reconciliation instead of redispatch. Manually deleting retry
+  record files is NOT a supported recovery mechanism: it destroys the evidence that justified
+  the park and bypasses the fence on the next start.
+
 - Restarting the service for process recovery or deployment (not as the normal path for applying
   workflow config changes).
 

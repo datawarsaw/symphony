@@ -188,7 +188,8 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
     issue = test_issue("ISS-SCHEMA-1", "MT-SCHEMA-1")
 
     # A legacy (expectation-less) running entry must still write the exact
-    # minimum durable schema; the MIC-223 expectation is added only when known.
+    # minimum durable schema plus the additive parked stop reason (schema stays
+    # version 1); the MIC-223 expectation is added only when known.
     entry = Map.delete(running_entry(issue), :termination_expectation)
 
     next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-s", :unauthorized)
@@ -197,7 +198,7 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
       assert {:ok, record} = RetryStore.read_record(root, issue.id)
 
       expected_keys =
-        ~w(schema_version issue_id identifier status failure_class attempt_count identical_failure_count first_failure_at last_failure_at next_retry_at last_error worker_host worker_identity workspace_path workspace_root route primary_failure_count)
+        ~w(schema_version issue_id identifier status failure_class attempt_count identical_failure_count first_failure_at last_failure_at next_retry_at last_error worker_host worker_identity workspace_path workspace_root route primary_failure_count stop_reason)
         |> Enum.sort()
 
       assert Map.keys(record) |> Enum.sort() == expected_keys
@@ -205,6 +206,9 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
       assert record["issue_id"] == issue.id
       assert record["status"] == "parked"
       assert record["worker_identity"] == nil
+      # PARKED recovery: the park's stop reason is durable so an operator
+      # recovery can classify the park after a restart.
+      assert record["stop_reason"] == "auth_unavailable"
       # MIC-195 Slice C: durable route state rides in the same version-1
       # schema; a fallback lane label is still not a concept.
       assert record["route"] == "primary"
@@ -213,6 +217,54 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
       refute Map.has_key?(record, "lane")
     after
       cancel_timers(next)
+    end
+  end
+
+  test "retrying records omit stop_reason and never persist a literal nil", %{root: root} do
+    state = fresh_state()
+
+    # The retrying write path carries stop_reason nil. nil is an atom, so the
+    # durable record must omit the key (minimum schema) instead of persisting
+    # the literal string "nil" an atom clause would produce.
+    issue = test_issue("ISS-RETRY-NIL", "MT-RETRY-NIL")
+    entry = running_entry(issue)
+
+    next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-n", :provider_outage)
+
+    try do
+      assert map_size(next.retry_attempts) == 1
+      assert Orchestrator.parked_for_test(next) == %{}
+
+      assert {:ok, record} = RetryStore.read_record(root, issue.id)
+      assert record["status"] == "retrying"
+      refute Map.has_key?(record, "stop_reason")
+
+      expected_keys =
+        ~w(schema_version issue_id identifier status failure_class attempt_count identical_failure_count first_failure_at last_failure_at next_retry_at last_error worker_host worker_identity workspace_path workspace_root route primary_failure_count termination_expectation)
+        |> Enum.sort()
+
+      assert Map.keys(record) |> Enum.sort() == expected_keys
+      refute File.read!(RetryStore.record_path(root, issue.id)) =~ ~s("stop_reason": "nil")
+    after
+      cancel_timers(next)
+    end
+
+    # A real stop reason atom must still persist its atom-derived string: the
+    # nil clause only absorbs nil, never the fence/policy reasons.
+    park_issue = test_issue("ISS-PARK-AUTH", "MT-PARK-AUTH")
+
+    parked_next =
+      Orchestrator.handle_failure_for_test(state, park_issue.id, running_entry(park_issue), "sess-p", :unauthorized)
+
+    try do
+      assert Orchestrator.parked_for_test(parked_next) |> Map.has_key?(park_issue.id)
+
+      assert {:ok, park_record} = RetryStore.read_record(root, park_issue.id)
+      assert park_record["status"] == "parked"
+      assert park_record["stop_reason"] == "auth_unavailable"
+      assert File.read!(RetryStore.record_path(root, park_issue.id)) =~ ~s("stop_reason": "auth_unavailable")
+    after
+      cancel_timers(parked_next)
     end
   end
 

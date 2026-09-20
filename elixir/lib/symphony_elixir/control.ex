@@ -35,6 +35,12 @@ defmodule SymphonyElixir.Control do
       notifications), so `:interrupt` requests are recorded and rejected
       fail-closed as `:rejected_interrupt_not_supported` instead of being
       silently mapped onto terminate.
+    - `:recover_parked` — operator recovery for one PARKED issue whose park
+      was caused by worker-reuse uncertainty. Recovery never overrides the
+      fence: it re-reads the durable worker evidence (retry record + MIC-223
+      termination receipt) and only releases the park when the fence now
+      positively proves the previous worker tree drained. Unknown, live,
+      corrupt, or policy-parked states are refused fail-closed.
 
   Every accepted request — including rejected ones — yields a bounded
   structured receipt so an operator can answer: what was requested, against
@@ -48,10 +54,10 @@ defmodule SymphonyElixir.Control do
 
   alias SymphonyElixir.Orchestrator
 
-  @type action :: :interrupt | :relaunch | :terminate
+  @type action :: :interrupt | :relaunch | :terminate | :recover_parked
 
-  @supported_actions [:interrupt, :relaunch, :terminate]
-  @executable_actions [:relaunch, :terminate]
+  @supported_actions [:interrupt, :relaunch, :terminate, :recover_parked]
+  @executable_actions [:relaunch, :terminate, :recover_parked]
 
   @type target :: %{
           required(:issue_id) => String.t(),
@@ -64,11 +70,20 @@ defmodule SymphonyElixir.Control do
           | :termination_unconfirmed
           | :relaunch_scheduled
           | :already_scheduled
+          | :recovery_scheduled
+          | :recovered_terminal
+          | :recovered_issue_gone
+          | :recovered_issue_inactive
           | :rejected_worker_not_running
           | :rejected_worker_still_running
           | :rejected_stale_attempt
           | :rejected_no_terminated_attempt
           | :rejected_interrupt_not_supported
+          | :rejected_issue_not_parked
+          | :rejected_not_fence_parked
+          | :rejected_fence_unknown
+          | :rejected_corrupt_evidence
+          | :rejected_tracker_unavailable
 
   @type receipt :: %{
           control_id: String.t(),
