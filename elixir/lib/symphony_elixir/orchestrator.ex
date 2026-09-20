@@ -7,7 +7,8 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
 
   alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Steering, Tracker, Workspace}
-  alias SymphonyElixir.{DispatchRouter, FailureClass, RetryPolicy, RetryStore, Wake.Ledger, WorkerContainment, WorkerFence}
+  alias SymphonyElixir.{DispatchRouter, FailureClass, LaunchMarker, RetryPolicy, RetryStore, WorkerContainment, WorkerFence}
+  alias SymphonyElixir.Wake.Ledger
   alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Tracker.Issue
 
@@ -248,6 +249,14 @@ defmodule SymphonyElixir.Orchestrator do
         expectation = Map.get(receipt.evidence, :termination_expectation)
         verdict = WorkerContainment.reuse_gate(confirmation, expectation)
         outcome = if verdict == :allowed, do: :terminated, else: :termination_unconfirmed
+
+        # Successful-completion semantics: once the gate accepts durable
+        # termination evidence the marker's job is done; clear it so the next
+        # dispatch starts from a clean fence. An unconfirmed outcome keeps the
+        # marker as evidence and the resume/cleanup gates fail closed.
+        if outcome == :terminated do
+          LaunchMarker.clear(Map.get(receipt.evidence, :worker_identity))
+        end
 
         finalized =
           receipt
@@ -779,7 +788,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
-        cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
+        fenced_workspace_cleanup(issue, Map.get(state.blocked, issue.id, %{}), issue.id)
         release_issue_claim(state, issue.id)
 
       !issue_routable?(issue) ->
@@ -895,7 +904,7 @@ defmodule SymphonyElixir.Orchestrator do
         stop_running_task(pid, ref, state.task_supervisor)
 
         if cleanup_workspace do
-          cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
+          fenced_workspace_cleanup(Map.get(running_entry, :issue, identifier), running_entry, issue_id)
         end
 
         state =
@@ -1318,25 +1327,67 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        case Workspace.classify_candidate(issue, worker_host) do
-          {:error, {:workspace_repository_mismatch, target, details}} ->
-            error = "workspace repository identity mismatch for target #{target}: #{inspect(details)}"
-            Logger.error("Dispatch failed closed for #{issue_context(issue)}: #{error}")
-            block_reconciliation_mismatch(state, issue, error)
+        # Hardening slice resume gate: before dispatching — and in particular
+        # before resuming into an EXISTING workspace — a prior launch marker
+        # for this issue must be absent or its worker death positively proven
+        # through the WorkerFence (MIC-223 termination receipt). LIVE and
+        # UNKNOWN fail closed; death is never inferred from a missing BEAM
+        # process, a missing task, elapsed time, workspace presence, or the
+        # restart itself.
+        case LaunchMarker.reuse_gate(issue.id) do
+          :allowed ->
+            classify_candidate_and_spawn(state, issue, attempt, recipient, worker_host)
 
-          {:ok, :resume, _workspace, _route} ->
-            resumed? = MapSet.member?(state.resumed_issues, issue.id) or is_nil(attempt)
-            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, resumed?)
-
-          {:ok, :fresh, _workspace, _route} ->
-            state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
-            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, false)
-
-          _ ->
-            state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
-            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, false)
+          {:blocked, reason} ->
+            block_dispatch_on_unproven_launch(state, issue, reason)
         end
     end
+  end
+
+  # Resume gate admitted the dispatch: classify the workspace (resume vs
+  # fresh) and spawn, preserving the pre-existing classification semantics.
+  defp classify_candidate_and_spawn(%State{} = state, issue, attempt, recipient, worker_host) do
+    case Workspace.classify_candidate(issue, worker_host) do
+      {:error, {:workspace_repository_mismatch, target, details}} ->
+        error = "workspace repository identity mismatch for target #{target}: #{inspect(details)}"
+        Logger.error("Dispatch failed closed for #{issue_context(issue)}: #{error}")
+        block_reconciliation_mismatch(state, issue, error)
+
+      {:ok, :resume, _workspace, _route} ->
+        resumed? = MapSet.member?(state.resumed_issues, issue.id) or is_nil(attempt)
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, resumed?)
+
+      _fresh_or_unreadable ->
+        state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, false)
+    end
+  end
+
+  # Resume gate fail-closed outcome: the previous worker's death is LIVE or
+  # UNKNOWN (or the marker itself is unreadable), so no second worker may be
+  # launched and nothing is scheduled. Mirrors the retry-path reuse-gate park:
+  # claim + durable parked record, no retry timer, workspace preserved. The
+  # marker stays in place; once a receipt proves the drain (or an operator
+  # resolves it through CONTROL), the same gate re-admits dispatch.
+  defp block_dispatch_on_unproven_launch(%State{} = state, %Issue{} = issue, reason) do
+    Logger.error(
+      "Dispatch failed closed for #{issue_context(issue)}: previous worker launch not proven terminated " <>
+        "reason=#{inspect(reason)}; parking with claim, preserving workspace, no retry timer"
+    )
+
+    state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
+
+    state =
+      observe_wake(state, :worker_termination_unconfirmed, issue.id, evidence: "launch_gate:#{inspect(reason)}")
+
+    park_issue(state, issue.id, nil, %{
+      identifier: issue.identifier,
+      issue_url: issue.url,
+      error: "previous worker launch not proven terminated: #{inspect(reason)}",
+      stop_reason: :worker_launch_unproven,
+      worker_identity: LaunchMarker.stored_identity(issue.id),
+      worker_host: nil
+    })
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, resumed?) do
@@ -1659,7 +1710,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-        cleanup_issue_workspace(issue, metadata)
+        fenced_workspace_cleanup(issue, metadata, issue_id)
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
@@ -1677,7 +1728,7 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host \\ nil)
+  defp cleanup_issue_workspace(identifier, worker_host)
 
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
     if Map.get(metadata, :reconciliation_mismatch) == true do
@@ -1708,13 +1759,100 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
 
+  # ── Hardening slice: fenced destructive workspace cleanup ──────────────────
+  #
+  # Every path that destructively cleans a workspace after an asynchronous
+  # worker termination must first prove TERMINATED_CONFIRMED for the launch
+  # recorded in the durable launch marker. No marker keeps the legacy behavior
+  # (no managed worker launch to prove); a proven marker clears before legacy
+  # cleanup; an unproven marker waits a bounded interval for the wrapper
+  # receipt (the worker was often just stopped and its tree drains
+  # asynchronously) and cleans only on positive proof; a timeout or corrupt
+  # marker preserves the workspace fail-closed. Existing receipt evidence and
+  # the WorkerFence decide — death is never inferred from task death, elapsed
+  # time, or workspace state.
+  @fenced_cleanup_evidence_poll_ms 50
+
+  defp fenced_workspace_cleanup(issue_or_identifier, metadata, issue_id) do
+    case LaunchMarker.cleanup_gate(issue_id) do
+      :allowed ->
+        LaunchMarker.clear(issue_id)
+        cleanup_issue_workspace(issue_or_identifier, metadata)
+
+      {:blocked, :worker_termination_unproven} ->
+        spawn_fenced_cleanup_wait(issue_or_identifier, metadata, issue_id)
+
+      {:blocked, reason} ->
+        Logger.error(
+          "Destructive workspace cleanup failed closed for issue_id=#{inspect(issue_id)}: worker launch not " <>
+            "proven terminated reason=#{inspect(reason)}; preserving workspace"
+        )
+
+        :ok
+    end
+  end
+
+  # Bounded detached drain wait: polls the marker's fence verdict (positive
+  # receipt proof only) and cleans only on {:ok, :dead}. Never touches
+  # orchestrator state — by the time this runs the issue has already left the
+  # lifecycle maps; the watcher only settles the workspace itself.
+  defp spawn_fenced_cleanup_wait(issue_or_identifier, metadata, issue_id) do
+    spawn(fn ->
+      deadline = System.monotonic_time(:millisecond) + fenced_cleanup_evidence_budget_ms()
+
+      case await_drain_proof(issue_id, deadline) do
+        {:ok, :dead} ->
+          LaunchMarker.clear(issue_id)
+          cleanup_issue_workspace(issue_or_identifier, metadata)
+
+        _verdict ->
+          Logger.error(
+            "Destructive workspace cleanup failed closed for issue_id=#{inspect(issue_id)}: worker drain not " <>
+              "proven within the evidence budget; preserving workspace"
+          )
+      end
+    end)
+
+    :ok
+  end
+
+  defp await_drain_proof(issue_id, deadline) do
+    cond do
+      verdict = proven_drain_verdict(issue_id) ->
+        verdict
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {:error, :unknown}
+
+      true ->
+        Process.sleep(@fenced_cleanup_evidence_poll_ms)
+        await_drain_proof(issue_id, deadline)
+    end
+  end
+
+  defp proven_drain_verdict(issue_id) do
+    case LaunchMarker.fence_verdict(issue_id) do
+      {:ok, :dead} = verdict -> verdict
+      {:error, :alive} = verdict -> verdict
+      _unproven -> nil
+    end
+  end
+
+  # Same budget shape as the CONTROL evidence watcher (grace + hard-terminate
+  # drain) and the same test seam, so one knob bounds every asynchronous
+  # receipt wait.
+  defp fenced_cleanup_evidence_budget_ms do
+    hard_budget = Application.get_env(:symphony_elixir, :worker_termination_hard_budget_ms, 20_000)
+    WorkerContainment.grace_ms() + hard_budget
+  end
+
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
         issues
         |> Enum.each(fn
           %Issue{} = issue ->
-            cleanup_issue_workspace(issue)
+            fenced_workspace_cleanup(issue, %{}, issue.id)
 
           _ ->
             :ok
@@ -2827,9 +2965,12 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_root: Map.get(entry, :workspace_root),
       # MIC-223 authoritative inputs, frozen at stop time: the reuse decision
       # is made from the attempt's predeclared expectation plus the wrapper
-      # receipt evidence, never from task death alone.
+      # receipt evidence, never from task death alone. Hardening slice: an
+      # abruptly stopped task never delivered its :worker_termination message,
+      # so the in-memory identity is nil exactly when it is needed — the
+      # durable launch marker supplies the same fenceable identity.
       termination_expectation: Map.get(entry, :termination_expectation),
-      worker_identity: Map.get(entry, :worker_identity),
+      worker_identity: Map.get(entry, :worker_identity) || LaunchMarker.stored_identity(request.issue_id),
       worker_termination: nil,
       reuse_gate: nil
     }
