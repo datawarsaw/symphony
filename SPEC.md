@@ -419,6 +419,11 @@ Fields:
 
 #### 5.3.4 `hooks` (object)
 
+Hook commands are interpreted by a POSIX shell. Filesystem paths are data, not shell syntax:
+implementations and configurations MUST quote (single-quote) any path embedded in hook
+command text, or reference implementation-exported environment variables instead, so
+backslashes, spaces, and other path characters survive shell parsing.
+
 Fields:
 
 - `after_create` (multiline shell script string, OPTIONAL)

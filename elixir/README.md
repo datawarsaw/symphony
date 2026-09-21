@@ -200,6 +200,12 @@ Notes:
   may clone or materialize the prepared source there, along with any setup commands it needs.
   Codex must not repeat that preparation or mutate `.git`; it may edit source files, run tests,
   and collect read-only Git status/diff/log/rev-parse evidence.
+- Hook commands are shell scripts: a path interpolated into the command text is shell syntax
+  unless quoted, and POSIX shells (including Git Bash `sh` on Windows) consume unquoted
+  backslashes. Embed filesystem paths only single-quoted — programmatic config must use
+  `SymphonyElixir.Workspace.shell_quote_path/1` — and prefer the exported
+  `"$SYMPHONY_REPOSITORY_*"` variables over path literals. Quoted paths keep backslashes,
+  spaces, parentheses, and Unicode intact on every platform.
 - `routing.targets` enables deterministic multi-repository dispatch. Once enabled, every issue
   needs exactly one label with `routing.target_label_prefix` (default `repo:`), such as
   `repo:wup`. The selected target must be in the configured allowlist; missing, unknown, or
