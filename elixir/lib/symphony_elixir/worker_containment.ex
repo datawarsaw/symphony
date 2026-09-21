@@ -104,15 +104,23 @@ defmodule SymphonyElixir.WorkerContainment do
   convention: durable state lives under `<workspace_root>/.symphony-state` so
   receipts survive per-workspace cleanup and runtime restarts.
   """
-  @spec receipt_dir() :: String.t()
-  def receipt_dir do
+  @spec receipt_dir(String.t() | nil) :: String.t()
+  def receipt_dir(authority_root \\ nil) do
     override = Application.get_env(:symphony_elixir, :worker_termination_receipt_root)
 
     case override do
-      root when is_binary(root) and root != "" -> root
-      _ -> Path.join([Config.local_workspace_root(), ".symphony-state", "worker-terminations"])
+      root when is_binary(root) and root != "" ->
+        root
+
+      _ ->
+        case authority_root do
+          root when is_binary(root) and root != "" -> termination_dir(root)
+          _ -> termination_dir(Config.local_workspace_root())
+        end
     end
   end
+
+  defp termination_dir(root), do: Path.join([root, ".symphony-state", "worker-terminations"])
 
   # ---------------------------------------------------------------------------
   # Helper binary: deterministic in-box build + hash verification
@@ -260,9 +268,14 @@ defmodule SymphonyElixir.WorkerContainment do
       "attempt_id" => opts[:attempt_id],
       "workspace" => opts[:workspace],
       "worker_host" => opts[:worker_host],
+      # Mutation-root pinning: the boot-pinned authority root this launch was
+      # created under, carried so identity-derived marker operations (wrapper
+      # identity refresh, confirmed clear, never-spawned clear) mutate the same
+      # marker store the launch was fenced with — never live configuration.
+      "authority_root" => opts[:authority_root],
       "root_pid" => nil,
       "root_creation_time" => nil,
-      "receipt_path" => Path.join(receipt_dir(), launch_id <> ".json")
+      "receipt_path" => Path.join(receipt_dir(opts[:authority_root]), launch_id <> ".json")
     }
   end
 
@@ -548,9 +561,9 @@ defmodule SymphonyElixir.WorkerContainment do
   carry the identity's launch id. Anything else is UNKNOWN (fail closed).
   """
   @spec verify_identity_receipt(term()) :: SymphonyElixir.WorkerFence.verdict()
-  def verify_identity_receipt(%{"receipt_path" => path, "launch_id" => launch_id})
+  def verify_identity_receipt(%{"receipt_path" => path, "launch_id" => launch_id} = identity)
       when is_binary(path) and is_binary(launch_id) do
-    if receipt_under_managed_dir?(path) do
+    if receipt_under_managed_dir?(identity) do
       case parse_receipt(path) do
         {:ok, receipt} ->
           if receipt["launch_id"] == launch_id and classify_receipt(receipt) == :TERMINATED_CONFIRMED do
@@ -570,10 +583,31 @@ defmodule SymphonyElixir.WorkerContainment do
 
   def verify_identity_receipt(_other), do: {:error, :unknown}
 
-  defp receipt_under_managed_dir?(path) do
-    managed = receipt_dir() |> Path.expand() |> normalize_path()
-    candidate = path |> Path.expand() |> normalize_path()
-    String.starts_with?(candidate, managed <> "\\") or String.starts_with?(candidate, managed <> "/")
+  defp receipt_under_managed_dir?(identity) do
+    # Receipts written by a pinned runtime live under the authority root the
+    # launch itself was created under (carried in the identity), so a
+    # `workspace.root` reload must never make previously written receipts
+    # unreadable. The live holder's authority dir (same-instance re-adoption
+    # keeps older launches valid) and the configured dir stay trusted too.
+    identity_root = identity["authority_root"]
+
+    holder_root =
+      case SymphonyElixir.RuntimeLease.authority_root() do
+        {:ok, root} -> root
+        {:error, _no_authority} -> nil
+      end
+
+    managed_dirs =
+      [receipt_dir(nil), receipt_dir(holder_root), receipt_dir(identity_root)]
+      |> Enum.reject(&(!is_binary(&1)))
+      |> Enum.map(&(&1 |> Path.expand() |> normalize_path()))
+      |> Enum.uniq()
+
+    candidate = identity["receipt_path"] |> Path.expand() |> normalize_path()
+
+    Enum.any?(managed_dirs, fn managed ->
+      String.starts_with?(candidate, managed <> "\\") or String.starts_with?(candidate, managed <> "/")
+    end)
   end
 
   defp normalize_path(path) do

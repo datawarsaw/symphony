@@ -86,7 +86,7 @@ defmodule SymphonyElixir.AgentRunner do
     if Discovery.discovery?(issue) do
       Discovery.run(issue, codex_update_recipient, Keyword.put(opts, :worker_host, worker_host))
     else
-      with {:ok, implementation_issue} <- Discovery.implementation_issue(issue) do
+      with {:ok, implementation_issue} <- Discovery.implementation_issue(issue, Keyword.take(opts, [:authority_root])) do
         run_implementation_on_worker_host(implementation_issue, codex_update_recipient, opts, worker_host)
       end
     end
@@ -95,13 +95,14 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_implementation_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue_with_route(issue, worker_host) do
+    case Workspace.create_for_issue_with_route(issue, worker_host, workspace_root_opts(opts)) do
       {:ok, workspace, route, workspace_root} ->
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, workspace_root)
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host, route),
-               {:ok, provenance} <- Workspace.capture_provenance(workspace, issue, worker_host, route) do
+               root_opts <- workspace_root_opts(opts),
+               {:ok, provenance} <- Workspace.capture_provenance(workspace, issue, worker_host, route, root_opts) do
             log_workspace_provenance(issue, provenance)
             run_codex_turns(workspace, workspace_root, issue, codex_update_recipient, opts, worker_host, provenance)
           end
@@ -112,6 +113,16 @@ defmodule SymphonyElixir.AgentRunner do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # The orchestrator's boot-pinned mutation roots, translated into Workspace
+  # option names. Absent in unpinned contexts, where configuration resolves
+  # the roots live.
+  defp workspace_root_opts(opts) do
+    [
+      workspace_root: Keyword.get(opts, :authority_root),
+      configured_workspace_root: Keyword.get(opts, :configured_workspace_root)
+    ]
   end
 
   defp codex_message_handler(recipient, issue) do

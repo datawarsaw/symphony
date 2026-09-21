@@ -23,22 +23,29 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  # Root options (workspace_root: the local canonical mutation root,
+  # configured_workspace_root: the raw root remote worker hosts resolve) pin
+  # every managed path to the runtime's boot-pinned authority root. When they
+  # are absent — direct API use, tests — configuration resolves the roots live,
+  # exactly as before pinning existed.
   @doc false
-  @spec create_for_issue_with_route(map() | String.t() | nil, worker_host()) ::
+  @spec create_for_issue_with_route(map() | String.t() | nil, worker_host(), keyword()) ::
           {:ok, Path.t(), RepositoryRouter.Route.t() | nil, Path.t() | nil} | {:error, term()}
-  def create_for_issue_with_route(issue_or_identifier, worker_host \\ nil) do
+  def create_for_issue_with_route(issue_or_identifier, worker_host \\ nil, opts \\ []) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
       safe_id = workspace_key(issue_or_identifier)
+      local_root = local_workspace_root(opts)
+      configured_root = configured_workspace_root(opts)
 
       with {:ok, route} <- resolve_repository_route(issue_or_identifier),
            :ok <- sync_source_baseline(route, issue_context, worker_host),
            issue_context = Map.put(issue_context, :repository_route, route),
-           {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
-           :ok <- validate_workspace_path(workspace, worker_host),
+           {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host, local_root, configured_root),
+           :ok <- validate_workspace_path(workspace, worker_host, opts),
            {:ok, workspace, created?, recorded_root} <-
-             ensure_workspace(workspace, worker_host, creation_workspace_root(worker_host)),
+             ensure_workspace(workspace, worker_host, creation_root(worker_host, local_root, configured_root)),
            :ok <- verify_reused_workspace_repository(workspace, route, created?, worker_host) do
         case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
           :ok ->
@@ -56,15 +63,29 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  # The trusted deletion boundary for a workspace is the root it was created under,
-  # captured here at creation time. Remote roots are resolved by the prepare script
-  # because the recorded workspace path is that host's canonical `pwd -P` output,
-  # which the control host cannot reproduce for `~`-relative or relative roots.
-  defp creation_workspace_root(nil), do: Config.local_workspace_root()
-
-  defp creation_workspace_root(worker_host) when is_binary(worker_host) do
-    Config.settings!().workspace.root
+  # The pinned roots for one runtime-driven call: `:workspace_root` is the
+  # canonical local root the runtime authority protects; `:configured_workspace_root`
+  # is the raw configured root a remote worker host resolves itself. Both default
+  # to live configuration when absent or nil.
+  defp local_workspace_root(opts) do
+    case Keyword.get(opts, :workspace_root) do
+      root when is_binary(root) and root != "" -> root
+      _ -> Config.local_workspace_root()
+    end
   end
+
+  defp configured_workspace_root(opts) do
+    case Keyword.get(opts, :configured_workspace_root) do
+      root when is_binary(root) and root != "" -> root
+      _ -> Config.settings!().workspace.root
+    end
+  end
+
+  # The trusted creation boundary: the canonical local root for local
+  # workspaces, the raw configured root for remote hosts (they resolve it in
+  # their own filesystem during the prepare script).
+  defp creation_root(nil, local_root, _configured_root), do: local_root
+  defp creation_root(worker_host, _local_root, configured_root) when is_binary(worker_host), do: configured_root
 
   defp ensure_workspace(workspace, nil, workspace_root) do
     cond do
@@ -132,10 +153,13 @@ defmodule SymphonyElixir.Workspace do
   def remove(workspace), do: remove(workspace, nil)
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove(workspace, nil) do
+  def remove(workspace, worker_host), do: remove(workspace, worker_host, [])
+
+  @spec remove(Path.t(), worker_host(), keyword()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove(workspace, nil, opts) when is_list(opts) do
     case File.exists?(workspace) do
       true ->
-        case validate_workspace_path(workspace, nil) do
+        case validate_workspace_path(workspace, nil, opts) do
           :ok ->
             remove_local_workspace(workspace)
 
@@ -148,7 +172,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  def remove(workspace, worker_host) when is_binary(worker_host) do
+  def remove(workspace, worker_host, opts) when is_binary(worker_host) and is_list(opts) do
     maybe_run_before_remove_hook(workspace, worker_host)
 
     script =
@@ -172,19 +196,31 @@ defmodule SymphonyElixir.Workspace do
 
   @doc false
   @spec remove_recorded(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove_recorded(workspace, worker_host), do: remove_recorded(workspace, worker_host, nil)
+  def remove_recorded(workspace, worker_host), do: remove_recorded(workspace, worker_host, nil, [])
 
   # Recorded cleanup is the only removal path that acts on a path stored outside the
   # caller's control, so it must prove containment in the workspace root that was active
   # when the workspace was created. `recorded_root` is that root; when it is unavailable
-  # the current configured root is the boundary instead. Nothing touches the workspace -
-  # no `before_remove` hook and no recursive deletion - until containment holds.
+  # the runtime's pinned root (option `:fallback_workspace_root`, or the raw
+  # `:fallback_configured_workspace_root` for remote hosts) is the boundary instead.
+  # Nothing touches the workspace - no `before_remove` hook and no recursive deletion -
+  # until containment holds.
   @doc false
   @spec remove_recorded(Path.t(), worker_host(), Path.t() | nil) ::
           {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove_recorded(workspace, nil, recorded_root) when is_binary(workspace) do
+  def remove_recorded(workspace, worker_host, recorded_root),
+    do: remove_recorded(workspace, worker_host, recorded_root, [])
+
+  @doc false
+  @spec remove_recorded(Path.t(), worker_host(), Path.t() | nil, keyword()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded(workspace, nil, recorded_root, opts)
+      when is_binary(workspace) and is_list(opts) do
     if Path.type(workspace) == :absolute do
-      case validate_local_workspace_path(workspace, trusted_local_workspace_root(recorded_root)) do
+      trusted_root =
+        trusted_local_workspace_root(recorded_root, Keyword.get(opts, :fallback_workspace_root))
+
+      case validate_local_workspace_path(workspace, trusted_root) do
         :ok ->
           remove_local_workspace(workspace)
 
@@ -196,18 +232,21 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  def remove_recorded(workspace, worker_host, recorded_root)
-      when is_binary(workspace) and is_binary(worker_host) do
-    case validate_remote_workspace_path(workspace, trusted_remote_workspace_root(recorded_root)) do
+  def remove_recorded(workspace, worker_host, recorded_root, opts)
+      when is_binary(workspace) and is_binary(worker_host) and is_list(opts) do
+    trusted_root =
+      trusted_remote_workspace_root(recorded_root, Keyword.get(opts, :fallback_configured_workspace_root))
+
+    case validate_remote_workspace_path(workspace, trusted_root) do
       :ok ->
-        remove(workspace, worker_host)
+        remove(workspace, worker_host, opts)
 
       {:error, reason} ->
         {:error, reason, ""}
     end
   end
 
-  def remove_recorded(workspace, _worker_host, _recorded_root) do
+  def remove_recorded(workspace, _worker_host, _recorded_root, _opts) do
     {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
   end
 
@@ -217,58 +256,63 @@ defmodule SymphonyElixir.Workspace do
   end
 
   @spec remove_issue_workspaces(term()) :: :ok
-  def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil)
+  def remove_issue_workspaces(identifier), do: remove_issue_workspaces(identifier, nil, [])
 
   @spec remove_issue_workspaces(term(), worker_host()) :: :ok
-  def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, worker_host)
-      when is_binary(worker_host) do
-    case workspace_path_for_issue(workspace_key(issue), worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
+  def remove_issue_workspaces(target, worker_host), do: remove_issue_workspaces(target, worker_host, [])
+
+  @spec remove_issue_workspaces(term(), worker_host(), keyword()) :: :ok
+  def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, worker_host, opts)
+      when is_binary(worker_host) and is_list(opts) do
+    case pinned_workspace_path(issue, worker_host, opts) do
+      {:ok, workspace} -> remove(workspace, worker_host, opts)
       {:error, _reason} -> :ok
     end
 
     :ok
   end
 
-  def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, nil) do
+  def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, nil, opts)
+      when is_list(opts) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
-        remove_local_issue_workspace(issue)
+        remove_local_issue_workspace(issue, opts)
 
       worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(issue, &1))
+        Enum.each(worker_hosts, &remove_issue_workspaces(issue, &1, opts))
     end
 
     :ok
   end
 
-  def remove_issue_workspaces(identifier, worker_host) when is_binary(identifier) and is_binary(worker_host) do
-    case workspace_path_for_issue(workspace_key(identifier), worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
+  def remove_issue_workspaces(identifier, worker_host, opts)
+      when is_binary(identifier) and is_binary(worker_host) and is_list(opts) do
+    case pinned_workspace_path(identifier, worker_host, opts) do
+      {:ok, workspace} -> remove(workspace, worker_host, opts)
       {:error, _reason} -> :ok
     end
 
     :ok
   end
 
-  def remove_issue_workspaces(identifier, nil) when is_binary(identifier) do
+  def remove_issue_workspaces(identifier, nil, opts) when is_binary(identifier) and is_list(opts) do
     case Config.settings!().worker.ssh_hosts do
       [] ->
-        remove_local_issue_workspace(identifier)
+        remove_local_issue_workspace(identifier, opts)
 
       worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1))
+        Enum.each(worker_hosts, &remove_issue_workspaces(identifier, &1, opts))
     end
 
     :ok
   end
 
-  def remove_issue_workspaces(_identifier, _worker_host), do: :ok
+  def remove_issue_workspaces(_identifier, _worker_host, _opts), do: :ok
 
-  defp remove_local_issue_workspace(issue_or_identifier) do
-    case classify_candidate(issue_or_identifier, nil) do
+  defp remove_local_issue_workspace(issue_or_identifier, opts) do
+    case classify_candidate(issue_or_identifier, nil, opts) do
       {:ok, :resume, workspace, _route} ->
-        remove(workspace, nil)
+        remove(workspace, nil, opts)
         :ok
 
       {:ok, :fresh, _workspace, _route} ->
@@ -330,7 +374,16 @@ defmodule SymphonyElixir.Workspace do
   @spec capture_provenance(Path.t(), issue_reference(), worker_host(), route()) :: {:ok, map()} | {:error, term()}
   def capture_provenance(workspace, _issue_or_identifier, worker_host, route)
       when is_binary(workspace) and (is_nil(route) or is_struct(route, RepositoryRouter.Route)) do
-    capture_workspace_provenance(workspace, route, worker_host)
+    capture_workspace_provenance(workspace, route, worker_host, [])
+  end
+
+  @doc false
+  @spec capture_provenance(Path.t(), issue_reference(), worker_host(), route(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def capture_provenance(workspace, _issue_or_identifier, worker_host, route, opts)
+      when is_binary(workspace) and is_list(opts) and
+             (is_nil(route) or is_struct(route, RepositoryRouter.Route)) do
+    capture_workspace_provenance(workspace, route, worker_host, opts)
   end
 
   defp run_before_run_hook_for_context(workspace, issue_context, worker_host) do
@@ -345,8 +398,8 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp capture_workspace_provenance(workspace, nil, nil) do
-    case validate_workspace_path(workspace, nil) do
+  defp capture_workspace_provenance(workspace, nil, nil, opts) do
+    case validate_workspace_path(workspace, nil, opts) do
       :ok ->
         case local_git_output(workspace, ["rev-parse", "--verify", "HEAD^{commit}"]) do
           {:ok, head} ->
@@ -361,8 +414,9 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp capture_workspace_provenance(workspace, nil, worker_host) when is_binary(worker_host) do
-    case validate_workspace_path(workspace, worker_host) do
+  defp capture_workspace_provenance(workspace, nil, worker_host, opts)
+       when is_binary(worker_host) do
+    case validate_workspace_path(workspace, worker_host, opts) do
       :ok ->
         case remote_git_provenance(workspace, worker_host) do
           {:ok, {head, origin}} -> {:ok, unrouted_provenance(head, {:ok, origin})}
@@ -375,8 +429,8 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp capture_workspace_provenance(workspace, %RepositoryRouter.Route{} = route, nil) do
-    with :ok <- validate_workspace_path(workspace, nil),
+  defp capture_workspace_provenance(workspace, %RepositoryRouter.Route{} = route, nil, opts) do
+    with :ok <- validate_workspace_path(workspace, nil, opts),
          {:ok, head} <- local_git_output(workspace, ["rev-parse", "--verify", "HEAD^{commit}"]),
          {:ok, origin} <- local_origin(workspace) do
       {:ok, provenance(route, head, origin)}
@@ -385,9 +439,9 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp capture_workspace_provenance(workspace, %RepositoryRouter.Route{} = route, worker_host)
+  defp capture_workspace_provenance(workspace, %RepositoryRouter.Route{} = route, worker_host, opts)
        when is_binary(worker_host) do
-    with :ok <- validate_workspace_path(workspace, worker_host),
+    with :ok <- validate_workspace_path(workspace, worker_host, opts),
          {:ok, {head, origin}} <- remote_git_provenance(workspace, worker_host) do
       {:ok, provenance(route, head, origin)}
     else
@@ -503,18 +557,36 @@ defmodule SymphonyElixir.Workspace do
   end
 
   @doc false
+  @spec workspace_path(issue_reference()) :: {:ok, Path.t()} | {:error, term()}
+  def workspace_path(issue_or_identifier), do: workspace_path(issue_or_identifier, nil, [])
+
+  @doc false
   @spec workspace_path(issue_reference(), worker_host()) :: {:ok, Path.t()} | {:error, term()}
-  def workspace_path(issue_or_identifier, worker_host \\ nil) do
+  def workspace_path(issue_or_identifier, worker_host), do: workspace_path(issue_or_identifier, worker_host, [])
+
+  @doc false
+  @spec workspace_path(issue_reference(), worker_host(), keyword()) :: {:ok, Path.t()} | {:error, term()}
+  def workspace_path(issue_or_identifier, worker_host, opts) when is_list(opts) do
     safe_id = workspace_key(issue_or_identifier)
-    workspace_path_for_issue(safe_id, worker_host)
+    workspace_path_for_issue(safe_id, worker_host, local_workspace_root(opts), configured_workspace_root(opts))
   end
+
+  @doc false
+  @spec classify_candidate(issue_reference()) ::
+          {:ok, classification(), Path.t(), route()} | {:error, term()}
+  def classify_candidate(issue_or_identifier), do: classify_candidate(issue_or_identifier, nil, [])
 
   @doc false
   @spec classify_candidate(issue_reference(), worker_host()) ::
           {:ok, classification(), Path.t(), route()} | {:error, term()}
-  def classify_candidate(issue_or_identifier, worker_host \\ nil) do
+  def classify_candidate(issue_or_identifier, worker_host), do: classify_candidate(issue_or_identifier, worker_host, [])
+
+  @doc false
+  @spec classify_candidate(issue_reference(), worker_host(), keyword()) ::
+          {:ok, classification(), Path.t(), route()} | {:error, term()}
+  def classify_candidate(issue_or_identifier, worker_host, opts) when is_list(opts) do
     with {:ok, route} <- resolve_repository_route(issue_or_identifier),
-         {:ok, workspace} <- workspace_path(issue_or_identifier, worker_host) do
+         {:ok, workspace} <- workspace_path(issue_or_identifier, worker_host, opts) do
       case workspace_exists?(workspace, worker_host) do
         true ->
           # Repository identity is necessary but not sufficient: a structurally
@@ -534,14 +606,24 @@ defmodule SymphonyElixir.Workspace do
   defp workspace_exists?(workspace, nil) when is_binary(workspace), do: File.exists?(workspace)
   defp workspace_exists?(_workspace, _worker_host), do: false
 
-  defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
-    Config.local_workspace_root()
+  defp pinned_workspace_path(target, worker_host, opts) do
+    safe_id = workspace_key(target)
+    local_root = local_workspace_root(opts)
+    configured_root = configured_workspace_root(opts)
+
+    workspace_path_for_issue(safe_id, worker_host, local_root, configured_root)
+  end
+
+  defp workspace_path_for_issue(safe_id, nil, local_root, _configured_root)
+       when is_binary(safe_id) and is_binary(local_root) do
+    local_root
     |> Path.join(safe_id)
     |> PathSafety.canonicalize()
   end
 
-  defp workspace_path_for_issue(safe_id, worker_host) when is_binary(safe_id) and is_binary(worker_host) do
-    {:ok, Path.join(Config.settings!().workspace.root, safe_id)}
+  defp workspace_path_for_issue(safe_id, worker_host, _local_root, configured_root)
+       when is_binary(safe_id) and is_binary(worker_host) and is_binary(configured_root) do
+    {:ok, Path.join(configured_root, safe_id)}
   end
 
   @doc """
@@ -771,11 +853,11 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp validate_workspace_path(workspace, nil) when is_binary(workspace) do
-    validate_local_workspace_path(workspace, Config.local_workspace_root())
+  defp validate_workspace_path(workspace, nil, opts) when is_binary(workspace) and is_list(opts) do
+    validate_local_workspace_path(workspace, local_workspace_root(opts))
   end
 
-  defp validate_workspace_path(workspace, worker_host)
+  defp validate_workspace_path(workspace, worker_host, _opts)
        when is_binary(workspace) and is_binary(worker_host) do
     cond do
       String.trim(workspace) == "" ->
@@ -790,26 +872,31 @@ defmodule SymphonyElixir.Workspace do
   end
 
   # Trusted deletion boundary for recorded cleanup: the root the workspace was created
-  # under whenever that root was recorded, otherwise the current configured root. The
-  # recorded root is preferred because WORKFLOW.md may have moved the active root since
-  # the workspace was created, and that move must not silently retarget deletion.
-  defp trusted_local_workspace_root(recorded_root) when is_binary(recorded_root) do
+  # under whenever that root was recorded, otherwise the runtime's pinned root
+  # (`fallback_root`, option `:fallback_workspace_root`). The recorded root is preferred
+  # because WORKFLOW.md may have moved the active root since the workspace was created,
+  # and that move must not silently retarget deletion.
+  defp trusted_local_workspace_root(recorded_root, fallback_root)
+       when is_binary(recorded_root) and (is_binary(fallback_root) or is_nil(fallback_root)) do
     case String.trim(recorded_root) do
-      "" -> Config.local_workspace_root()
+      "" -> fallback_root || Config.local_workspace_root()
       root -> root
     end
   end
 
-  defp trusted_local_workspace_root(_recorded_root), do: Config.local_workspace_root()
+  defp trusted_local_workspace_root(_recorded_root, fallback_root),
+    do: fallback_root || Config.local_workspace_root()
 
-  defp trusted_remote_workspace_root(recorded_root) when is_binary(recorded_root) do
+  defp trusted_remote_workspace_root(recorded_root, fallback_root)
+       when is_binary(recorded_root) and (is_binary(fallback_root) or is_nil(fallback_root)) do
     case String.trim(recorded_root) do
-      "" -> configured_remote_workspace_root()
+      "" -> fallback_root || configured_remote_workspace_root()
       root -> root
     end
   end
 
-  defp trusted_remote_workspace_root(_recorded_root), do: configured_remote_workspace_root()
+  defp trusted_remote_workspace_root(_recorded_root, fallback_root),
+    do: fallback_root || configured_remote_workspace_root()
 
   defp configured_remote_workspace_root do
     case Config.settings!().workspace.root do

@@ -257,6 +257,16 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
+    # The test VM's application boot is a documented unpinned entry path, so it
+    # holds no runtime-authority lease; this test acquires one on a fixture
+    # root to cover the held projection, then releases to cover the
+    # unavailable shape — both truthful, holder-scoped, never suite-global.
+    authority_root = Path.join(System.tmp_dir!(), "mic-extensions-lease-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(authority_root)
+    on_exit(fn -> File.rm_rf(authority_root) end)
+
+    assert {:ok, _holder} = SymphonyElixir.RuntimeLease.acquire_and_hold(root: authority_root)
+
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
 
@@ -318,8 +328,51 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             # MIC-10: the durable steering inbox projection (empty for this
+             # static snapshot fixture).
+             "steering" => %{"counts" => %{}, "entries" => []},
+             # Read-only runtime authority projection: this test holds the
+             # single-instance lifecycle lease on its fixture root, so the
+             # projection reports the holder's identity and heartbeat.
+             "runtime_authority" => %{
+               "held" => true,
+               "lost" => false,
+               "instance_id" => state_payload["runtime_authority"]["instance_id"],
+               "os_pid" => state_payload["runtime_authority"]["os_pid"],
+               "hostname" => state_payload["runtime_authority"]["hostname"],
+               "state_root" => authority_root,
+               # Mutation-root truth projected by the runtime authority payload:
+               # what live configuration currently desires and whether the two
+               # roots have diverged (drift never moves the mutation root).
+               # Resolved from the payload itself: whether this holder is
+               # drifted depends on the test VM's own configured root.
+               "configured_root" => state_payload["runtime_authority"]["configured_root"],
+               "root_drift" => state_payload["runtime_authority"]["root_drift"],
+               "restart_required" => state_payload["runtime_authority"]["restart_required"],
+               "started_at" => state_payload["runtime_authority"]["started_at"],
+               "heartbeat_at" => state_payload["runtime_authority"]["heartbeat_at"],
+               "last_renew_at" => state_payload["runtime_authority"]["last_renew_at"],
+               "renew_error" => state_payload["runtime_authority"]["renew_error"]
+             }
            }
+
+    assert is_binary(state_payload["runtime_authority"]["instance_id"])
+    assert byte_size(state_payload["runtime_authority"]["instance_id"]) == 32
+    assert is_binary(state_payload["runtime_authority"]["started_at"])
+
+    # After the holder releases, the same projection truthfully reports that
+    # this entry path holds no runtime authority.
+    assert :ok = SymphonyElixir.RuntimeLease.release_held()
+
+    conn = get(build_conn(), "/api/v1/state")
+    released_payload = json_response(conn, 200)
+
+    assert %{
+             "held" => false,
+             "lost" => false,
+             "reason" => "runtime_authority_unavailable"
+           } = released_payload["runtime_authority"]
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)

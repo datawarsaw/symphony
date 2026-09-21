@@ -1808,7 +1808,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert StatusDashboard.humanize_codex_message(fallback_reasoning) == "reasoning update"
   end
 
-  test "application stop renders offline status" do
+  test "application stop renders offline status and releases runtime authority" do
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->
         assert :ok = SymphonyElixir.Application.stop(:normal)
@@ -1816,6 +1816,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert rendered =~ "app_status=offline"
     refute rendered =~ "Timestamp:"
+
+    # stop/1 releases the runtime authority lease when one is held (the
+    # production shutdown contract) and is a harmless no-op otherwise. The
+    # test VM's application boot is the documented unpinned entry path — it
+    # holds no lease, so release here is the no-op branch, and this assertion
+    # pins that stop/1 never leaves an authority claim behind.
+    refute SymphonyElixir.RuntimeLease.authoritative?()
   end
 
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do

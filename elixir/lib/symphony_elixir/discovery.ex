@@ -44,7 +44,7 @@ defmodule SymphonyElixir.Discovery do
     with true <- Config.settings!().discovery.enabled,
          true <- is_nil(Keyword.get(opts, :worker_host)),
          {:ok, input} <- snapshot(issue),
-         {:ok, workspace} <- workspace(input),
+         {:ok, workspace} <- workspace(input, mutation_root(opts)),
          {:ok, evidence} <- cached_or_execute(issue, workspace, input, recipient, opts),
          :ok <- publish_retained(issue, input, opts) do
       if is_pid(recipient), do: send(recipient, {:discovery_completed, issue.id, evidence.status})
@@ -74,18 +74,18 @@ defmodule SymphonyElixir.Discovery do
     end
   end
 
-  @spec implementation_issue(map()) :: {:ok, map()} | {:error, term()}
-  def implementation_issue(issue) do
+  @spec implementation_issue(map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def implementation_issue(issue, opts \\ []) do
     if Config.settings!().discovery.enabled do
       with {:ok, input} <- snapshot(issue) do
-        consume_evidence(read_evidence(issue.id, input), issue)
+        consume_evidence(read_evidence(issue.id, input, mutation_root(opts)), issue, mutation_root(opts))
       end
     else
       {:ok, issue}
     end
   end
 
-  defp consume_evidence({:ok, %{status: "READY", output: output}}, issue) do
+  defp consume_evidence({:ok, %{status: "READY", output: output}}, issue, _root) do
     with {:ok, %{verdict: "READY", handoff: handoff}} <- Contract.parse(output),
          %{status: "READY"} <- bind_issue(%{status: "READY", output: output}, issue) do
       {:ok, %{issue | description: handoff}}
@@ -94,14 +94,14 @@ defmodule SymphonyElixir.Discovery do
     end
   end
 
-  defp consume_evidence({:error, :enoent}, issue) do
-    if File.dir?(evidence_dir(issue.id)), do: {:error, :stale_discovery_handoff}, else: {:ok, issue}
+  defp consume_evidence({:error, :enoent}, issue, root) do
+    if File.dir?(evidence_dir(issue.id, root)), do: {:error, :stale_discovery_handoff}, else: {:ok, issue}
   end
 
-  defp consume_evidence(_, _), do: {:error, :discovery_not_ready}
+  defp consume_evidence(_, _, _root), do: {:error, :discovery_not_ready}
 
   defp cached_or_execute(issue, workspace, input, recipient, opts) do
-    case read_evidence(issue.id, input) do
+    case read_evidence(issue.id, input, mutation_root(opts)) do
       # A READY handoff or a deterministic semantic verdict is authoritative for the
       # same (issue_id, input_sha256) and stays a cache hit. A persisted technical
       # failure is kept for forensics but is never authoritative semantics: the next
@@ -134,12 +134,12 @@ defmodule SymphonyElixir.Discovery do
 
     evidence = evidence |> bind_issue(issue) |> Map.put(:duration_ms, System.monotonic_time(:millisecond) - started)
     evidence = Map.put(evidence, :completed_at, DateTime.to_iso8601(DateTime.utc_now()))
-    persist(issue.id, input, evidence)
+    persist(issue.id, input, evidence, mutation_root(opts))
   end
 
   defp publish_retained(issue, input, opts) do
     if Config.settings!().tracker.kind == "linear" or Keyword.has_key?(opts, :publication_graphql) do
-      with {:ok, evidence} <- read_evidence(issue.id, input),
+      with {:ok, evidence} <- read_evidence(issue.id, input, mutation_root(opts)),
            true <- is_binary(evidence.output),
            {:ok, parsed} <- Contract.parse(evidence.output),
            true <- parsed.verdict == evidence.status,
@@ -284,14 +284,21 @@ defmodule SymphonyElixir.Discovery do
     end
   end
 
-  defp workspace(input) do
-    path = Path.join(Config.local_workspace_root(), "discovery-" <> digest(input))
-    with :ok <- safe_path(path), :ok <- File.mkdir_p(path), do: {:ok, path}
+  # The runtime's boot-pinned mutation root when launched by a pinned runtime;
+  # live configuration in direct API use.
+  defp mutation_root(opts) do
+    case Keyword.get(opts, :authority_root) do
+      root when is_binary(root) and root != "" -> root
+      _ -> Config.local_workspace_root()
+    end
   end
 
-  defp safe_path(path) do
-    root = Config.local_workspace_root()
+  defp workspace(input, root) do
+    path = Path.join(root, "discovery-" <> digest(input))
+    with :ok <- safe_path(path, root), :ok <- File.mkdir_p(path), do: {:ok, path}
+  end
 
+  defp safe_path(path, root) do
     with {:ok, canonical_root} <- PathSafety.canonicalize(root),
          {:ok, canonical_path} <- PathSafety.canonicalize(path),
          true <- canonical_path == Path.join(canonical_root, Path.relative_to(path, root)) do
@@ -302,15 +309,18 @@ defmodule SymphonyElixir.Discovery do
   end
 
   defp digest(input), do: :crypto.hash(:sha256, input) |> Base.encode16(case: :lower)
-  defp evidence_dir(issue_id), do: Path.join([Config.local_workspace_root(), ".discovery-results", digest(issue_id)])
-  defp evidence_path(issue_id, input), do: Path.join(evidence_dir(issue_id), digest(input) <> ".json")
+  defp evidence_dir(issue_id, root), do: Path.join([root, ".discovery-results", digest(issue_id)])
 
-  defp read_evidence(issue_id, input) do
-    with :ok <- safe_path(evidence_path(issue_id, input)),
-         {:ok, body} <- File.read(evidence_path(issue_id, input)),
+  defp evidence_path(issue_id, input, root), do: Path.join(evidence_dir(issue_id, root), digest(input) <> ".json")
+
+  defp read_evidence(issue_id, input, root) do
+    path = evidence_path(issue_id, input, root)
+
+    with :ok <- safe_path(path, root),
+         {:ok, body} <- File.read(path),
          {:ok, %{"input_sha256" => hash, "status" => status, "output" => output} = fields} <- Jason.decode(body),
          true <- hash == digest(input),
-         {:ok, stat} <- File.stat(evidence_path(issue_id, input), time: :posix) do
+         {:ok, stat} <- File.stat(path, time: :posix) do
       metadata = Map.new([:provider, :model, :reasoning, :lane, :fallback_reason, :duration_ms, :completed_at], &{&1, fields[Atom.to_string(&1)]})
       completed_at = metadata.completed_at || DateTime.to_iso8601(DateTime.from_unix!(stat.mtime))
       {:ok, Map.merge(metadata, %{status: status, output: output, completed_at: completed_at})}
@@ -320,13 +330,13 @@ defmodule SymphonyElixir.Discovery do
     end
   end
 
-  defp persist(issue_id, input, evidence) do
-    path = evidence_path(issue_id, input)
+  defp persist(issue_id, input, evidence, root) do
+    path = evidence_path(issue_id, input, root)
     temp = path <> "." <> Integer.to_string(System.unique_integer([:positive])) <> ".tmp"
     body = evidence |> Map.put(:input_sha256, digest(input)) |> Jason.encode!()
 
-    with :ok <- safe_path(path),
-         :ok <- safe_path(temp),
+    with :ok <- safe_path(path, root),
+         :ok <- safe_path(temp, root),
          :ok <- File.mkdir_p(Path.dirname(path)),
          :ok <- File.write(temp, body, [:exclusive]),
          :ok <- File.rename(temp, path) do
