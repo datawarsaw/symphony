@@ -3,6 +3,7 @@ Code.require_file("support/snapshot_support.exs", __DIR__)
 Code.require_file("support/fake_ssh.exs", __DIR__)
 Code.require_file("support/test_support.exs", __DIR__)
 Code.require_file("support/scratch_process.exs", __DIR__)
+Code.require_file("support/delivery_fixtures.exs", __DIR__)
 
 # MIC-223: on Windows the containment helper must exist and hash-verify before
 # the suite runs, because local worker launches go through jobrun. Building from
