@@ -323,7 +323,19 @@ defmodule SymphonyElixir.WorkspaceViabilityLaunchFenceTest do
   # ── Fixtures and helpers ────────────────────────────────────────────────────
 
   defp combined_fixture!(name) do
-    test_root = Path.join(System.tmp_dir!(), "symphony-viability-fence-fixture-#{name}-#{System.unique_integer([:positive])}")
+    # unique_integer restarts at 1 in every BEAM, so a fixture root a previous
+    # run leaked under the same id would be silently reinitialized by `git init`
+    # and break this run's setup; the clock suffix makes the path unique across
+    # concurrent and successive runs.
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-viability-fence-fixture-#{name}-#{System.unique_integer([:positive])}-#{System.system_time(:native)}"
+      )
+
+    # Register cleanup before the fixture exists, so even a fixture-setup
+    # failure cannot leak the tree into the shared TEMP root.
+    on_exit(fn -> SymphonyElixir.TestSupport.remove_temp_fixture_root!(test_root) end)
     File.mkdir_p!(test_root)
 
     remote_repo = Path.join(test_root, "remote.git") |> String.replace("\\", "/")

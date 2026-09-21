@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.TestSupport do
+  require Logger
+
   @workflow_prompt "You are an agent for this repository."
 
   # Application env owned by the harness: every test may change it, and later
@@ -213,6 +215,30 @@ defmodule SymphonyElixir.TestSupport do
 
       {:error, :fixture_error, detail} ->
         raise "symlink fixture setup failed for #{inspect(link)} -> #{inspect(target)}: #{detail}"
+    end
+  end
+
+  @doc """
+  Removes a test-owned fixture root under the system TEMP root.
+
+  On Windows a freshly written `.git` file can still be held open for a short
+  while by a scanner or a draining process, which makes a single `File.rm_rf/1`
+  fail with a transient error and leak the whole fixture into the shared TEMP
+  root. The removal retries briefly; a final failure is logged (not raised) so
+  a slow host cannot turn fixture cleanup into a flaky test failure.
+  """
+  def remove_temp_fixture_root!(root, attempts \\ 12) when is_binary(root) do
+    case File.rm_rf(root) do
+      {:ok, _removed} ->
+        :ok
+
+      {:error, reason, path} when attempts <= 1 ->
+        Logger.warning("Test fixture cleanup failed after retries path=#{root} reason=#{inspect(reason)} file=#{inspect(path)}")
+
+      {:error, reason, _path} ->
+        Logger.debug("Test fixture cleanup retrying path=#{root} reason=#{inspect(reason)}")
+        Process.sleep(250)
+        remove_temp_fixture_root!(root, attempts - 1)
     end
   end
 

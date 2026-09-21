@@ -387,6 +387,9 @@ defmodule SymphonyElixir.LaunchFenceTest do
 
   defp fence_fixture!(name, overrides \\ []) do
     test_root = test_root_path(name)
+    # Register cleanup before the fixture exists, so even a fixture-setup
+    # failure cannot leak the tree into the shared TEMP root.
+    on_exit(fn -> SymphonyElixir.TestSupport.remove_temp_fixture_root!(test_root) end)
     fixture = setup_source_fixture!(test_root)
 
     # Dispatch fixtures keep containment off so the agent task a successful
@@ -568,7 +571,14 @@ defmodule SymphonyElixir.LaunchFenceTest do
   end
 
   defp test_root_path(name) do
-    Path.join(System.tmp_dir!(), "symphony-launch-fence-fixture-#{name}-#{System.unique_integer([:positive])}")
+    # unique_integer restarts at 1 in every BEAM, so a fixture root a previous
+    # run leaked under the same id would be silently reinitialized by `git init`
+    # and break this run's setup; the clock suffix makes the path unique across
+    # concurrent and successive runs.
+    Path.join(
+      System.tmp_dir!(),
+      "symphony-launch-fence-fixture-#{name}-#{System.unique_integer([:positive])}-#{System.system_time(:native)}"
+    )
   end
 
   defp setup_source_fixture!(test_root) do

@@ -38,13 +38,18 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
     }
   end
 
+  # Lifecycle cleanup treats the entry's workspace_root as the trusted deletion
+  # boundary, so it must be this test's owned per-test retry-store root and can
+  # never be the shared system TEMP root itself.
   defp running_entry(%Issue{} = issue) do
+    workspace_root = Application.fetch_env!(:symphony_elixir, :retry_store_root)
+
     %{
       identifier: issue.identifier,
       issue: issue,
       worker_host: nil,
-      workspace_path: Path.join(System.tmp_dir!(), "ws-" <> issue.id),
-      workspace_root: System.tmp_dir!(),
+      workspace_path: Path.join(workspace_root, "ws-" <> issue.id),
+      workspace_root: workspace_root,
       # MIC-223: these fixtures codify the legacy (non-managed) retry envelope;
       # a nil expectation would fail closed at the reuse gate.
       termination_expectation: :NOT_APPLICABLE
