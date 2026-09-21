@@ -34,13 +34,100 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "git clone --depth 1 #{template_repo} ."
+        hook_after_create: "git clone --depth 1 #{Workspace.shell_quote_path(template_repo)} ."
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("S-1")
       assert File.exists?(Path.join(workspace, ".git"))
-      assert File.read!(Path.join(workspace, "README.md")) == "hook clone\n"
+      # Content check tolerates autocrlf: checkout may write CRLF on Windows.
+      assert File.read!(Path.join(workspace, "README.md")) |> String.trim_trailing() == "hook clone"
       assert File.read!(Path.join([workspace, "keep", "file.txt"])) == "keep me"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  # Hook commands are shell scripts, so a path interpolated into the command text is shell
+  # syntax unless quoted. Each of these runs a real hook through `sh` with a real directory
+  # of the given shape and asserts the hook received the exact filesystem path as data.
+  defp capture_hook_path_raw(shape, unique_tag) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-hook-path-#{unique_tag}-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source = Path.join(test_root, shape)
+      File.mkdir_p!(source)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.join(test_root, "workspaces"),
+        hook_after_create: "test -d #{Workspace.shell_quote_path(source)} && printf '%s' #{Workspace.shell_quote_path(source)} > captured.txt"
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("S-#{unique_tag}")
+      assert File.read!(Path.join(workspace, "captured.txt")) == source
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "after_create hook receives backslash paths as data, not shell syntax" do
+    capture_hook_path_raw("source", "backslash")
+  end
+
+  test "after_create hook receives paths with spaces and parentheses intact" do
+    capture_hook_path_raw("source with spaces (v2)", "spaces-parens")
+  end
+
+  test "after_create hook receives Unicode paths intact" do
+    capture_hook_path_raw("source-ünïcødé-中文", "unicode")
+  end
+
+  test "after_create hook treats hostile path text as data, not a command" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-hook-path-hostile-#{System.unique_integer([:positive])}"
+      )
+
+    hostile = "x'; touch pwned; echo '"
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "printf '%s' #{Workspace.shell_quote_path(hostile)} > captured.txt"
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("S-HOSTILE")
+      assert File.read!(Path.join(workspace, "captured.txt")) == hostile
+      refute File.exists?(Path.join(workspace, "pwned"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "after_create keeps POSIX shell semantics: quoting, chaining, and env expansion" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-hook-posix-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.join(test_root, "workspaces"),
+        hook_after_create: """
+        first="quoted value"
+        test "$first" = "quoted value" && printf '%s\\n' "issue=$SYMPHONY_ISSUE_IDENTIFIER" > captured.txt
+        """
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("S-POSIX")
+      assert File.read!(Path.join(workspace, "captured.txt")) == "issue=S-POSIX\n"
     after
       File.rm_rf(test_root)
     end
@@ -521,6 +608,44 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                Workspace.create_for_issue("MT-TIMEOUT")
     after
       File.rm_rf(workspace_root)
+    end
+  end
+
+  # A hook whose shell cannot spawn is an infrastructure failure like any other:
+  # it must return the structured workspace-hook error and remove the partial
+  # workspace instead of escaping as an internal exception. The lookup is isolated
+  # by pointing this process's PATH at an empty directory; PATH is restored so no
+  # global or persistent state changes.
+  test "after_create spawn failure returns structured error and removes partial workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-spawn-failure-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    path_without_shell = Path.join(test_root, "path-without-shell")
+    File.mkdir_p!(path_without_shell)
+
+    previous_path = System.get_env("PATH")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "echo partial > partial.txt"
+      )
+
+      System.put_env("PATH", path_without_shell)
+
+      assert {:error, {:workspace_hook_spawn_failed, "after_create", reason}} =
+               Workspace.create_for_issue("MT-SPAWN-FAILURE")
+
+      assert is_binary(reason) and reason != ""
+
+      refute File.exists?(Path.join(workspace_root, Workspace.workspace_key("MT-SPAWN-FAILURE")))
+    after
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
     end
   end
 

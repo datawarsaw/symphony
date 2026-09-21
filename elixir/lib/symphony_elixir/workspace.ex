@@ -687,18 +687,31 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
+    # A missing shell must fail the workspace like any other hook failure instead of
+    # crashing this process through the async link, so cleanup semantics still run.
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command],
-          cd: workspace,
-          env: repository_route_environment(issue_context),
-          stderr_to_stdout: true
-        )
+        try do
+          System.cmd("sh", ["-lc", command],
+            cd: workspace,
+            env: repository_route_environment(issue_context),
+            stderr_to_stdout: true
+          )
+        rescue
+          error -> {:spawn_failed, Exception.message(error)}
+        end
       end)
 
     case Task.yield(task, timeout_ms) do
-      {:ok, cmd_result} ->
-        handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
+      # Must precede the generic {output, status} clause: {:spawn_failed, reason}
+      # is itself a 2-tuple and would otherwise be consumed as command output.
+      {:ok, {:spawn_failed, reason}} ->
+        Logger.warning("Workspace hook could not run hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local reason=#{inspect(reason)}")
+
+        {:error, {:workspace_hook_spawn_failed, hook_name, reason}}
+
+      {:ok, {output, status}} ->
+        handle_hook_command_result({output, status}, workspace, issue_context, hook_name)
 
       nil ->
         Task.shutdown(task, :brutal_kill)
@@ -971,6 +984,19 @@ defmodule SymphonyElixir.Workspace do
         {:error, {:workspace_hook_timeout, "remote_command", timeout_ms}}
     end
   end
+
+  @doc """
+  Quotes a filesystem path (or any literal value) for embedding in a workspace hook command.
+
+  Hook commands are shell scripts, so a value interpolated into the command text is shell
+  syntax unless quoted. This wraps the value in POSIX single quotes, which every supported
+  shell — including Git Bash `sh` on Windows — preserves byte-for-byte: backslashes, spaces,
+  parentheses, `$`, and Unicode in a path stay data and are never reinterpreted as shell
+  syntax. Prefer `"$SYMPHONY_REPOSITORY_*"` expansion for values Symphony exports, and the
+  working directory for the workspace path itself.
+  """
+  @spec shell_quote_path(String.t()) :: String.t()
+  def shell_quote_path(value) when is_binary(value), do: shell_escape(value)
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
