@@ -30,7 +30,10 @@ defmodule SymphonyElixirWeb.Presenter do
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
           steering: steering_payload(Map.get(snapshot, :steering, %{entries: [], counts: %{}})),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          # Read-only runtime authority projection: whether this runtime holds the
+          # single-instance lifecycle lease, and the identity/evidence it holds.
+          runtime_authority: runtime_authority_payload()
         }
 
       :timeout ->
@@ -125,6 +128,36 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp operational_status_name(status) when is_binary(status), do: String.upcase(status)
+
+  # Read-only runtime authority projection for the observability API: whether this
+  # runtime holds the single-instance lifecycle lease for its state root, plus the
+  # identity and heartbeat evidence. The owner token is never projected. Root
+  # truth: `state_root` is the pinned authority root this runtime mutates;
+  # `configured_root` is what live configuration currently desires; drift means
+  # only that a restart is required — it never moves the mutation root.
+  defp runtime_authority_payload do
+    case SymphonyElixir.RuntimeLease.status() do
+      {:ok, status} ->
+        %{
+          held: Map.get(status, :held?, false),
+          lost: Map.get(status, :lost?, false),
+          instance_id: status[:instance_id],
+          os_pid: status[:os_pid],
+          hostname: status[:hostname],
+          state_root: status[:root],
+          configured_root: Map.get(status, :configured_root),
+          root_drift: Map.get(status, :root_drift?, false),
+          restart_required: Map.get(status, :restart_required, false),
+          started_at: status[:started_at],
+          heartbeat_at: status[:heartbeat_at],
+          last_renew_at: status[:last_renew_at],
+          renew_error: status[:renew_error]
+        }
+
+      :unavailable ->
+        %{held: false, lost: false, reason: "runtime_authority_unavailable"}
+    end
+  end
 
   # MIC-10: read-only projection of the durable steering inbox. Instruction
   # text never leaves workspace-owned state.

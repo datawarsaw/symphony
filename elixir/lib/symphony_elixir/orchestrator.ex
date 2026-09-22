@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
 
   alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Steering, Tracker, Workspace}
-  alias SymphonyElixir.{DispatchRouter, FailureClass, LaunchMarker, RetryPolicy, RetryStore, WorkerContainment, WorkerFence}
+  alias SymphonyElixir.{DispatchRouter, FailureClass, LaunchMarker, RetryPolicy, RetryStore, RuntimeLease, WorkerContainment, WorkerFence}
   alias SymphonyElixir.Wake.Ledger
   alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Tracker.Issue
@@ -39,6 +39,8 @@ defmodule SymphonyElixir.Orchestrator do
     Runtime state for the orchestrator polling loop.
     """
 
+    @type t :: %__MODULE__{}
+
     defstruct [
       :poll_interval_ms,
       :max_concurrent_agents,
@@ -46,6 +48,14 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      # Mutation-root pinning: the boot-pinned authority root the runtime lease
+      # protects (and the raw configured workspace root as read at boot, for
+      # remote hosts). Injected by Application.start_runtime; nil in test or
+      # direct-API contexts, where the roots resolve live, exactly as before.
+      # Whatever these hold, a WORKFLOW.md reload never moves them.
+      :authority_root,
+      :configured_workspace_root,
+      root_drift_detected?: false,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -96,12 +106,14 @@ defmodule SymphonyElixir.Orchestrator do
           poll_check_in_progress: false,
           tick_timer_ref: nil,
           tick_token: nil,
+          authority_root: Keyword.get(opts, :authority_root),
+          configured_workspace_root: Keyword.get(opts, :configured_workspace_root),
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup()
+        run_terminal_workspace_cleanup(state)
 
         # MIC-10: the wake ledger must be attached before any wake-producing
         # startup path runs — reconciliation mismatches and retry-record fence
@@ -255,7 +267,7 @@ defmodule SymphonyElixir.Orchestrator do
         # dispatch starts from a clean fence. An unconfirmed outcome keeps the
         # marker as evidence and the resume/cleanup gates fail closed.
         if outcome == :terminated do
-          LaunchMarker.clear(Map.get(receipt.evidence, :worker_identity))
+          LaunchMarker.clear(Map.get(receipt.evidence, :worker_identity), launch_marker_opts(state))
         end
 
         finalized =
@@ -788,7 +800,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
-        fenced_workspace_cleanup(issue, Map.get(state.blocked, issue.id, %{}), issue.id)
+        fenced_workspace_cleanup(issue, Map.get(state.blocked, issue.id, %{}), issue.id, cleanup_workspace_opts(state))
         release_issue_claim(state, issue.id)
 
       !issue_routable?(issue) ->
@@ -904,7 +916,7 @@ defmodule SymphonyElixir.Orchestrator do
         stop_running_task(pid, ref, state.task_supervisor)
 
         if cleanup_workspace do
-          fenced_workspace_cleanup(Map.get(running_entry, :issue, identifier), running_entry, issue_id)
+          fenced_workspace_cleanup(Map.get(running_entry, :issue, identifier), running_entry, issue_id, cleanup_workspace_opts(state))
         end
 
         state =
@@ -939,7 +951,7 @@ defmodule SymphonyElixir.Orchestrator do
   @spec clear_failure_sequence(%State{}, String.t()) :: %State{}
   defp clear_failure_sequence(%State{} = state, issue_id) do
     state = cancel_retry_timer(state, issue_id)
-    delete_retry_record_best_effort(issue_id)
+    delete_retry_record_best_effort(state, issue_id)
     %{state | retry_history: Map.delete(state.retry_history, issue_id)}
   end
 
@@ -1334,7 +1346,7 @@ defmodule SymphonyElixir.Orchestrator do
         # UNKNOWN fail closed; death is never inferred from a missing BEAM
         # process, a missing task, elapsed time, workspace presence, or the
         # restart itself.
-        case LaunchMarker.reuse_gate(issue.id) do
+        case LaunchMarker.reuse_gate(issue.id, launch_marker_opts(state)) do
           :allowed ->
             classify_candidate_and_spawn(state, issue, attempt, recipient, worker_host)
 
@@ -1346,8 +1358,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   # Resume gate admitted the dispatch: classify the workspace (resume vs
   # fresh) and spawn, preserving the pre-existing classification semantics.
+  # Classification derives from the boot-pinned mutation root, so a workspace
+  # created before a `workspace.root` reload still resolves — and is still
+  # resumable — under the root this runtime actually owns (repository identity
+  # and structural viability included).
   defp classify_candidate_and_spawn(%State{} = state, issue, attempt, recipient, worker_host) do
-    case Workspace.classify_candidate(issue, worker_host) do
+    case Workspace.classify_candidate(issue, worker_host, workspace_opts(state)) do
       {:error, {:workspace_repository_mismatch, target, details}} ->
         error = "workspace repository identity mismatch for target #{target}: #{inspect(details)}"
         Logger.error("Dispatch failed closed for #{issue_context(issue)}: #{error}")
@@ -1389,7 +1405,7 @@ defmodule SymphonyElixir.Orchestrator do
       issue_url: issue.url,
       error: "previous worker launch not proven terminated: #{inspect(reason)}",
       stop_reason: :worker_launch_unproven,
-      worker_identity: LaunchMarker.stored_identity(issue.id),
+      worker_identity: LaunchMarker.stored_identity(issue.id, launch_marker_opts(state)),
       worker_host: nil
     })
   end
@@ -1399,7 +1415,10 @@ defmodule SymphonyElixir.Orchestrator do
     # sequence, :fallback when the latched fallback route says so (Slice C).
     # DispatchRouter materializes the selection, AgentRunner forwards it, and
     # AppServer consumes it without re-resolving routing policy.
-    dispatch_opts = [attempt: attempt, worker_host: worker_host, resumed: resumed?]
+    dispatch_opts =
+      [attempt: attempt, worker_host: worker_host, resumed: resumed?] ++
+        agent_root_opts(state)
+
     route = current_dispatch_route(state, issue.id)
 
     case DispatchRouter.materialize(route, issue, dispatch_opts) do
@@ -1559,7 +1578,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
   defp complete_issue(%State{} = state, issue_id) do
-    delete_retry_record_best_effort(issue_id)
+    delete_retry_record_best_effort(state, issue_id)
 
     %{
       state
@@ -1714,7 +1733,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-        fenced_workspace_cleanup(issue, metadata, issue_id)
+        fenced_workspace_cleanup(issue, metadata, issue_id, cleanup_workspace_opts(state))
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
@@ -1732,9 +1751,15 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, release_issue_claim(state, issue_id)}
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host)
+  # Terminal/reconcile cleanup. The second argument is either the running entry
+  # metadata map (recorded cleanup: the workspace path recorded at creation is
+  # the trusted deletion target) or a worker host (binary/nil, direct removal).
+  # The leading root opts (`cleanup_workspace_opts/1` — boot-pinned mutation
+  # roots plus recorded-cleanup fallbacks) keep deletion inside the root the
+  # runtime owns, including from the detached drain watcher.
+  defp cleanup_issue_workspace(root_opts, issue_or_identifier, metadata)
 
-  defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
+  defp cleanup_issue_workspace(root_opts, issue_or_identifier, metadata) when is_map(metadata) do
     case workspace_gate_preserved?(metadata) do
       nil ->
         case Map.get(metadata, :workspace_path) do
@@ -1742,11 +1767,12 @@ defmodule SymphonyElixir.Orchestrator do
             Workspace.remove_recorded(
               workspace_path,
               Map.get(metadata, :worker_host),
-              Map.get(metadata, :workspace_root)
+              Map.get(metadata, :workspace_root),
+              root_opts
             )
 
           _ ->
-            cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
+            cleanup_issue_workspace(root_opts, issue_or_identifier, Map.get(metadata, :worker_host))
         end
 
       gate_name ->
@@ -1756,15 +1782,15 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp cleanup_issue_workspace(%Issue{} = issue, worker_host) do
-    Workspace.remove_issue_workspaces(issue, worker_host)
+  defp cleanup_issue_workspace(root_opts, %Issue{} = issue, worker_host) do
+    Workspace.remove_issue_workspaces(issue, worker_host, root_opts)
   end
 
-  defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    Workspace.remove_issue_workspaces(identifier, worker_host)
+  defp cleanup_issue_workspace(root_opts, identifier, worker_host) when is_binary(identifier) do
+    Workspace.remove_issue_workspaces(identifier, worker_host, root_opts)
   end
 
-  defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
+  defp cleanup_issue_workspace(_root_opts, _issue_or_identifier, _metadata), do: :ok
 
   # Second cleanup gate, composed UNDER the LaunchMarker/WorkerFence fence in
   # fenced_workspace_cleanup/3: the fence first proves the previous worker's
@@ -1796,14 +1822,24 @@ defmodule SymphonyElixir.Orchestrator do
   # time, or workspace state.
   @fenced_cleanup_evidence_poll_ms 50
 
-  defp fenced_workspace_cleanup(issue_or_identifier, metadata, issue_id) do
-    case LaunchMarker.cleanup_gate(issue_id) do
+  # Mutation-root pinning: the fence and the cleanup it admits both run against
+  # the root opts captured from the orchestrator state (`cleanup_workspace_opts/1`)
+  # — the boot-pinned authority root for the marker store and every workspace
+  # path, never live configuration a WORKFLOW.md reload may have moved. A
+  # drifted fence could never be trusted: the marker and the deletion boundary
+  # must live in the same mutation domain the runtime owns.
+  defp fenced_workspace_cleanup(issue_or_identifier, metadata, issue_id, root_opts) do
+    case LaunchMarker.cleanup_gate(issue_id, root_opts) do
       :allowed ->
-        LaunchMarker.clear(issue_id)
-        cleanup_issue_workspace(issue_or_identifier, metadata)
+        if cleanup_authority_held?(root_opts) do
+          LaunchMarker.clear(issue_id, root_opts)
+          cleanup_issue_workspace(root_opts, issue_or_identifier, metadata)
+        else
+          cleanup_authority_lost(issue_id)
+        end
 
       {:blocked, :worker_termination_unproven} ->
-        spawn_fenced_cleanup_wait(issue_or_identifier, metadata, issue_id)
+        spawn_fenced_cleanup_wait(issue_or_identifier, metadata, issue_id, root_opts)
 
       {:blocked, reason} ->
         Logger.error(
@@ -1818,15 +1854,30 @@ defmodule SymphonyElixir.Orchestrator do
   # Bounded detached drain wait: polls the marker's fence verdict (positive
   # receipt proof only) and cleans only on {:ok, :dead}. Never touches
   # orchestrator state — by the time this runs the issue has already left the
-  # lifecycle maps; the watcher only settles the workspace itself.
-  defp spawn_fenced_cleanup_wait(issue_or_identifier, metadata, issue_id) do
+  # lifecycle maps; the watcher only settles the workspace itself. It carries
+  # the precomputed root opts instead: the pinned roots are immutable for the
+  # runtime lifetime, so capturing them here keeps the detached cleanup in
+  # exactly the mutation domain the fence decided about, with no live-config
+  # resolution after the wait.
+  #
+  # Authority loss fails closed: before deleting anything the watcher re-proves
+  # — from the durable lease file, not the holder's heartbeat-lagged memory —
+  # that this runtime instance still owns the pinned root. A watcher that
+  # outlives an authority transfer (operator force_release plus a successor's
+  # acquisition) must never clear a marker or delete a workspace the successor
+  # now owns; the workspace is preserved for whoever holds the root.
+  defp spawn_fenced_cleanup_wait(issue_or_identifier, metadata, issue_id, root_opts) do
     spawn(fn ->
       deadline = System.monotonic_time(:millisecond) + fenced_cleanup_evidence_budget_ms()
 
-      case await_drain_proof(issue_id, deadline) do
+      case await_drain_proof(issue_id, deadline, root_opts) do
         {:ok, :dead} ->
-          LaunchMarker.clear(issue_id)
-          cleanup_issue_workspace(issue_or_identifier, metadata)
+          if cleanup_authority_held?(root_opts) do
+            LaunchMarker.clear(issue_id, root_opts)
+            cleanup_issue_workspace(root_opts, issue_or_identifier, metadata)
+          else
+            cleanup_authority_lost(issue_id)
+          end
 
         _verdict ->
           Logger.error(
@@ -1839,9 +1890,19 @@ defmodule SymphonyElixir.Orchestrator do
     :ok
   end
 
-  defp await_drain_proof(issue_id, deadline) do
+  # Test seam mirroring the other *_for_test wrappers: drives the same detached
+  # drain watcher the fenced cleanup path spawns, with explicit root opts, so
+  # pinning and authority-loss behavior are observable without a full
+  # orchestrator lifecycle.
+  @doc false
+  @spec spawn_fenced_cleanup_wait_for_test(term(), map(), String.t(), keyword()) :: :ok
+  def spawn_fenced_cleanup_wait_for_test(issue_or_identifier, metadata, issue_id, root_opts) do
+    spawn_fenced_cleanup_wait(issue_or_identifier, metadata, issue_id, root_opts)
+  end
+
+  defp await_drain_proof(issue_id, deadline, root_opts) do
     cond do
-      verdict = proven_drain_verdict(issue_id) ->
+      verdict = proven_drain_verdict(issue_id, root_opts) ->
         verdict
 
       System.monotonic_time(:millisecond) >= deadline ->
@@ -1849,16 +1910,36 @@ defmodule SymphonyElixir.Orchestrator do
 
       true ->
         Process.sleep(@fenced_cleanup_evidence_poll_ms)
-        await_drain_proof(issue_id, deadline)
+        await_drain_proof(issue_id, deadline, root_opts)
     end
   end
 
-  defp proven_drain_verdict(issue_id) do
-    case LaunchMarker.fence_verdict(issue_id) do
+  defp proven_drain_verdict(issue_id, root_opts) do
+    case LaunchMarker.fence_verdict(issue_id, root_opts) do
       {:ok, :dead} = verdict -> verdict
       {:error, :alive} = verdict -> verdict
       _unproven -> nil
     end
+  end
+
+  # The durable-ownership check behind both fenced cleanup action points.
+  # Unpinned contexts (tests, direct API) keep legacy behavior; a pinned
+  # runtime must still provably own its authority root at the moment of
+  # deletion.
+  defp cleanup_authority_held?(root_opts) do
+    case Keyword.get(root_opts, :root) do
+      root when is_binary(root) and root != "" -> RuntimeLease.holds_authority_for?(root)
+      _ -> true
+    end
+  end
+
+  defp cleanup_authority_lost(issue_id) do
+    Logger.error(
+      "Destructive workspace cleanup failed closed for issue_id=#{inspect(issue_id)}: this runtime no longer " <>
+        "provably holds authority over its pinned root; preserving workspace and marker"
+    )
+
+    :ok
   end
 
   # Same budget shape as the CONTROL evidence watcher (grace + hard-terminate
@@ -1869,13 +1950,13 @@ defmodule SymphonyElixir.Orchestrator do
     WorkerContainment.grace_ms() + hard_budget
   end
 
-  defp run_terminal_workspace_cleanup do
+  defp run_terminal_workspace_cleanup(%State{} = state) do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
         issues
         |> Enum.each(fn
           %Issue{} = issue ->
-            fenced_workspace_cleanup(issue, %{}, issue.id)
+            fenced_workspace_cleanup(issue, %{}, issue.id, cleanup_workspace_opts(state))
 
           _ ->
             :ok
@@ -1890,12 +1971,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp ensure_startup_reconciled(%State{} = state), do: run_startup_reconciliation(state)
 
   defp run_startup_reconciliation(%State{} = state) do
-    reconcile_steering_inbox()
+    reconcile_steering_inbox(state)
 
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
       {:ok, active_issues} ->
         state = reconcile_startup_candidates(state, active_issues)
-        orphans = scan_orphaned_workspaces(active_issues)
+        orphans = scan_orphaned_workspaces(active_issues, state)
         %{state | orphaned_workspaces: orphans, startup_reconciled: true}
 
       {:error, reason} ->
@@ -1907,8 +1988,8 @@ defmodule SymphonyElixir.Orchestrator do
   # MIC-10 steering inbox: PENDING steers survive restart; DELIVERED-but-
   # unacknowledged steers are retained durably but invalidated (STALE) because
   # their delivery session is gone and must never be re-delivered.
-  defp reconcile_steering_inbox do
-    summary = Steering.reconcile_after_restart(Config.local_workspace_root())
+  defp reconcile_steering_inbox(%State{} = state) do
+    summary = Steering.reconcile_after_restart(mutation_root(state))
 
     if Enum.any?(Map.values(summary), &(&1 > 0)) do
       Logger.info("Steering inbox reconciled after restart: #{inspect(summary)}")
@@ -1921,8 +2002,8 @@ defmodule SymphonyElixir.Orchestrator do
       :ok
   end
 
-  defp steering_snapshot do
-    Steering.snapshot_summary(Config.local_workspace_root())
+  defp steering_snapshot(%State{} = state) do
+    Steering.snapshot_summary(mutation_root(state))
   rescue
     _ -> %{entries: [], counts: %{}}
   end
@@ -1933,9 +2014,9 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp reconcile_startup_candidate(state, %Issue{} = issue) do
+  defp reconcile_startup_candidate(%State{} = state, %Issue{} = issue) do
     if candidate_routable?(issue) do
-      case Workspace.classify_candidate(issue) do
+      case Workspace.classify_candidate(issue, nil, workspace_opts(state)) do
         {:ok, :resume, workspace, _route} ->
           Logger.info("Startup reconciliation identified resumable workspace for #{issue_context(issue)} workspace=#{workspace}")
           %{state | resumed_issues: MapSet.put(state.resumed_issues, issue.id)}
@@ -1977,9 +2058,9 @@ defmodule SymphonyElixir.Orchestrator do
   # the blocked-issue surface and the cleanup skip in cleanup_issue_workspace/2:
   # gated workspaces are preserved as evidence for the operator and the bounded
   # `mix symphony.workspace_repair` command instead of being removed silently.
-  defp block_workspace_gate(state, issue, error, marker) do
+  defp block_workspace_gate(%State{} = state, issue, error, marker) do
     workspace_path =
-      case Workspace.workspace_path(issue) do
+      case Workspace.workspace_path(issue, nil, workspace_opts(state)) do
         {:ok, path} -> path
         _ -> nil
       end
@@ -1990,7 +2071,7 @@ defmodule SymphonyElixir.Orchestrator do
       issue: issue,
       worker_host: nil,
       workspace_path: workspace_path,
-      workspace_root: Config.local_workspace_root(),
+      workspace_root: mutation_root(state),
       session_id: nil,
       error: error,
       discovery_result: nil,
@@ -2018,8 +2099,8 @@ defmodule SymphonyElixir.Orchestrator do
     block_workspace_gate(state, issue, error, :viability_error)
   end
 
-  defp scan_orphaned_workspaces(active_issues) do
-    local_workspace_root = Config.local_workspace_root()
+  defp scan_orphaned_workspaces(active_issues, %State{} = state) do
+    local_workspace_root = mutation_root(state)
 
     active_workspace_names =
       active_issues
@@ -2089,7 +2170,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp recover_wake_ledger(%State{} = state) do
-    %{state | wake_ledger: Ledger.recover(retry_store_root())}
+    case retry_store_root(state) do
+      {:ok, root} ->
+        %{state | wake_ledger: Ledger.recover(root)}
+
+      {:error, reason} ->
+        Logger.warning("Skipping wake ledger recovery; no durable record root: #{inspect(reason)}")
+        %{state | wake_ledger: Ledger.recover(nil)}
+    end
   end
 
   # Pending receipts whose issue left every live set (running/blocked/parked/
@@ -2166,7 +2254,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp release_issue_claim(%State{} = state, issue_id) do
     state = handle_wake_release(state, issue_id)
-    delete_retry_record_best_effort(issue_id)
+    delete_retry_record_best_effort(state, issue_id)
 
     %{
       state
@@ -2344,7 +2432,7 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     state = cancel_retry_timer(state, issue_id)
-    write_retry_record_best_effort(issue_id, entry, "parked")
+    write_retry_record_best_effort(state, issue_id, entry, "parked")
 
     %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
   end
@@ -2359,8 +2447,8 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
   end
 
-  @spec persist_failure_retry_record(term(), String.t(), integer() | nil, integer(), map()) :: :ok
-  defp persist_failure_retry_record(_state, issue_id, attempt, delay_ms, metadata) do
+  @spec persist_failure_retry_record(State.t(), String.t(), integer() | nil, integer(), map()) :: :ok
+  defp persist_failure_retry_record(%State{} = state, issue_id, attempt, delay_ms, metadata) do
     if is_binary(metadata[:failure_class]) do
       now_dt = DateTime.utc_now()
 
@@ -2385,16 +2473,26 @@ defmodule SymphonyElixir.Orchestrator do
         next_retry_in_ms: delay_ms
       }
 
-      write_retry_record_best_effort(issue_id, entry, "retrying")
+      write_retry_record_best_effort(state, issue_id, entry, "retrying")
     else
       :ok
     end
   end
 
-  @spec write_retry_record_best_effort(String.t(), map(), String.t()) :: :ok
-  defp write_retry_record_best_effort(issue_id, entry, status) do
-    root = retry_store_root()
+  @spec write_retry_record_best_effort(State.t(), String.t(), map(), String.t()) :: :ok
+  defp write_retry_record_best_effort(%State{} = state, issue_id, entry, status) do
+    case retry_store_root(state) do
+      {:ok, root} ->
+        write_retry_record_best_effort(root, issue_id, entry, status)
 
+      {:error, reason} ->
+        Logger.warning("Skipping retry record write issue_id=#{issue_id}; no durable record root: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  @spec write_retry_record_best_effort(String.t(), String.t(), map(), String.t()) :: :ok
+  defp write_retry_record_best_effort(root, issue_id, entry, status) when is_binary(root) do
     record =
       RetryStore.build_record(%{
         issue_id: issue_id,
@@ -2459,36 +2557,64 @@ defmodule SymphonyElixir.Orchestrator do
   defp persisted_stop_reason(reason) when is_binary(reason), do: reason
   defp persisted_stop_reason(_reason), do: nil
 
-  @spec delete_retry_record_best_effort(String.t()) :: :ok
-  defp delete_retry_record_best_effort(issue_id) do
-    try do
-      RetryStore.delete_record(retry_store_root(), issue_id)
-    rescue
-      _ -> :ok
-    catch
-      _, _ -> :ok
+  @spec delete_retry_record_best_effort(State.t(), String.t()) :: :ok
+  defp delete_retry_record_best_effort(%State{} = state, issue_id) do
+    case retry_store_root(state) do
+      {:ok, root} ->
+        try do
+          RetryStore.delete_record(root, issue_id)
+        rescue
+          _ -> :ok
+        catch
+          _, _ -> :ok
+        end
+
+      {:error, reason} ->
+        Logger.warning("Skipping retry record delete issue_id=#{issue_id}; no durable record root: #{inspect(reason)}")
+        :ok
     end
   end
 
-  @spec retry_store_root() :: String.t()
-  defp retry_store_root do
-    Application.get_env(:symphony_elixir, :retry_store_root) || Config.local_workspace_root()
+  # The durable record root for retry/wake state. The `:retry_store_root` app
+  # env keeps its existing boot-time-override/test-seam meaning; otherwise the
+  # boot-pinned authority root is the record root — never live configuration,
+  # which a WORKFLOW.md reload could move out from under the lease. With
+  # neither, callers fail closed (no record mutation).
+  @spec retry_store_root(State.t()) :: {:ok, String.t()} | {:error, :no_retry_store_root}
+  defp retry_store_root(%State{} = state) do
+    case Application.get_env(:symphony_elixir, :retry_store_root) do
+      root when is_binary(root) ->
+        {:ok, root}
+
+      _ ->
+        case state do
+          %State{authority_root: root} when is_binary(root) -> {:ok, root}
+          _ -> {:error, :no_retry_store_root}
+        end
+    end
   end
 
-  @spec recover_retry_records(term()) :: term()
+  @spec recover_retry_records(State.t()) :: State.t()
   defp recover_retry_records(%State{} = state) do
-    root = retry_store_root()
+    case retry_store_root(state) do
+      {:ok, root} ->
+        Enum.reduce(RetryStore.list_records(root), state, &recover_retry_list_record(&2, &1, root))
 
-    Enum.reduce(RetryStore.list_records(root), state, fn {file_id, result}, acc ->
-      case result do
-        {:ok, record} ->
-          recover_retry_record(acc, record, root)
+      {:error, reason} ->
+        Logger.warning("Skipping retry record recovery; no durable record root: #{inspect(reason)}")
+        state
+    end
+  end
 
-        {:error, reason} ->
-          Logger.warning("Ignoring corrupt retry record file_id=#{file_id}: #{inspect(reason)}; preserving workspaces")
-          acc
-      end
-    end)
+  defp recover_retry_list_record(state, {file_id, result}, root) do
+    case result do
+      {:ok, record} ->
+        recover_retry_record(state, record, root)
+
+      {:error, reason} ->
+        Logger.warning("Ignoring corrupt retry record file_id=#{file_id}: #{inspect(reason)}; preserving workspaces")
+        state
+    end
   end
 
   @spec recover_retry_record(term(), map(), String.t()) :: term()
@@ -2907,10 +3033,20 @@ defmodule SymphonyElixir.Orchestrator do
        retrying: retrying,
        blocked: blocked,
        parked: parked,
-       steering: steering_snapshot(),
+       steering: steering_snapshot(state),
        operational_status: operational_status,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       # Mutation-root truth: the root this runtime mutates (pinned at boot from
+       # the runtime authority lease), the configured root live configuration
+       # currently desires, and whether the two have diverged. Drift never moves
+       # the mutation root; it is resolved only by a runtime restart.
+       runtime_root: %{
+         authority_root: authority_root_for_status(state),
+         configured_root: configured_root_for_status(state),
+         drift_detected?: state.root_drift_detected?,
+         restart_required: state.root_drift_detected?
+       },
        # MIC-10 STEER != CONTROL observability: what control was requested
        # against which attempt and how it completed.
        controls: Enum.take(state.control_ledger, 20),
@@ -3042,7 +3178,7 @@ defmodule SymphonyElixir.Orchestrator do
       # so the in-memory identity is nil exactly when it is needed — the
       # durable launch marker supplies the same fenceable identity.
       termination_expectation: Map.get(entry, :termination_expectation),
-      worker_identity: Map.get(entry, :worker_identity) || LaunchMarker.stored_identity(request.issue_id),
+      worker_identity: Map.get(entry, :worker_identity) || LaunchMarker.stored_identity(request.issue_id, launch_marker_opts(state)),
       worker_termination: nil,
       reuse_gate: nil
     }
@@ -3268,8 +3404,11 @@ defmodule SymphonyElixir.Orchestrator do
   # The durable retry record is the recovery evidence source, so a restart
   # (which rehydrates parks as :recovered_parked and loses the original
   # in-memory reason) recovers identically to a live park.
+  # The durable retry record is read from the boot-pinned record root: a
+  # recovery must judge exactly the evidence this runtime's lifecycle wrote,
+  # never a record a WORKFLOW.md reload would point at.
   defp control_recover_parked_entry(state, request, issue_id, entry) do
-    case RetryStore.read_record(retry_store_root(), issue_id) do
+    case retry_record_for_recovery(state, issue_id) do
       {:ok, record} ->
         cond do
           Map.get(record, "status") in ["parked", "retrying"] ->
@@ -3312,6 +3451,18 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         deny_recovery(state, request, :rejected_corrupt_evidence, %{reason: inspect(reason)}, nil)
+    end
+  end
+
+  # Recovery evidence resolution: the `:retry_store_root` app-env seam first
+  # (test/tool override), then the boot-pinned authority root. A pinned runtime
+  # with neither has no durable record domain it owns, so recovery is denied
+  # fail-closed instead of reading live configuration.
+  @spec retry_record_for_recovery(State.t(), String.t()) :: {:ok, map()} | {:error, term()}
+  defp retry_record_for_recovery(%State{} = state, issue_id) do
+    case retry_store_root(state) do
+      {:ok, root} -> RetryStore.read_record(root, issue_id)
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -3396,7 +3547,7 @@ defmodule SymphonyElixir.Orchestrator do
             {receipt, state} =
               record_control(state, request, :recovered_terminal, evidence, attempt_id: attempt_id)
 
-            cleanup_issue_workspace(issue, recovery_workspace_metadata(entry, record))
+            cleanup_issue_workspace(cleanup_workspace_opts(state), issue, recovery_workspace_metadata(entry, record))
             state = release_issue_claim(state, issue_id)
 
             {{:ok, receipt}, state}
@@ -3935,11 +4086,117 @@ defmodule SymphonyElixir.Orchestrator do
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
 
-    %{
-      state
-      | poll_interval_ms: config.polling.interval_ms,
-        max_concurrent_agents: config.agent.max_concurrent_agents
-    }
+    %{maybe_observe_root_drift(state, config) | poll_interval_ms: config.polling.interval_ms, max_concurrent_agents: config.agent.max_concurrent_agents}
+  end
+
+  # --- mutation-root pinning --------------------------------------------------
+
+  # The one mutation root for this runtime instance's local lifecycle state:
+  # the boot-pinned authority root injected at startup when the runtime is
+  # lease-bound, falling back to live configuration only in contexts that run
+  # outside a pinned runtime (direct API use in tests and tools). A WORKFLOW.md
+  # reload never changes the pinned value.
+  defp mutation_root(%State{authority_root: root}) when is_binary(root), do: root
+  defp mutation_root(%State{}), do: Config.local_workspace_root()
+
+  # The raw configured workspace root as it read at runtime boot — the value
+  # remote worker hosts resolve in their own filesystems. Unpinned contexts
+  # read live configuration, as before.
+  defp configured_root(%State{configured_workspace_root: root}) when is_binary(root), do: root
+  defp configured_root(%State{}), do: Config.settings!().workspace.root
+
+  # Root options threaded into every runtime-driven Workspace call.
+  defp workspace_opts(%State{} = state) do
+    [
+      workspace_root: pinned_root_or_nil(state),
+      configured_workspace_root: pinned_configured_root_or_nil(state)
+    ]
+  end
+
+  defp pinned_root_or_nil(%State{authority_root: root}) when is_binary(root), do: root
+  defp pinned_root_or_nil(%State{}), do: nil
+
+  defp pinned_configured_root_or_nil(%State{configured_workspace_root: root}) when is_binary(root), do: root
+  defp pinned_configured_root_or_nil(%State{}), do: nil
+
+  # Root options merged into dispatch opts so agent tasks (AgentRunner,
+  # AppServer, Discovery, WorkerContainment) derive every root from the same
+  # boot-pinned values. Nils are omitted so unpinned contexts stay byte-identical.
+  defp agent_root_opts(%State{} = state) do
+    state
+    |> agent_root_opts([:authority_root, :configured_workspace_root], [])
+    |> Enum.reverse()
+  end
+
+  defp agent_root_opts(%State{} = state, [key | rest], acc) do
+    case Map.get(state, key) do
+      nil -> agent_root_opts(state, rest, acc)
+      value -> agent_root_opts(state, rest, [{key, value} | acc])
+    end
+  end
+
+  defp agent_root_opts(%State{}, [], acc), do: acc
+
+  # Launch-marker store root options: the boot-pinned authority root when this
+  # runtime is lease-bound, so the reuse/cleanup fences read and clear the
+  # store they were written into. Absent in unpinned contexts, where the store
+  # resolves from live configuration as before.
+  defp launch_marker_opts(%State{} = state), do: [root: pinned_root_or_nil(state)]
+
+  # Root options for one fenced cleanup decision: the pinned Workspace roots,
+  # the recorded-cleanup fallback boundaries, and the launch-marker store root.
+  # Computed once in the orchestrator process and carried (immutable for the
+  # runtime lifetime) into the detached drain watcher.
+  defp cleanup_workspace_opts(%State{} = state) do
+    state
+    |> workspace_opts()
+    |> Keyword.put(:fallback_workspace_root, mutation_root(state))
+    |> Keyword.put(:fallback_configured_workspace_root, configured_root(state))
+    |> Keyword.put(:root, pinned_root_or_nil(state))
+  end
+
+  # Phase-6 hot-reload contract: a reloaded `workspace.root` is configuration's
+  # *desired* root, never this runtime's mutation root. The first tick that
+  # observes divergence warns once (operator action: restart), and the drift
+  # flag feeds the snapshot/runtime-root status until the runtime is restarted.
+  defp maybe_observe_root_drift(%State{authority_root: nil} = state, _config), do: state
+
+  defp maybe_observe_root_drift(%State{} = state, config) do
+    configured = config.workspace.root
+    drift? = not RuntimeLease.roots_match?(state.authority_root, configured)
+
+    cond do
+      drift? and not state.root_drift_detected? ->
+        Logger.warning(
+          "Workspace root drift detected authority_root=#{state.authority_root} " <>
+            "configured_root=#{inspect(configured)}; the runtime keeps mutating the " <>
+            "authority root — restart the runtime to adopt the configured root"
+        )
+
+        %{state | root_drift_detected?: true}
+
+      not drift? and state.root_drift_detected? ->
+        Logger.info("Workspace root drift resolved by configuration reload; restart still required to adopt it")
+
+        %{state | root_drift_detected?: false}
+
+      true ->
+        state
+    end
+  end
+
+  defp authority_root_for_status(%State{authority_root: root}) when is_binary(root), do: root
+  defp authority_root_for_status(%State{} = state), do: mutation_root(state)
+
+  # Status truth: `configured_root` is what live configuration desires right
+  # now (the value a restart would adopt), never the boot-time snapshot — the
+  # drift flag only means anything against the live desired root.
+  defp configured_root_for_status(%State{}), do: configured_desired_root()
+
+  defp configured_desired_root do
+    Config.settings!().workspace.root
+  rescue
+    _error -> nil
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do

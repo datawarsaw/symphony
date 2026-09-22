@@ -23,5 +23,18 @@ if config_env() == :test do
     # per-run retry store root; TestSupport narrows this to a per-test root
     # while each test executes. The default workspace root must never hold
     # durable retry records during tests.
-    retry_store_root: Path.join(System.tmp_dir!(), "symphony-elixir-retries-run-#{System.unique_integer([:positive])}")
+    #
+    # The name is keyed to the booting VM's OS pid: per-VM integer counters
+    # collide across `mix test` invocations, and a run aborted before the
+    # after-suite cleanup leaves residue that the next run's runtime authority
+    # lease must (and does) fail closed against.
+    retry_store_root: Path.join(System.tmp_dir!(), "symphony-elixir-retries-run-#{System.pid()}"),
+    # The test VM's application boot is a direct entry path of the documented
+    # unpinned kind (tests build runtime trees on fixture roots themselves), so
+    # it starts no runtime-authority holder: the run-scoped retry root above is
+    # shared suite fixture state that tests narrow, restore, and delete, and it
+    # must never be load-bearing for a lease. Lease coverage lives in the
+    # runtime-authority suites and the env-gated multi-BEAM startup e2e, whose
+    # child BEAMs boot with this flag unset and acquire exactly as production.
+    runtime_authority_app_boot: false
 end

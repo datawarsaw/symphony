@@ -74,7 +74,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     # failed marker write refuses the launch (fail closed).
     with :ok <- record_launch_marker(worker_identity, issue, opts),
          {:ok, worker_route} <- worker_route_for(opts, issue, discovery_route),
-         {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+         {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host, Keyword.get(opts, :authority_root)),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding, worker_identity) do
       metadata = port_metadata(port, worker_host)
       worker_identity = attach_wrapper_pid(worker_identity, port)
@@ -367,9 +367,20 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp publish_worker_termination(_publisher, _info), do: :ok
 
-  defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
+  defp validate_workspace_cwd(workspace, nil, local_root) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
-    expanded_root = Config.local_workspace_root()
+
+    # Local launch containment: the workspace must sit inside the runtime's
+    # mutation root — the boot-pinned authority root when one is supplied,
+    # otherwise the configured root (direct API use). Validating against a
+    # moved live root would reject pinned workspaces after a `workspace.root`
+    # reload.
+    expanded_root =
+      case local_root do
+        root when is_binary(root) and root != "" -> Path.expand(root)
+        _ -> Config.local_workspace_root()
+      end
+
     expanded_root_prefix = expanded_root <> "/"
 
     with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
@@ -395,7 +406,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp validate_workspace_cwd(workspace, worker_host)
+  defp validate_workspace_cwd(workspace, worker_host, _local_root)
        when is_binary(workspace) and is_binary(worker_host) do
     cond do
       String.trim(workspace) == "" ->
@@ -484,7 +495,12 @@ defmodule SymphonyElixir.Codex.AppServer do
         issue_id: issue && Map.get(issue, :id),
         attempt_id: Keyword.get(opts, :attempt_id),
         workspace: workspace,
-        worker_host: nil
+        worker_host: nil,
+        # Mutation-root pinning: the boot-pinned authority root this launch is
+        # fenced under. Resolves the termination-receipt directory and rides
+        # inside the identity so every identity-derived marker operation stays
+        # in the same mutation domain as the launch itself.
+        authority_root: Keyword.get(opts, :authority_root)
       )
     else
       nil
@@ -497,6 +513,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   # cannot name its issue can never be fenced at those decision points; direct
   # API use without an issue keeps legacy behavior with a visible warning.
   # A marker write failure for a keyed launch refuses it (fail closed).
+  # Mutation-root pinning: the marker is written into the store under the
+  # boot-pinned authority root (`:root`), so a later `workspace.root` reload
+  # can never strand the fence's memory in a store the gates no longer read.
   defp record_launch_marker(nil, _issue, _opts), do: :ok
 
   defp record_launch_marker(identity, issue, opts) do
@@ -504,7 +523,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       issue_id when is_binary(issue_id) and issue_id != "" ->
         LaunchMarker.record(identity,
           identifier: issue && Map.get(issue, :identifier),
-          attempt_id: Keyword.get(opts, :attempt_id) || Keyword.get(opts, :attempt)
+          attempt_id: Keyword.get(opts, :attempt_id) || Keyword.get(opts, :attempt),
+          root: Keyword.get(opts, :authority_root)
         )
 
       _unkeyed ->
@@ -515,18 +535,26 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp record_launch_wrapper_identity(nil), do: :ok
-  defp record_launch_wrapper_identity(identity), do: LaunchMarker.record_wrapper_identity(identity)
+
+  defp record_launch_wrapper_identity(identity),
+    do: LaunchMarker.record_wrapper_identity(identity, launch_marker_identity_opts(identity))
 
   defp clear_launch_marker(nil), do: :ok
-  defp clear_launch_marker(identity), do: LaunchMarker.clear(identity)
+  defp clear_launch_marker(identity), do: LaunchMarker.clear(identity, launch_marker_identity_opts(identity))
+
+  # The marker store root carried by the launch's own identity: the boot-pinned
+  # authority root recorded at creation. Identity-derived operations (wrapper
+  # identity refresh, confirmed clear, never-spawned clear) mutate exactly the
+  # store the launch was fenced with.
+  defp launch_marker_identity_opts(%{"authority_root" => root}) when is_binary(root) and root != "", do: [root: root]
+  defp launch_marker_identity_opts(_identity), do: []
 
   # Marker clearing is fence-accepted-only: TERMINATED_CONFIRMED means the
   # wrapper receipt durably proves the tree drained, so the marker cannot be
   # deleted while a worker may still be alive. Any other status keeps the
   # marker as evidence for the resume/cleanup gates.
-  defp maybe_clear_confirmed_launch_marker(%{"issue_id" => issue_id}, %{status: :TERMINATED_CONFIRMED})
-       when is_binary(issue_id) and issue_id != "" do
-    LaunchMarker.clear(issue_id)
+  defp maybe_clear_confirmed_launch_marker(%{"issue_id" => _issue_id} = identity, %{status: :TERMINATED_CONFIRMED}) do
+    LaunchMarker.clear(identity, launch_marker_identity_opts(identity))
   end
 
   defp maybe_clear_confirmed_launch_marker(_identity, _confirmation), do: :ok

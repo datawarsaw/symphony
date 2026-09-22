@@ -17,6 +17,10 @@ tracker:
 polling:
   interval_ms: 5000
 workspace:
+  # This file hot-reloads, but `workspace.root` is special: a running runtime
+  # keeps mutating the root its runtime-authority lease protects (the root it
+  # resolved at boot). A changed `root` takes effect at the next runtime start;
+  # until then status reports the drift (restart_required: true).
   root: ~/code/symphony-workspaces
 routing:
   # Every dispatched issue must have one `repo:<target>` label. Targets are an explicit
