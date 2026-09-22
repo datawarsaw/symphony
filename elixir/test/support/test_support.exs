@@ -136,7 +136,8 @@ defmodule SymphonyElixir.TestSupport do
           stop_default_http_server: 0,
           link_dir_fixture!: 2,
           symlink_fixture_skip_reason: 0,
-          remove_dir_link_fixtures!: 1
+          remove_dir_link_fixtures!: 1,
+          remove_temp_fixture_root!: 1
         ]
 
       setup do
@@ -152,7 +153,7 @@ defmodule SymphonyElixir.TestSupport do
           )
 
         File.mkdir_p!(workflow_root)
-        on_exit(fn -> File.rm_rf(workflow_root) end)
+        on_exit(fn -> remove_temp_fixture_root!(workflow_root) end)
 
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
         write_workflow_file!(workflow_file)
@@ -170,7 +171,7 @@ defmodule SymphonyElixir.TestSupport do
           Path.join(System.tmp_dir!(), "symphony-elixir-retries-#{System.unique_integer([:positive])}")
 
         Application.put_env(:symphony_elixir, :retry_store_root, retry_store_root)
-        on_exit(fn -> File.rm_rf(retry_store_root) end)
+        on_exit(fn -> remove_temp_fixture_root!(retry_store_root) end)
 
         stop_default_http_server()
 

@@ -41,7 +41,7 @@ defmodule SymphonyElixir.LaunchFenceTest do
       Application.delete_env(:symphony_elixir, :launch_marker_root)
       Application.delete_env(:symphony_elixir, :worker_termination_receipt_root)
       Application.delete_env(:symphony_elixir, :worker_termination_hard_budget_ms)
-      File.rm_rf(state_root)
+      SymphonyElixir.TestSupport.remove_temp_fixture_root!(state_root)
     end)
 
     %{state_root: state_root}

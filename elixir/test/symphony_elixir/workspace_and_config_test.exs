@@ -43,7 +43,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(Path.join(workspace, "README.md")) |> String.trim_trailing() == "hook clone"
       assert File.read!(Path.join([workspace, "keep", "file.txt"])) == "keep me"
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -69,7 +69,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, workspace} = Workspace.create_for_issue("S-#{unique_tag}")
       assert File.read!(Path.join(workspace, "captured.txt")) == source
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -106,7 +106,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(Path.join(workspace, "captured.txt")) == hostile
       refute File.exists?(Path.join(workspace, "pwned"))
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -129,7 +129,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, workspace} = Workspace.create_for_issue("S-POSIX")
       assert File.read!(Path.join(workspace, "captured.txt")) == "issue=S-POSIX\n"
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -139,6 +139,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         System.tmp_dir!(),
         "symphony-elixir-workspace-deterministic-#{System.unique_integer([:positive])}"
       )
+
+    on_exit(fn -> remove_temp_fixture_root!(workspace_root) end)
 
     write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
@@ -169,7 +171,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       refute String.starts_with?(workspace, launcher_dir <> "/")
     after
       File.cd!(original_cwd)
-      File.rm_rf(launcher_dir)
+      remove_temp_fixture_root!(launcher_dir)
     end
   end
 
@@ -198,7 +200,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       refute File.exists?(slash_workspace)
       assert File.exists?(underscore_workspace)
     after
-      File.rm_rf(workspace_root)
+      remove_temp_fixture_root!(workspace_root)
     end
   end
 
@@ -234,7 +236,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(Path.join([second_workspace, "_build", "artifact.txt"])) == "compiled artifact\n"
       assert File.read!(Path.join([second_workspace, "tmp", "scratch.txt"])) == "remove me\n"
     after
-      File.rm_rf(workspace_root)
+      remove_temp_fixture_root!(workspace_root)
     end
   end
 
@@ -257,7 +259,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert workspace == canonical_workspace
       assert File.dir?(workspace)
     after
-      File.rm_rf(workspace_root)
+      remove_temp_fixture_root!(workspace_root)
     end
   end
 
@@ -401,7 +403,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       refute File.exists?(valid_workspace)
       assert File.exists?(hook_marker)
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -485,7 +487,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ valid_workspace
       assert trace =~ fallback_workspace
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -534,7 +536,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:error, {:workspace_equals_root, ^canonical_workspace_root, ^canonical_workspace_root}, ""} =
                Workspace.remove(workspace_root)
     after
-      File.rm_rf(workspace_root)
+      remove_temp_fixture_root!(workspace_root)
     end
   end
 
@@ -554,7 +556,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
                Workspace.create_for_issue("MT-FAIL")
     after
-      File.rm_rf(workspace_root)
+      remove_temp_fixture_root!(workspace_root)
     end
   end
 
@@ -586,7 +588,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(Path.join(workspace, "READY")) == "ready"
       assert String.split(String.trim(File.read!(attempt_log)), "\n") == ["attempt", "attempt"]
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -607,7 +609,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:error, {:workspace_hook_timeout, "after_create", 10}} =
                Workspace.create_for_issue("MT-TIMEOUT")
     after
-      File.rm_rf(workspace_root)
+      remove_temp_fixture_root!(workspace_root)
     end
   end
 
@@ -645,7 +647,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       refute File.exists?(Path.join(workspace_root, Workspace.workspace_key("MT-SPAWN-FAILURE")))
     after
       restore_env("PATH", previous_path)
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -666,7 +668,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.dir?(workspace)
       assert {:ok, []} = File.ls(workspace)
     after
-      File.rm_rf(workspace_root)
+      remove_temp_fixture_root!(workspace_root)
     end
   end
 
@@ -692,7 +694,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       refute File.exists?(target_workspace)
       assert File.exists?(untouched_workspace)
     after
-      File.rm_rf(workspace_root)
+      remove_temp_fixture_root!(workspace_root)
     end
   end
 
@@ -768,7 +770,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, workspace} = Workspace.create_for_issue(issue)
       assert File.read!(Path.join(workspace, "route.txt")) == "symphony-runtime|#{fixture.source_repo}|trunk|#{fixture.remote_repo}"
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -862,7 +864,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       refute File.exists?(Path.join(workspace_root, Workspace.workspace_key(issue)))
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -891,7 +893,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       refute File.exists?(Path.join([workspace, "state", "preserved-checkpoint.json"]))
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -920,7 +922,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       refute File.exists?(routed_source_workspace_path(fixture, issue))
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -950,7 +952,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       refute File.exists?(routed_source_workspace_path(fixture, issue))
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -1456,7 +1458,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(before_remove_marker) == "before_remove\n"
       refute File.exists?(workspace)
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -1481,7 +1483,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-FAIL")
       refute File.exists?(workspace)
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -1506,7 +1508,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-LARGE-FAIL")
       refute File.exists?(workspace)
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -1543,7 +1545,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-TIMEOUT")
       refute File.exists?(workspace)
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -1643,7 +1645,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     explicit_cache = Path.join(explicit_workspace, "cache")
     File.mkdir_p!(explicit_cache)
 
-    on_exit(fn -> File.rm_rf(explicit_root) end)
+    on_exit(fn -> remove_temp_fixture_root!(explicit_root) end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: explicit_root,
@@ -2109,7 +2111,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                "nested" => %{"flag" => true}
              }
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -2170,7 +2172,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:error, {:unsafe_turn_sandbox_policy, {:invalid_workspace_root, 123}}} =
                Schema.resolve_runtime_turn_sandbox_policy(settings, 123)
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -2235,7 +2237,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ "rm -rf"
       assert trace =~ workspace_path
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -2282,7 +2284,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, _} = Workspace.remove_recorded(arity_workspace, nil)
       refute File.exists?(arity_workspace)
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
@@ -2305,7 +2307,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, _} = Workspace.remove_recorded(workspace, nil, recorded_root)
       refute File.exists?(workspace)
     after
-      File.rm_rf(test_root)
+      remove_temp_fixture_root!(test_root)
     end
   end
 
