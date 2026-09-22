@@ -33,18 +33,36 @@ defmodule SymphonyElixir.Delivery.Replay do
 
   Returns the replayed commit shas oldest-first, or the conflicting paths if
   any pick fails to merge. The worktree is removed in all outcomes.
+
+  Cleanup is ownership-tracked: scratch-local operations run only after the
+  worktree has actually been created, and a caller-supplied scratch path that
+  never became a worktree is left exactly as found. A cleanup step that finds
+  nothing to clean is skipped, so the failure that ended the replay is always
+  the failure the caller sees.
   """
   @spec cherry_pick(repo(), [sha()], sha(), keyword()) :: result()
   def cherry_pick(repo, shas, base_sha, opts \\ []) do
     scratch = scratch_dir(opts)
+    caller_path? = Keyword.has_key?(opts, :scratch_dir)
 
-    try do
-      with :ok <- add_worktree(repo, scratch, base_sha),
-           {:ok, replayed} <- pick_all(repo, scratch, shas) do
-        {:ok, %{replayed_shas: Enum.reverse(replayed), base: base_sha}}
-      end
-    after
-      cleanup_worktree(repo, scratch)
+    case add_worktree(repo, scratch, base_sha) do
+      :ok ->
+        try do
+          with {:ok, replayed} <- pick_all(repo, scratch, shas) do
+            {:ok, %{replayed_shas: Enum.reverse(replayed), base: base_sha}}
+          end
+        after
+          cleanup_worktree(repo, scratch)
+        end
+
+      error ->
+        # Nothing was registered. A generated path was never created, but
+        # `worktree add` can fail after partially materialising its target,
+        # so a path this module generated is still swept best-effort; a
+        # caller's path may hold unrelated content and is never touched.
+        unless caller_path?, do: cleanup_worktree(repo, scratch)
+
+        error
     end
   end
 
@@ -102,10 +120,16 @@ defmodule SymphonyElixir.Delivery.Replay do
   end
 
   defp cleanup_worktree(repo, scratch) do
-    _ = Git.run(scratch, ["cherry-pick", "--abort"])
+    # Scratch-local git needs the scratch to exist as a working directory; a
+    # scratch that was never created (or already swept) is skipped so cleanup
+    # itself can never raise over the failure it is cleaning up after.
+    if File.dir?(scratch) do
+      _ = Git.run(scratch, ["cherry-pick", "--abort"])
+    end
+
     _ = Git.run(repo, ["worktree", "remove", "--force", scratch])
     _ = Git.run(repo, ["worktree", "prune"])
-    File.rm_rf(scratch)
+    _ = File.rm_rf(scratch)
     :ok
   end
 end

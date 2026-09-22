@@ -209,23 +209,41 @@ defmodule SymphonyElixir.Delivery.Git do
   # `git patch-id` reads only stdin (never the repository), so the patch text
   # is staged in a uniquely-named temp file and redirected in via the shell.
   # System.cmd has no stdin option, and the shell never sees a path argument:
-  # the working directory is the temp file's own directory.
+  # the working directory is the temp file's own directory. The `after` block
+  # is the cleanup guarantee: even a spawn that raises (missing shell, temp
+  # dir gone between write and spawn) removes the staged file first, so no
+  # exit path leaks a `symphony_patch_id_*` file into the system temp dir.
   defp patch_id_from_text(_repo, text) do
     dir = System.tmp_dir!()
-    file = "symphony_patch_id_#{:erlang.unique_integer([:positive])}"
-    :ok = File.write!(Path.join(dir, file), text)
+    path = Path.join(dir, "symphony_patch_id_#{:erlang.unique_integer([:positive])}")
+    :ok = File.write!(path, text)
 
     result =
-      case :os.type() do
-        {:win32, _} -> System.cmd("cmd", ["/c", "git patch-id --stable < #{file}"], cd: dir, stderr_to_stdout: true)
-        _ -> System.cmd("sh", ["-c", "git patch-id --stable < \"$1\"", "sh", file], cd: dir, stderr_to_stdout: true)
+      try do
+        run_patch_id(dir, Path.basename(path))
+      after
+        _ = File.rm(path)
       end
-
-    File.rm(Path.join(dir, file))
 
     case result do
       {out, 0} -> {:ok, trim(out)}
       {out, code} -> {:error, {:git_failed, code, trim(out)}}
+    end
+  end
+
+  # Indirection seam so tests can exercise spawn and parse failures against
+  # the guaranteed cleanup above without touching the real command.
+  defp run_patch_id(dir, file) do
+    case Application.get_env(:symphony_elixir, :patch_id_runner) do
+      nil -> native_patch_id(dir, file)
+      runner -> runner.(dir, file)
+    end
+  end
+
+  defp native_patch_id(dir, file) do
+    case :os.type() do
+      {:win32, _} -> System.cmd("cmd", ["/c", "git patch-id --stable < #{file}"], cd: dir, stderr_to_stdout: true)
+      _ -> System.cmd("sh", ["-c", "git patch-id --stable < \"$1\"", "sh", file], cd: dir, stderr_to_stdout: true)
     end
   end
 

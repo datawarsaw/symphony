@@ -194,7 +194,15 @@ defmodule Mix.Tasks.Symphony.DeliveryPreflight do
     end
   end
 
-  defp finish(report, true), do: Mix.shell().info(Jason.encode!(report, pretty: true))
+  defp finish(report, true) do
+    Mix.shell().info(Jason.encode!(json_report(report), pretty: true))
+
+    if report.verdict == :stop do
+      stop_exit(report)
+    end
+
+    :ok
+  end
 
   defp finish(report, false) do
     Enum.each(report.evidence, &Mix.shell().info(&1))
@@ -207,6 +215,12 @@ defmodule Mix.Tasks.Symphony.DeliveryPreflight do
 
     :ok
   end
+
+  # Stop reasons hold atoms and tuples, which Jason rejects; emit them in the
+  # same text form the human-readable output prints. PROCEED reports carry no
+  # stop reasons, so their JSON shape is unchanged.
+  defp json_report(report),
+    do: Map.update!(report, :stop_reasons, fn reasons -> Enum.map(reasons, &stop_reason_text/1) end)
 
   defp print_boundary do
     Mix.shell().info("NOTE: mechanical evidence only — this tool is not a semantic reviewer, not Human Acceptance, and not merge authority.")

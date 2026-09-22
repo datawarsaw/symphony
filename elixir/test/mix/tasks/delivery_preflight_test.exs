@@ -113,6 +113,57 @@ defmodule Mix.Tasks.Symphony.DeliveryPreflightTaskTest do
     assert report["classification"] == "exact_parent"
   end
 
+  test "a hand-tampered reversed chain exits with a structured STOP, not a crash", %{repo: repo, feature: feature, base: base} do
+    DeliveryFixtures.reset_hard(repo, feature)
+
+    remediation =
+      DeliveryFixtures.commit_file(repo, "lib/thing.ex", String.replace(@base_content, "l1\n", "l1-fixed\n"), "R: remediation")
+
+    DeliveryFixtures.reset_hard(repo, base)
+
+    {:ok, manifest} = ArtifactManifest.build(repo, [feature, remediation])
+    tampered = %{manifest | commits: Enum.reverse(manifest.commits)}
+    path = Path.join(System.tmp_dir!(), "task_manifest_#{:erlang.unique_integer([:positive])}.json")
+    :ok = ArtifactManifest.save(tampered, path)
+    on_exit(fn -> File.rm(path) end)
+
+    output =
+      capture_io(:stderr, fn ->
+        capture_io(fn ->
+          assert catch_exit(DeliveryPreflight.run(["preflight", "--manifest", path, "--repo", repo, "--fresh-main", base])) ==
+                   {:shutdown, 1}
+        end)
+      end)
+
+    assert output =~ "lineage_broken"
+  end
+
+  test "preflight --json emits a decodable STOP report for tuple stop reasons", %{repo: repo, feature: feature, base: base} do
+    DeliveryFixtures.reset_hard(repo, feature)
+
+    remediation =
+      DeliveryFixtures.commit_file(repo, "lib/thing.ex", String.replace(@base_content, "l1\n", "l1-fixed\n"), "R: remediation")
+
+    DeliveryFixtures.reset_hard(repo, base)
+
+    {:ok, manifest} = ArtifactManifest.build(repo, [feature, remediation])
+    tampered = %{manifest | commits: Enum.reverse(manifest.commits)}
+    path = Path.join(System.tmp_dir!(), "task_manifest_#{:erlang.unique_integer([:positive])}.json")
+    :ok = ArtifactManifest.save(tampered, path)
+    on_exit(fn -> File.rm(path) end)
+
+    output =
+      capture_io(fn ->
+        assert catch_exit(DeliveryPreflight.run(["preflight", "--manifest", path, "--repo", repo, "--fresh-main", base, "--json"])) == {:shutdown, 1}
+      end)
+
+    assert {:ok, report} = Jason.decode(output)
+    assert report["verdict"] == "stop"
+    assert [reason] = report["stop_reasons"]
+    assert reason =~ "lineage_broken"
+    assert reason =~ feature
+  end
+
   test "remote-truth stops when the artifact is absent from final main", %{repo: repo, feature: feature} do
     manifest = manifest_file(repo, feature)
     other = DeliveryFixtures.commit_file(repo, "docs/other.txt", "x\n", "U")

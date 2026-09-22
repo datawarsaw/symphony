@@ -331,20 +331,28 @@ defmodule SymphonyElixir.Delivery.Proof do
   defp check_chain(%ArtifactManifest{artifact_kind: :single}), do: :ok
 
   defp check_chain(%ArtifactManifest{commits: commits, cumulative: cumulative}) do
-    broken =
+    broken_pair =
       commits
       |> Enum.chunk_every(2, 1, :discard)
       |> Enum.find(fn [parent, child] -> child.parent_sha != parent.candidate_sha end)
 
-    cond do
-      broken != nil ->
-        {:stop, stop_report({:lineage_broken, broken.candidate_sha}, :preflight)}
+    case broken_pair do
+      nil ->
+        if is_nil(cumulative) or cumulative.ordered_patch_ids != ordered_patch_ids(commits) do
+          {:stop, stop_report({:manifest_tampered, {:cumulative, :ordered_patch_ids}}, :preflight)}
+        else
+          :ok
+        end
 
-      is_nil(cumulative) or cumulative.ordered_patch_ids != ordered_patch_ids(commits) ->
-        {:stop, stop_report({:manifest_tampered, {:cumulative, :ordered_patch_ids}}, :preflight)}
+      # A hand-tampered manifest (reversed, duplicated, or reordered chain)
+      # can leave every entry individually consistent with git while the
+      # consecutive pairs disagree; the child is the entry claiming a parent
+      # that is not the previously accepted commit.
+      [_parent, child] ->
+        {:stop, stop_report({:lineage_broken, child.candidate_sha}, :preflight)}
 
-      true ->
-        :ok
+      other ->
+        {:stop, stop_report({:manifest_tampered, {:cumulative, :malformed_pair}}, :preflight, [inspect(other)])}
     end
   end
 
@@ -856,11 +864,13 @@ defmodule SymphonyElixir.Delivery.Proof do
     if match?({:ok, true}, Git.ancestor?(repo, feature.sha, remediation.sha)) do
       :ok
     else
+      # stop_report takes the evidence lines positionally; a keyword here would
+      # leak a tuple into the report and crash the CLI printing the stop.
       {:stop,
        stop_report(
          :remote_truth_order_violated,
          :remote_truth,
-         evidence: [
+         [
            "STOP: cumulative order violated on final main: feature container #{short(feature.sha)} is not an " <>
              "ancestor of remediation container #{short(remediation.sha)}"
          ]
