@@ -109,6 +109,84 @@ defmodule SymphonyElixir.Delivery.DeliveryProofTest do
   end
 
   # ------------------------------------------------------------------
+  # malformed lineage fails closed
+  # ------------------------------------------------------------------
+
+  test "a reversed cumulative chain stops instead of crashing", %{
+    repo: repo,
+    feature: feature,
+    remediation: remediation
+  } do
+    {:ok, manifest} = ArtifactManifest.build(repo, [feature, remediation])
+    tampered = %{manifest | commits: Enum.reverse(manifest.commits)}
+
+    assert {:stop, report} = Proof.self_check(repo, tampered)
+    assert report.verdict == :stop
+    assert [{:lineage_broken, ^feature}] = report.stop_reasons
+  end
+
+  test "a duplicated chain entry stops instead of crashing", %{repo: repo, feature: feature, remediation: remediation} do
+    {:ok, manifest} = ArtifactManifest.build(repo, [feature, remediation])
+    entry = hd(manifest.commits)
+    tampered = %{manifest | commits: [entry, entry]}
+
+    assert {:stop, report} = Proof.self_check(repo, tampered)
+    assert [{:lineage_broken, ^feature}] = report.stop_reasons
+  end
+
+  test "a wrong-parent chain entry stops with lineage_broken", %{
+    repo: repo,
+    base: base,
+    feature: feature,
+    remediation: remediation
+  } do
+    {:ok, manifest} = ArtifactManifest.build(repo, [feature, remediation])
+    [feature_entry, remediation_entry] = manifest.commits
+    tampered = %{manifest | commits: [feature_entry, %{remediation_entry | parent_sha: base}]}
+
+    assert {:stop, report} = Proof.self_check(repo, tampered)
+    assert [{:lineage_broken, ^remediation}] = report.stop_reasons
+  end
+
+  test "a malformed chain with an extra entry stops on the first broken pair", %{
+    repo: repo,
+    feature: feature,
+    remediation: remediation
+  } do
+    {:ok, manifest} = ArtifactManifest.build(repo, [feature, remediation])
+    [feature_entry, remediation_entry] = manifest.commits
+    tampered = %{manifest | commits: [feature_entry, remediation_entry, feature_entry]}
+
+    assert {:stop, report} = Proof.self_check(repo, tampered)
+    assert [{:lineage_broken, ^feature}] = report.stop_reasons
+  end
+
+  test "a tampered cumulative patch-id ordering stops", %{
+    repo: repo,
+    feature: feature,
+    remediation: remediation
+  } do
+    {:ok, manifest} = ArtifactManifest.build(repo, [feature, remediation])
+    cumulative = %{manifest.cumulative | ordered_patch_ids: Enum.reverse(manifest.cumulative.ordered_patch_ids)}
+    tampered = %{manifest | cumulative: cumulative}
+
+    assert {:stop, report} = Proof.self_check(repo, tampered)
+    assert [{:manifest_tampered, {:cumulative, :ordered_patch_ids}}] = report.stop_reasons
+  end
+
+  test "a supported cumulative manifest still passes self-check unchanged", %{
+    repo: repo,
+    feature: feature,
+    remediation: remediation
+  } do
+    {:ok, manifest} = ArtifactManifest.build(repo, [feature, remediation])
+
+    assert {:ok, report} = Proof.self_check(repo, manifest)
+    assert report.verdict == :proceed
+    assert report.stop_reasons == []
+  end
+
+  # ------------------------------------------------------------------
   # preflight classifications
   # ------------------------------------------------------------------
 
