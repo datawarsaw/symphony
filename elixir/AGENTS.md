@@ -27,6 +27,18 @@ This directory contains the Elixir agent orchestration service that polls Linear
 - For stateful changes, check startup, reload, restart, and failure recovery together before editing.
 - Follow `docs/logging.md` for logging conventions and required issue/session context fields.
 
+## Source Canonicality
+
+- `C:/Users/micha/symphony-source` is the only authoritative implementation source for Symphony.
+  Implementation, review, tests, and source mutation happen there.
+- `C:/Users/micha/symphony-runtime` is a runtime deployment copy of this repository (NOT
+  AUTHORITATIVE SOURCE). It runs the service and receives promoted builds; do not select it as an
+  implementation source, and land changes in the canonical checkout first.
+- `C:/Users/micha/symphony` is a clone of the unrelated `openai/symphony` upstream. It must never
+  satisfy a `repo:symphony-runtime` (or equivalent implementation) routing request.
+- `WORKFLOW.md` pins the `symphony-runtime` routing target to the canonical path and origin remote,
+  and `test/symphony_elixir/source_canonicality_test.exs` enforces that contract mechanically.
+
 ## Tests and Validation
 
 Run targeted tests while iterating, then run full gates before handoff.
