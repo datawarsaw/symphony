@@ -33,7 +33,11 @@ defmodule SymphonyElixirWeb.Presenter do
           rate_limits: snapshot.rate_limits,
           # Read-only runtime authority projection: whether this runtime holds the
           # single-instance lifecycle lease, and the identity/evidence it holds.
-          runtime_authority: runtime_authority_payload()
+          runtime_authority: runtime_authority_payload(),
+          # Read-only launch-hardening diagnostics: per-issue launch marker,
+          # termination receipt, and resume/cleanup fence verdict. Display only;
+          # see SymphonyElixir.LaunchDiagnostics.
+          launch_diagnostics: launch_diagnostics_payload(snapshot)
         }
 
       :timeout ->
@@ -77,9 +81,11 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp issue_payload_body(issue_identifier, running, retry, blocked, parked, operational_status) do
+    issue_id = issue_id_from_entries(running, retry, blocked, parked)
+
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry, blocked, parked),
+      issue_id: issue_id,
       status: issue_status(running, retry, blocked, parked),
       operational_status: operational_status_name(operational_status),
       workspace: %{
@@ -99,7 +105,10 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       recent_events: recent_events_payload(running || blocked),
       last_error: (blocked && blocked.error) || (retry && retry.error),
-      tracked: %{}
+      tracked: %{},
+      # Read-only launch-hardening diagnostics for this issue (nil when the
+      # snapshot carries no durable issue id for the identifier).
+      launch_diagnostics: issue_launch_diagnostics_payload(issue_id)
     }
   end
 
@@ -157,6 +166,36 @@ defmodule SymphonyElixirWeb.Presenter do
       :unavailable ->
         %{held: false, lost: false, reason: "runtime_authority_unavailable"}
     end
+  end
+
+  # Read-only launch-hardening diagnostics for every issue the snapshot
+  # tracks. Bounded by the tracked-issue count; each entry is produced by
+  # `SymphonyElixir.LaunchDiagnostics` from the same authoritative stores the
+  # runtime's fences read. Display only — never authority, never mutation.
+  defp launch_diagnostics_payload(snapshot) do
+    snapshot
+    |> tracked_issue_ids()
+    |> Map.new(fn issue_id ->
+      {issue_id, SymphonyElixir.LaunchDiagnostics.issue_diagnostics(issue_id)}
+    end)
+  end
+
+  defp issue_launch_diagnostics_payload(nil), do: nil
+
+  defp issue_launch_diagnostics_payload(issue_id) when is_binary(issue_id) do
+    SymphonyElixir.LaunchDiagnostics.issue_diagnostics(issue_id)
+  end
+
+  defp tracked_issue_ids(snapshot) do
+    [:running, :retrying, :blocked, :parked]
+    |> Enum.flat_map(fn key ->
+      snapshot
+      |> Map.get(key, [])
+      |> Enum.map(&Map.get(&1, :issue_id))
+      |> Enum.reject(&is_nil(&1))
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   # MIC-10: read-only projection of the durable steering inbox. Instruction
