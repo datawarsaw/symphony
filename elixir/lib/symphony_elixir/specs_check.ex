@@ -33,7 +33,10 @@ defmodule SymphonyElixir.SpecsCheck do
         [path]
 
       File.dir?(path) ->
-        Path.wildcard(Path.join(path, "**/*.ex"))
+        path
+        |> Path.join("**/*.ex")
+        |> String.replace("\\", "/")
+        |> Path.wildcard()
 
       true ->
         []
@@ -76,11 +79,18 @@ defmodule SymphonyElixir.SpecsCheck do
     |> Enum.reduce(initial_state(), fn form, state ->
       consume_form(form, state, module_name, file, exemptions)
     end)
+    |> flush_open_finding()
     |> Map.fetch!(:findings)
   end
 
   defp initial_state do
-    %{pending_specs: MapSet.new(), pending_impl: false, seen_defs: MapSet.new(), findings: []}
+    %{
+      pending_specs: MapSet.new(),
+      pending_impl: false,
+      seen_defs: MapSet.new(),
+      open_finding: nil,
+      findings: []
+    }
   end
 
   defp consume_form({:@, _, [{:spec, _, spec_nodes}]}, state, _module_name, _file, _exemptions) do
@@ -89,7 +99,19 @@ defmodule SymphonyElixir.SpecsCheck do
       |> Enum.flat_map(&extract_spec_identifiers/1)
       |> MapSet.new()
 
-    %{state | pending_specs: MapSet.union(state.pending_specs, ids)}
+    state = %{state | pending_specs: MapSet.union(state.pending_specs, ids)}
+
+    case state.open_finding do
+      %{name: name, arity: arity} ->
+        if MapSet.member?(ids, {name, arity}) do
+          %{state | open_finding: nil}
+        else
+          state
+        end
+
+      nil ->
+        state
+    end
   end
 
   defp consume_form({:@, _, [{:impl, _, _}]}, state, _module_name, _file, _exemptions) do
@@ -98,13 +120,38 @@ defmodule SymphonyElixir.SpecsCheck do
 
   defp consume_form({:@, _, _}, state, _module_name, _file, _exemptions), do: state
 
-  defp consume_form({:def, meta, [head_ast, _]} = _form, state, module_name, file, exemptions) do
+  # A standalone function head (e.g. `def foo(a \\ default)`, no do-block)
+  # parses as a def with a single argument and must consume pending specs
+  # like any other clause of the function.
+  defp consume_form({:def, meta, [head_ast]}, state, module_name, file, exemptions) do
+    consume_def(meta, head_ast, true, state, module_name, file, exemptions)
+  end
+
+  defp consume_form({:def, meta, [head_ast, _do_block]}, state, module_name, file, exemptions) do
+    consume_def(meta, head_ast, false, state, module_name, file, exemptions)
+  end
+
+  defp consume_form({:defp, _, _}, state, _module_name, _file, _exemptions) do
+    state
+    |> flush_open_finding()
+    |> then(&%{&1 | pending_specs: MapSet.new(), pending_impl: false})
+  end
+
+  defp consume_form(_form, state, _module_name, _file, _exemptions) do
+    state
+    |> flush_open_finding()
+    |> then(&%{&1 | pending_specs: MapSet.new(), pending_impl: false})
+  end
+
+  defp consume_def(meta, head_ast, head_only?, state, module_name, file, exemptions) do
     {name, arity} = def_head_to_identifier(head_ast)
 
     id = {name, arity}
 
     if MapSet.member?(state.seen_defs, id) do
-      %{state | pending_specs: MapSet.new(), pending_impl: false}
+      state
+      |> flush_open_finding()
+      |> then(&%{&1 | pending_specs: MapSet.new(), pending_impl: false})
     else
       finding = %{
         file: file,
@@ -121,20 +168,26 @@ defmodule SymphonyElixir.SpecsCheck do
           seen_defs: MapSet.put(state.seen_defs, id)
       }
 
-      if compliant?(finding, state, exemptions) do
-        next_state
-      else
-        %{next_state | findings: [finding | next_state.findings]}
+      cond do
+        compliant?(finding, state, exemptions) ->
+          next_state
+
+        head_only? ->
+          # The clause group stays open until the next non-attribute form:
+          # an adjacent @spec may still follow the standalone head and cover
+          # the same name/arity.
+          %{next_state | open_finding: finding}
+
+        true ->
+          %{next_state | findings: [finding | next_state.findings]}
       end
     end
   end
 
-  defp consume_form({:defp, _, _}, state, _module_name, _file, _exemptions) do
-    %{state | pending_specs: MapSet.new(), pending_impl: false}
-  end
+  defp flush_open_finding(%{open_finding: nil} = state), do: state
 
-  defp consume_form(_form, state, _module_name, _file, _exemptions) do
-    %{state | pending_specs: MapSet.new(), pending_impl: false}
+  defp flush_open_finding(%{open_finding: finding, findings: findings} = state) do
+    %{state | open_finding: nil, findings: [finding | findings]}
   end
 
   defp compliant?(finding, state, exemptions) do
