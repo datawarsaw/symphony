@@ -36,7 +36,14 @@ routing:
     agent-platform-workstation-ops:
       source_path: "C:/AI/workstation-ops-mcp"
     symphony-runtime:
-      source_path: "C:/Users/micha/symphony"
+      # The only authoritative implementation source for Symphony. The remote pin
+      # makes selection mechanically verifiable: workspace preparation fails closed
+      # unless the checkout's origin is this repository. C:/Users/micha/symphony-runtime
+      # is a runtime deployment copy (NOT AUTHORITATIVE SOURCE) and
+      # C:/Users/micha/symphony is the unrelated openai/symphony upstream clone;
+      # neither may satisfy this target.
+      source_path: "C:/Users/micha/symphony-source"
+      remote: "https://github.com/datawarsaw/symphony.git"
 hooks:
   after_create: |
     set -eu

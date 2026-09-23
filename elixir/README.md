@@ -223,6 +223,11 @@ Notes:
   Symphony automatically verifies the source baseline before configured host hooks create each task worktree,
   safely fast-forwarding clean repositories that are strictly behind remote origin and failing
   closed on dirty tracked files, staged changes, unmerged index state, ahead, or diverged branches.
+- Each target's `source_path` must be the authoritative implementation checkout for that
+  repository. Runtime or deployment copies of a repository must not be configured as a source;
+  they receive promoted builds instead. Declare `remote` with the repository's origin URL: when
+  set, workspace preparation fails closed unless the checkout's `origin` matches, so a same-named
+  clone of an unrelated upstream cannot be selected as an implementation source.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
@@ -262,7 +267,10 @@ routing:
       source_path: "C:/AI/wup"
       remote: "https://github.com/datawarsaw/wup.git"
     symphony-runtime:
-      source_path: "C:/Users/micha/symphony"
+      # Authoritative implementation source; deployment copies of this repository
+      # must never be configured here.
+      source_path: "C:/Users/micha/symphony-source"
+      remote: "https://github.com/datawarsaw/symphony.git"
 hooks:
   after_create: |
     git -C "$SYMPHONY_REPOSITORY_SOURCE_PATH" fetch --prune origin
