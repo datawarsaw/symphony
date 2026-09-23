@@ -137,6 +137,7 @@ defmodule SymphonyElixir.TestSupport do
           link_dir_fixture!: 2,
           symlink_fixture_skip_reason: 0,
           remove_dir_link_fixtures!: 1,
+          create_temp_fixture_root!: 1,
           remove_temp_fixture_root!: 1
         ]
 
@@ -146,13 +147,7 @@ defmodule SymphonyElixir.TestSupport do
         # and fail so the next test starts from the configured baseline.
         on_exit(fn -> SymphonyElixir.TestSupport.restore_shared_state() end)
 
-        workflow_root =
-          Path.join(
-            System.tmp_dir!(),
-            "symphony-elixir-workflow-#{System.unique_integer([:positive])}"
-          )
-
-        File.mkdir_p!(workflow_root)
+        workflow_root = create_temp_fixture_root!("symphony-elixir-workflow")
         on_exit(fn -> remove_temp_fixture_root!(workflow_root) end)
 
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
@@ -167,8 +162,7 @@ defmodule SymphonyElixir.TestSupport do
         # of the shared default workspace root in both directions; the
         # restore_shared_state callback registered above re-asserts the
         # configured baseline after this one removes the directory.
-        retry_store_root =
-          Path.join(System.tmp_dir!(), "symphony-elixir-retries-#{System.unique_integer([:positive])}")
+        retry_store_root = create_temp_fixture_root!("symphony-elixir-retries")
 
         Application.put_env(:symphony_elixir, :retry_store_root, retry_store_root)
         on_exit(fn -> remove_temp_fixture_root!(retry_store_root) end)
@@ -240,6 +234,55 @@ defmodule SymphonyElixir.TestSupport do
         Logger.debug("Test fixture cleanup retrying path=#{root} reason=#{inspect(reason)}")
         Process.sleep(250)
         remove_temp_fixture_root!(root, attempts - 1)
+    end
+  end
+
+  # A fresh BEAM restarts `System.unique_integer/1` near the same values (the
+  # counter seed is BEAM-local), so a bare counter suffix re-derives the same
+  # fixture path in a later run and silently adopts whatever the earlier run
+  # leaked there. Draws therefore come from `:crypto.strong_rand_bytes/1`,
+  # which no other process can predict or replay.
+  @fixture_root_creation_attempts 8
+
+  @doc """
+  Creates an empty fixture root under `System.tmp_dir!()` and returns its path.
+
+  The path is unique across BEAM invocations, not only within this VM: the name
+  carries a fresh 96-bit random draw, and ownership of that exact path is
+  established by `File.mkdir/1`, whose success is the atomic proof that this
+  caller created the directory. `:eexist` means somebody else owns the drawn
+  name, so a new name is drawn and creation retried; any other error means a
+  broken host and is raised. The base64url alphabet of the draw (`A-Z a-z 0-9`
+  `-` `_`) is safe as a path segment on Windows.
+
+  Cleanup stays with `remove_temp_fixture_root!/2`, the single removal
+  authority for temp fixture roots.
+  """
+  @spec create_temp_fixture_root!(String.t()) :: Path.t()
+  def create_temp_fixture_root!(prefix) when is_binary(prefix) do
+    create_temp_fixture_root!(prefix, @fixture_root_creation_attempts)
+  end
+
+  defp create_temp_fixture_root!(_prefix, 0) do
+    raise "could not create a cross-BEAM-unique fixture root after #{@fixture_root_creation_attempts} draws"
+  end
+
+  defp create_temp_fixture_root!(prefix, attempts_left) when is_binary(prefix) do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "#{prefix}-#{Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)}"
+      )
+
+    case File.mkdir(path) do
+      :ok ->
+        path
+
+      {:error, :eexist} ->
+        create_temp_fixture_root!(prefix, attempts_left - 1)
+
+      {:error, reason} ->
+        raise "fixture root creation failed for #{inspect(path)}: #{:file.format_error(reason)}"
     end
   end
 
@@ -326,11 +369,7 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp probe_symlink_fixture do
-    base =
-      Path.join(
-        System.tmp_dir!(),
-        "symphony-elixir-symlink-capability-#{System.unique_integer([:positive])}"
-      )
+    base = create_temp_fixture_root!("symphony-elixir-symlink-capability")
 
     target = Path.join(base, "target")
     link = Path.join(base, "link")

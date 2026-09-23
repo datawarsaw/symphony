@@ -29,10 +29,8 @@ defmodule SymphonyElixir.LaunchFenceTest do
   end
 
   setup do
-    state_root =
-      Path.join(System.tmp_dir!(), "symphony-launch-fence-#{System.unique_integer([:positive])}")
+    state_root = SymphonyElixir.TestSupport.create_temp_fixture_root!("symphony-launch-fence")
 
-    File.mkdir_p!(state_root)
     Application.put_env(:symphony_elixir, :launch_marker_root, Path.join(state_root, "launches"))
     Application.put_env(:symphony_elixir, :worker_termination_receipt_root, Path.join(state_root, "receipts"))
     Application.put_env(:symphony_elixir, :worker_termination_hard_budget_ms, @hard_budget_ms)
@@ -386,7 +384,8 @@ defmodule SymphonyElixir.LaunchFenceTest do
   # ── Fixtures and helpers ────────────────────────────────────────────────────
 
   defp fence_fixture!(name, overrides \\ []) do
-    test_root = test_root_path(name)
+    test_root = SymphonyElixir.TestSupport.create_temp_fixture_root!("symphony-launch-fence-fixture-#{name}")
+
     # Register cleanup before the fixture exists, so even a fixture-setup
     # failure cannot leak the tree into the shared TEMP root.
     on_exit(fn -> SymphonyElixir.TestSupport.remove_temp_fixture_root!(test_root) end)
@@ -568,17 +567,6 @@ defmodule SymphonyElixir.LaunchFenceTest do
       Process.sleep(25)
       do_wait_until(fun, deadline)
     end
-  end
-
-  defp test_root_path(name) do
-    # unique_integer restarts at 1 in every BEAM, so a fixture root a previous
-    # run leaked under the same id would be silently reinitialized by `git init`
-    # and break this run's setup; the clock suffix makes the path unique across
-    # concurrent and successive runs.
-    Path.join(
-      System.tmp_dir!(),
-      "symphony-launch-fence-fixture-#{name}-#{System.unique_integer([:positive])}-#{System.system_time(:native)}"
-    )
   end
 
   defp setup_source_fixture!(test_root) do
