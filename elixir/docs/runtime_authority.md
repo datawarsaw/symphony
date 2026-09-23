@@ -150,6 +150,9 @@ spawn and its drain proof.
 - `RuntimeLease.observe/1` — read-only evidence from the authoritative file
   (owner token stripped).
 - `GET /api/v1/state` — includes a read-only `runtime_authority` projection.
+- `GET /api/v1/state` and `/api/v1/:issue_identifier` — include a read-only
+  `launch_diagnostics` projection of the launch marker / termination receipt
+  / fence state per issue; see [launch diagnostics](launch_diagnostics.md).
 - The runtime log records acquisition, renewals failures, loss, and release with
   `state_root`, `instance_id`, and `os_pid`.
 

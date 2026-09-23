@@ -94,6 +94,14 @@ A second runtime pointed at the same root fails closed instead of becoming a sec
 authority, crash residue keeps fresh runtimes fail closed until explicit operator recovery, and
 normal shutdown releases the lease. See [runtime authority](docs/runtime_authority.md).
 
+## Launch diagnostics
+
+The observability API (`/api/v1/state` and `/api/v1/:issue_identifier`) carries a read-only
+`launch_diagnostics` projection of the hardening-critical durable state: the per-issue launch
+marker, its termination receipt, and the resume/cleanup fence verdict. Diagnostics are
+display-only — they never mutate durable state, grant authority, or change fence outcomes.
+See [launch diagnostics](docs/launch_diagnostics.md).
+
 ## Burrito releases
 
 Symphony ships self-contained executables built with
