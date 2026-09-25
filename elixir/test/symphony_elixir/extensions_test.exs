@@ -267,6 +267,18 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:ok, _holder} = SymphonyElixir.RuntimeLease.acquire_and_hold(root: authority_root)
 
+    # Read-only launch-hardening diagnostics, shared verbatim by the state
+    # payload (one entry per tracked issue) and the issue payload. With no
+    # durable launch marker in this fixture, every tracked issue reports an
+    # absent marker, no receipt, an allowed fence, and a store rooted at the
+    # held authority root.
+    launch_diagnostics_entry = %{
+      "fence" => %{"decision" => "ALLOWED", "reason" => nil},
+      "marker" => %{"status" => "ABSENT"},
+      "receipt" => nil,
+      "store_root" => Path.join([authority_root, ".symphony-state", "launches"])
+    }
+
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
 
@@ -354,6 +366,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                "heartbeat_at" => state_payload["runtime_authority"]["heartbeat_at"],
                "last_renew_at" => state_payload["runtime_authority"]["last_renew_at"],
                "renew_error" => state_payload["runtime_authority"]["renew_error"]
+             },
+             # Read-only launch diagnostics projection: per-issue marker,
+             # receipt, and fence verdict resolved from the same authoritative
+             # stores the runtime's fences read, rooted at the held authority.
+             "launch_diagnostics" => %{
+               "issue-blocked" => launch_diagnostics_entry,
+               "issue-http" => launch_diagnostics_entry,
+               "issue-retry" => launch_diagnostics_entry
              }
            }
 
@@ -364,6 +384,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     # After the holder releases, the same projection truthfully reports that
     # this entry path holds no runtime authority.
     assert :ok = SymphonyElixir.RuntimeLease.release_held()
+
+    # With no holder, the diagnostics store root falls back to live
+    # configuration — the same resolution the runtime's fences use.
+    released_launch_diagnostics_entry = %{
+      "fence" => %{"decision" => "ALLOWED", "reason" => nil},
+      "marker" => %{"status" => "ABSENT"},
+      "receipt" => nil,
+      "store_root" => Path.join([Config.local_workspace_root(), ".symphony-state", "launches"])
+    }
 
     conn = get(build_conn(), "/api/v1/state")
     released_payload = json_response(conn, 200)
@@ -405,7 +434,11 @@ defmodule SymphonyElixir.ExtensionsTest do
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
-             "tracked" => %{}
+             "tracked" => %{},
+             # Same read-only launch diagnostics projection, for this issue's
+             # own durable id — resolved post-release, so rooted at live
+             # configuration rather than the (no longer held) fixture root.
+             "launch_diagnostics" => released_launch_diagnostics_entry
            }
 
     conn = get(build_conn(), "/api/v1/MT-RETRY")
