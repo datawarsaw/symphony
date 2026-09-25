@@ -34,7 +34,8 @@ routing:
     agent-platform-code-skills:
       source_path: "C:/AI/code-skills"
     agent-platform-workstation-ops:
-      source_path: "C:/AI/workstation-ops-mcp"
+      source_path: "C:/AI/agent-platform/workstation-ops-mcp"
+      remote: "https://github.com/datawarsaw/workstation-ops-mcp.git"
     symphony-runtime:
       # The only authoritative implementation source for Symphony. The remote pin
       # makes selection mechanically verifiable: workspace preparation fails closed
