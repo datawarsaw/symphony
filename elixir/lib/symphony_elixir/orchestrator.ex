@@ -286,9 +286,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
-        {:codex_worker_update, issue_id, %{event: _, timestamp: _} = update},
+        {channel, issue_id, %{event: _, timestamp: _} = update},
         %{running: running} = state
-      ) do
+      )
+      when channel in [:codex_worker_update, :worker_update] do
     case Map.get(running, issue_id) do
       nil ->
         {:noreply, state}
@@ -306,7 +307,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
+  def handle_info({channel, _issue_id, _update}, state)
+      when channel in [:codex_worker_update, :worker_update],
+      do: {:noreply, state}
 
   def handle_info({:discovery_completed, issue_id, verdict}, %{running: running} = state) do
     case Map.fetch(running, issue_id) do
@@ -1036,13 +1039,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    Map.get(running_entry, :last_activity_at) ||
+      Map.get(running_entry, :last_codex_timestamp) ||
+      Map.get(running_entry, :started_at)
   end
 
   defp last_activity_timestamp(_running_entry), do: nil
 
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
     Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
+      Map.get(running_entry, :last_event) in [:turn_input_required, :approval_required, :input_required] or
       not is_nil(input_required_completion_outcome(Map.get(running_entry, :completion))) or
       codex_message_method(Map.get(running_entry, :last_codex_message)) ==
         "mcpServer/elicitation/request"
@@ -1083,6 +1089,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp codex_event_blocker_error(:turn_input_required), do: "codex turn requires operator input"
   defp codex_event_blocker_error(:approval_required), do: "codex turn requires approval"
+  defp codex_event_blocker_error(:input_required), do: "worker requires operator input"
   defp codex_event_blocker_error(_event), do: nil
 
   defp completion_blocker_error(completion) do
@@ -3947,7 +3954,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec operational_statuses_for_test(term()) :: %{String.t() => operational_status()}
   def operational_statuses_for_test(%State{} = state), do: operational_statuses(state)
 
+  defp integrate_codex_update(running_entry, %SymphonyElixir.WorkerEvent{} = event) do
+    integrate_codex_update(running_entry, SymphonyElixir.WorkerEvent.to_update(event))
+  end
+
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
+    timestamp = SymphonyElixir.WorkerEvent.normalize_timestamp(timestamp)
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
@@ -3961,12 +3973,14 @@ defmodule SymphonyElixir.Orchestrator do
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
+        last_activity_at: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         model: model_for_update(Map.get(running_entry, :model), update),
         reasoning_effort: reasoning_effort_for_update(Map.get(running_entry, :reasoning_effort), update),
         route_source: route_source_for_update(Map.get(running_entry, :route_source), update),
         last_codex_event: event,
+        last_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
@@ -4310,9 +4324,16 @@ defmodule SymphonyElixir.Orchestrator do
     ]
 
     Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
+      Enum.find_value(payloads, &direct_token_usage_from_payload/1) ||
       Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
       %{}
   end
+
+  defp direct_token_usage_from_payload(payload) when is_map(payload) do
+    if integer_token_map?(payload), do: payload, else: nil
+  end
+
+  defp direct_token_usage_from_payload(_payload), do: nil
 
   defp extract_rate_limits(update) do
     rate_limits_from_payload(update[:rate_limits]) ||
@@ -4484,6 +4505,7 @@ defmodule SymphonyElixir.Orchestrator do
         :input_tokens,
         :prompt_tokens,
         :input,
+        "input",
         "promptTokens",
         :promptTokens,
         "inputTokens",
@@ -4498,6 +4520,7 @@ defmodule SymphonyElixir.Orchestrator do
         :output_tokens,
         :completion_tokens,
         :output,
+        "output",
         :completion,
         "outputTokens",
         :outputTokens,
