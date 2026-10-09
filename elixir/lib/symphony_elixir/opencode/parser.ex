@@ -17,26 +17,26 @@ defmodule SymphonyElixir.OpenCode.Parser do
     captured into failure_evidence so the run fails closed with deterministic evidence.
   """
 
+  alias SymphonyElixir.OpenCode.Redactor
+
   defmodule State do
     @moduledoc false
-    defstruct [
-      buffer: "",
-      session_id: nil,
-      message_ids: MapSet.new(),
-      tool_events: [],
-      completion_state: :running,
-      usage: %{
-        input_tokens: 0,
-        output_tokens: 0,
-        reasoning_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        total_tokens: 0,
-        cost: 0.0
-      },
-      failure_evidence: [],
-      events: []
-    ]
+    defstruct buffer: "",
+              session_id: nil,
+              message_ids: MapSet.new(),
+              tool_events: [],
+              completion_state: :running,
+              usage: %{
+                input_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                total_tokens: 0,
+                cost: 0.0
+              },
+              failure_evidence: [],
+              events: []
   end
 
   @doc """
@@ -72,25 +72,28 @@ defmodule SymphonyElixir.OpenCode.Parser do
         state
       end
 
-    case exit_status do
-      0 ->
-        if state.completion_state == :running do
-          %{state | completion_state: :completed}
-        else
-          state
-        end
-
-      status when is_integer(status) ->
-        evidence = {:process_exit, status}
-
+    cond do
+      is_integer(exit_status) and exit_status != 0 ->
         %{
           state
           | completion_state: :failed,
-            failure_evidence: [evidence | state.failure_evidence]
+            failure_evidence: [{:process_exit, exit_status} | state.failure_evidence]
         }
 
-      nil ->
+      state.completion_state == :completed ->
         state
+
+      state.completion_state == :failed ->
+        state
+
+      true ->
+        %{
+          state
+          | completion_state: :failed,
+            failure_evidence: [
+              {:incomplete_stream, :missing_completion_event} | state.failure_evidence
+            ]
+        }
     end
   end
 
@@ -149,17 +152,20 @@ defmodule SymphonyElixir.OpenCode.Parser do
           process_event(state, event)
 
         {:error, reason} ->
-          evidence = {:malformed_json_line, trimmed, reason}
+          evidence = {:malformed_json_line, Redactor.redact(trimmed), reason}
 
           %{
             state
-            | failure_evidence: [evidence | state.failure_evidence]
+            | completion_state: :failed,
+              failure_evidence: [evidence | state.failure_evidence]
           }
       end
     end
   end
 
   defp process_event(state, event) do
+    event = Redactor.redact(event)
+
     state =
       state
       |> maybe_extract_session_id(event)
@@ -265,8 +271,10 @@ defmodule SymphonyElixir.OpenCode.Parser do
 
     new_tool_events = [tool_record | state.tool_events]
 
+    failed? = status == "error" or not is_nil(error)
+
     new_failure_evidence =
-      if status == "error" or not is_nil(error) do
+      if failed? do
         [{:tool_error, tool_name, error} | state.failure_evidence]
       else
         state.failure_evidence
@@ -275,7 +283,8 @@ defmodule SymphonyElixir.OpenCode.Parser do
     %{
       state
       | tool_events: new_tool_events,
-        failure_evidence: new_failure_evidence
+        failure_evidence: new_failure_evidence,
+        completion_state: if(failed?, do: :failed, else: state.completion_state)
     }
   end
 

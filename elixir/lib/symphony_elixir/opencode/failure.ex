@@ -17,6 +17,7 @@ defmodule SymphonyElixir.OpenCode.Failure do
   """
 
   alias SymphonyElixir.FailureClass
+  alias SymphonyElixir.OpenCode.Redactor
   alias SymphonyElixir.FailureClass.FailureError
 
   @doc """
@@ -52,6 +53,19 @@ defmodule SymphonyElixir.OpenCode.Failure do
   def classify({:invalid_workspace, _}), do: :probe_environment_error
 
   def classify({:executable_not_found, _}), do: :probe_infrastructure_error
+  def classify(:opencode_executable_not_found), do: :probe_infrastructure_error
+  def classify({:opencode_executable_not_found, _}), do: :probe_infrastructure_error
+  def classify(:stdio_host_unavailable), do: :probe_infrastructure_error
+  def classify({:stdio_host_unavailable, _}), do: :probe_infrastructure_error
+  def classify({:stdio_host_source_missing, _}), do: :probe_infrastructure_error
+  def classify({:stdio_host_compile_failed, _, _}), do: :probe_infrastructure_error
+  def classify(:csc_not_found), do: :probe_infrastructure_error
+  def classify({:unknown_tool_permission, _}), do: :persistent_worker_failure
+  def classify({:unauthorized_credential, _}), do: :persistent_worker_failure
+  def classify({:incomplete_stream, _}), do: :persistent_worker_failure
+  def classify({:malformed_json_line, _, _}), do: :persistent_worker_failure
+  def classify(:termination_unconfirmed), do: :persistent_worker_failure
+  def classify({:termination_unconfirmed, _}), do: :persistent_worker_failure
   def classify({:jobrun_helper_missing, _}), do: :probe_infrastructure_error
   def classify({:jobrun_helper_hash_mismatch, _, _, _}), do: :probe_infrastructure_error
   def classify({:jobrun_helper_unverified, _}), do: :probe_infrastructure_error
@@ -90,7 +104,7 @@ defmodule SymphonyElixir.OpenCode.Failure do
   @spec failure_info(term()) :: map()
   def failure_info(reason) do
     class = classify(reason)
-    message = extract_message(reason)
+    message = reason |> extract_message() |> Redactor.redact()
     reset_ms = extract_reset_in_ms(reason)
 
     %{
@@ -99,7 +113,7 @@ defmodule SymphonyElixir.OpenCode.Failure do
       code: extract_code(reason),
       reset_after_ms: reset_ms,
       reset_in_ms: reset_ms,
-      raw: reason
+      raw: Redactor.redact(reason)
     }
   end
 
@@ -166,55 +180,105 @@ defmodule SymphonyElixir.OpenCode.Failure do
     end
   end
 
+  @auth_signals [
+    ~r/\bunauthorized\b/,
+    ~r/\bunauthenticated\b/,
+    ~r/invalid api key/,
+    ~r/invalid_api_key/,
+    ~r/authentication failed/,
+    ~r/\bauth error\b/,
+    ~r/(?:http|status|error)\s+401\b/
+  ]
+  @permission_signals [
+    ~r/permission denied/,
+    ~r/permission auto-rejected/,
+    ~r/auto-reject/,
+    ~r/not permitted/,
+    ~r/tool permission/,
+    ~r/\bauto_approve\b/
+  ]
+  @model_signals [
+    ~r/model not found/,
+    ~r/model unavailable/,
+    ~r/modelnotfound/,
+    ~r/no such model/
+  ]
+  @quota_signals [~r/\bquota\b/, ~r/usage limit/, ~r/usage_limit/, ~r/usagelimit/]
+  @rate_signals [
+    ~r/rate limit/,
+    ~r/rate_limit/,
+    ~r/ratelimit/,
+    ~r/too many requests/,
+    ~r/(?:http|status|error)\s+429\b/
+  ]
+  @outage_signals [
+    ~r/server error/,
+    ~r/service unavailable/,
+    ~r/bad gateway/,
+    ~r/gateway timeout/,
+    ~r/provider_outage/,
+    ~r/(?:http|status|error)\s+50[0234]\b/
+  ]
+  @runtime_signals [
+    ~r/\btimeout\b/,
+    ~r/timed out/,
+    ~r/connection refused/,
+    ~r/connection reset/,
+    ~r/transport error/
+  ]
+  @environment_signals [~r/outside_workspace/, ~r/workspace_not_a_directory/]
+  @infrastructure_signals [~r/executable_not_found/, ~r/\bjobrun\b/, ~r/shell_start/]
+  @ambiguous_http_signals [
+    ~r/\bforbidden\b/,
+    ~r/(?:http|status|error)\s+403\b/,
+    ~r/(?<!\d)403(?!\d)/
+  ]
+
   defp classify_text(text, fallback) do
     normalized = String.downcase(text)
+    auth? = signal?(normalized, @auth_signals)
+    permission? = signal?(normalized, @permission_signals)
 
     cond do
-      contains_any?(normalized, ["model not found", "model unavailable", "modelnotfound", "no such model"]) ->
-        :model_unavailable
-
-      contains_any?(normalized, ["quota", "usage limit", "usage_limit", "usagelimit"]) ->
-        :provider_quota
-
-      contains_any?(normalized, ["rate limit", "rate_limit", "ratelimit", "too many requests", "429"]) ->
-        :provider_rate_limit
-
-      contains_any?(normalized, [
-        "unauthorized",
-        "authentication",
-        "forbidden",
-        "auth",
-        "401",
-        "403",
-        "invalid api key",
-        "invalid_api_key",
-        "autherror"
-      ]) ->
-        :auth_unavailable
-
-      contains_any?(normalized, ["server error", "service unavailable", "bad gateway", "gateway timeout", "provider_outage", "500", "502", "503", "504"]) ->
-        :provider_outage
-
-      contains_any?(normalized, ["timeout", "timed out", "connection", "transport", "disconnected"]) ->
-        :runtime_unavailable
-
-      contains_any?(normalized, ["permission", "auto-reject", "denied", "forbidden", "auto_approve"]) ->
+      auth? and permission? ->
         :persistent_worker_failure
 
-      contains_any?(normalized, ["workspace", "environment", "outside_workspace"]) ->
+      signal?(normalized, @model_signals) ->
+        :model_unavailable
+
+      signal?(normalized, @quota_signals) ->
+        :provider_quota
+
+      signal?(normalized, @rate_signals) ->
+        :provider_rate_limit
+
+      auth? ->
+        :auth_unavailable
+
+      signal?(normalized, @outage_signals) ->
+        :provider_outage
+
+      permission? ->
+        :persistent_worker_failure
+
+      signal?(normalized, @runtime_signals) ->
+        :runtime_unavailable
+
+      signal?(normalized, @environment_signals) ->
         :probe_environment_error
 
-      contains_any?(normalized, ["infrastructure", "jobrun", "shell_start", "executable_not_found"]) ->
+      signal?(normalized, @infrastructure_signals) ->
         :probe_infrastructure_error
+
+      signal?(normalized, @ambiguous_http_signals) ->
+        :persistent_worker_failure
 
       true ->
         fallback
     end
   end
 
-  defp contains_any?(haystack, needles) do
-    Enum.any?(needles, &String.contains?(haystack, &1))
-  end
+  defp signal?(text, patterns), do: Enum.any?(patterns, &Regex.match?(&1, text))
 
   defp extract_message(reason) when is_binary(reason), do: reason
   defp extract_message(%FailureError{message: msg}), do: msg

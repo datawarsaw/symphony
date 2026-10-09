@@ -66,6 +66,11 @@ defmodule SymphonyElixir.OpenCodeTest do
                Config.build(auto_approve: true)
     end
 
+    test "unknown tool permissions fail closed" do
+      assert {:error, {:unknown_tool_permission, ["shell"]}} =
+               Config.build(allowed_tools: ["shell", "read"])
+    end
+
     test "write_config writes valid JSON in both config root and opencode subfolder", %{workspace: workspace} do
       config_dir = Path.join(workspace, "config")
       File.mkdir_p!(config_dir)
@@ -98,6 +103,9 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert File.dir?(dirs.state)
       assert File.dir?(dirs.config)
       assert File.dir?(dirs.tmp)
+      assert File.dir?(dirs.home)
+      assert File.dir?(dirs.managed)
+      assert File.dir?(dirs.xdg_config)
 
       # Verify contained within workspace
       assert String.starts_with?(dirs.data, canonical_workspace)
@@ -135,11 +143,29 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert env_map["CLOUDFLARE_API_TOKEN"] == false
 
       # Isolated XDG and TMP directories must be set
-      assert env_map["XDG_DATA_HOME"] == String.to_charlist(dirs.data)
-      assert env_map["XDG_CACHE_HOME"] == String.to_charlist(dirs.cache)
-      assert env_map["XDG_CONFIG_HOME"] == String.to_charlist(dirs.config)
-      assert env_map["XDG_STATE_HOME"] == String.to_charlist(dirs.state)
+      assert env_map["XDG_DATA_HOME"] == String.to_charlist(dirs.xdg_data)
+      assert env_map["XDG_CACHE_HOME"] == String.to_charlist(dirs.xdg_cache)
+      assert env_map["XDG_CONFIG_HOME"] == String.to_charlist(dirs.xdg_config)
+      assert env_map["XDG_STATE_HOME"] == String.to_charlist(dirs.xdg_state)
+      assert env_map["OPENCODE_CONFIG_DIR"] == String.to_charlist(dirs.config)
+      assert env_map["HOME"] == String.to_charlist(dirs.home)
+      assert env_map["USERPROFILE"] == String.to_charlist(dirs.home)
+      assert env_map["OPENCODE_DISABLE_PROJECT_CONFIG"] == ~c"1"
+      assert env_map["OPENCODE_PERMISSION"] == false
+      assert env_map["OPENCODE_CONFIG"] == false
+      assert env_map["OPENCODE_CONFIG_CONTENT"] == false
       assert env_map["TMP"] == String.to_charlist(dirs.tmp)
+
+      if match?({:win32, _}, :os.type()) do
+        assert Enum.any?(env_map, fn {key, value} ->
+                 String.downcase(key) == "path" and is_list(value)
+               end)
+
+        assert Enum.any?(env_map, fn {key, value} ->
+                 String.downcase(key) == "systemroot" and is_list(value)
+               end)
+      end
+
       assert env_map["TEMP"] == String.to_charlist(dirs.tmp)
       assert env_map["TMPDIR"] == String.to_charlist(dirs.tmp)
     end
@@ -216,8 +242,15 @@ defmodule SymphonyElixir.OpenCodeTest do
                "high",
                "--title",
                "Run 1",
+               "--",
                "Solve issue"
              ]
+
+      assert Enum.take(Adapter.build_opencode_args("anthropic", "claude", workspace, "--auto", []), -2) ==
+               ["--", "--auto"]
+
+      assert Enum.take(Adapter.build_opencode_args("anthropic", "claude", workspace, "-leading", []), -2) ==
+               ["--", "-leading"]
     end
   end
 
@@ -228,6 +261,7 @@ defmodule SymphonyElixir.OpenCodeTest do
   describe "Incremental JSONL Parsing & Fragmentation" do
     test "parses complete JSONL events" do
       event1 = Jason.encode!(%{"type" => "step_start", "timestamp" => 1, "sessionID" => "ses_1"}) <> "\n"
+
       event2 =
         Jason.encode!(%{
           "type" => "tool_use",
@@ -240,6 +274,7 @@ defmodule SymphonyElixir.OpenCodeTest do
             "state" => %{"status" => "completed", "output" => "data"}
           }
         }) <> "\n"
+
       event3 =
         Jason.encode!(%{
           "type" => "step_finish",
@@ -257,6 +292,7 @@ defmodule SymphonyElixir.OpenCodeTest do
         |> Parser.feed(event1)
         |> Parser.feed(event2)
         |> Parser.feed(event3)
+        |> Parser.feed(idle_event("ses_1"))
         |> Parser.finish(0)
 
       res = Parser.to_result(state)
@@ -280,14 +316,16 @@ defmodule SymphonyElixir.OpenCodeTest do
     test "handles severe fragmentation across arbitrary byte boundaries" do
       raw_stream =
         ~s({"type":"step_start","timestamp":100,"sessionID":"ses_frag"}\r\n) <>
-        ~s({"type":"tool_use","timestamp":200,"sessionID":"ses_frag","part":{"tool":"edit","callID":"c1","messageID":"m1","state":{"status":"completed"}}}\n) <>
-        ~s({"type":"step_finish","timestamp":300,"sessionID":"ses_frag","part":{"messageID":"m1","tokens":{"input":12,"output":34}}}\r\n)
+          ~s({"type":"tool_use","timestamp":200,"sessionID":"ses_frag","part":{"tool":"edit","callID":"c1","messageID":"m1","state":{"status":"completed"}}}\n) <>
+          ~s({"type":"step_finish","timestamp":300,"sessionID":"ses_frag","part":{"messageID":"m1","tokens":{"input":12,"output":34}}}\r\n) <>
+          idle_event("ses_frag")
 
       # Split into 3-byte chunks to test heavy fragmentation
       chunks =
         for <<chunk::binary-size(3) <- raw_stream>>, do: chunk
 
       remainder_len = rem(byte_size(raw_stream), 3)
+
       all_chunks =
         if remainder_len > 0 do
           tail = :binary.part(raw_stream, byte_size(raw_stream) - remainder_len, remainder_len)
@@ -318,8 +356,8 @@ defmodule SymphonyElixir.OpenCodeTest do
     test "malformed non-JSON lines are captured in failure_evidence without crashing" do
       stream =
         "garbage line not json\n" <>
-        ~s({"type":"step_start","timestamp":100,"sessionID":"ses_clean"}\n) <>
-        "another corrupt {line\n"
+          ~s({"type":"step_start","timestamp":100,"sessionID":"ses_clean"}\n) <>
+          "another corrupt {line\n"
 
       state =
         Parser.new()
@@ -331,6 +369,7 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert res.session_id == "ses_clean"
       assert length(res.failure_evidence) == 2
       assert Enum.all?(res.failure_evidence, fn {:malformed_json_line, line, _} -> is_binary(line) end)
+      assert res.completion_state == :failed
     end
 
     test "error events set completion_state to :failed and capture evidence" do
@@ -350,10 +389,11 @@ defmodule SymphonyElixir.OpenCodeTest do
 
       assert res.completion_state == :failed
       assert length(res.failure_evidence) >= 1
+
       assert Enum.any?(res.failure_evidence, fn
-        {:error_event, err} -> err["name"] == "ModelNotFoundError"
-        _ -> false
-      end)
+               {:error_event, err} -> err["name"] == "ModelNotFoundError"
+               _ -> false
+             end)
     end
   end
 
@@ -414,6 +454,21 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert Failure.classify({:executable_not_found, "opencode"}) == :probe_infrastructure_error
       assert Failure.classify({:jobrun_helper_missing, "exe"}) == :probe_infrastructure_error
     end
+
+    test "missing executable is infrastructure and ambiguous text is not over-classified" do
+      assert Failure.classify(:opencode_executable_not_found) == :probe_infrastructure_error
+      assert Failure.classify("The author revised section 4012") == :transient_worker_failure
+      assert Failure.classify("processed 500 files") == :transient_worker_failure
+      assert Failure.classify("status 401") == :auth_unavailable
+      assert Failure.classify("unauthorized") == :auth_unavailable
+      assert Failure.classify("HTTP 403 Forbidden") == :persistent_worker_failure
+      assert Failure.classify("unauthorized permission denied") == :persistent_worker_failure
+      assert Failure.classify("permission denied") == :persistent_worker_failure
+
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      info = Failure.failure_info({:tool_error, "read", secret})
+      refute inspect(info) =~ secret
+    end
   end
 
   # ===========================================================================
@@ -441,6 +496,8 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert result.usage.total_tokens == 300
       assert result.completion_state == :completed
       assert result.exit_code == 0
+      assert result.failure_evidence == []
+      assert result.stderr =~ "not-json-stderr-marker"
 
       # Containment confirmation check
       if WorkerContainment.containment_active?() do
@@ -468,8 +525,14 @@ defmodule SymphonyElixir.OpenCodeTest do
       # Give the process a moment to launch into the Job Object
       Process.sleep(200)
 
+      if WorkerContainment.containment_active?() do
+        assert {:os_pid, os_pid} = :erlang.port_info(session.port, :os_pid)
+        assert session.identity["wrapper_pid"] == Integer.to_string(os_pid)
+      end
+
       # Stop the session forcefully
       confirmation = Adapter.stop_session(session)
+      assert Adapter.stop_session(session) == confirmation
 
       if WorkerContainment.containment_active?() do
         assert confirmation.status == :TERMINATED_CONFIRMED
@@ -493,6 +556,319 @@ defmodule SymphonyElixir.OpenCodeTest do
 
       assert result.completion_state == :failed
       assert result.failure_info.failure_class == :model_unavailable
+    end
+  end
+
+  describe "Completion evidence and redaction" do
+    test "exit 0 without a completion event fails closed" do
+      state =
+        Parser.new()
+        |> Parser.feed(~s({"type":"step_start","sessionID":"ses_partial"}\n))
+        |> Parser.finish(0)
+
+      result = Parser.to_result(state)
+      assert result.completion_state == :failed
+      assert {:incomplete_stream, :missing_completion_event} in result.failure_evidence
+    end
+
+    test "a tool error stays failed when a later idle event arrives" do
+      stream =
+        ~s({"type":"tool_use","sessionID":"ses_tool","part":{"tool":"bash","callID":"c1","state":{"status":"error","error":"permission denied"}}}\n) <>
+          idle_event("ses_tool")
+
+      result =
+        Parser.new()
+        |> Parser.feed(stream)
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :failed
+      assert {:tool_error, "bash", "permission denied"} in result.failure_evidence
+    end
+
+    test "tool output is redacted and bounded" do
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      output = secret <> " " <> String.duplicate("a", 5_000)
+
+      event =
+        Jason.encode!(%{
+          "type" => "tool_use",
+          "sessionID" => "ses_secret",
+          "part" => %{
+            "tool" => "read",
+            "callID" => "c1",
+            "messageID" => "m1",
+            "state" => %{"status" => "completed", "output" => output}
+          }
+        }) <> "\n"
+
+      result =
+        Parser.new()
+        |> Parser.feed(event <> idle_event("ses_secret"))
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      rendered = hd(result.tool_events).output
+      refute rendered =~ secret
+      assert String.ends_with?(rendered, "…[truncated]")
+      assert byte_size(rendered) <= 4_096 + byte_size("…[truncated]")
+    end
+  end
+
+  describe "Process boundary regressions" do
+    @tag :windows_only
+    test "the child receives stdin EOF before OpenCode would block", %{workspace: workspace} do
+      assert {:ok, result} = run_mock(workspace, "--mock-mode=stdin", timeout_ms: 5_000)
+      assert result.completion_state == :completed
+      assert result.exit_code == 0
+    end
+
+    @tag :windows_only
+    test "the child environment is an allowlist and keeps only the selected provider", %{
+      workspace: workspace
+    } do
+      linear = "lin_api_parentsecretvalue"
+      openai = "sk-parent-openai-secret"
+      anthropic = "sk-ant-parent-selected"
+      sentinel = "should-not-pass"
+
+      with_restored_env(
+        [
+          "LINEAR_API_KEY",
+          "OPENAI_API_KEY",
+          "ANTHROPIC_API_KEY",
+          "OPENCODE_PERMISSION",
+          "OPENCODE_CONFIG_CONTENT",
+          "OPENCODE_INHERITED_SENTINEL"
+        ],
+        fn ->
+          System.put_env("LINEAR_API_KEY", linear)
+          System.put_env("OPENAI_API_KEY", openai)
+          System.put_env("ANTHROPIC_API_KEY", anthropic)
+          System.put_env("OPENCODE_PERMISSION", ~s({"*":"allow","bash":"allow"}))
+          System.put_env("OPENCODE_CONFIG_CONTENT", ~s({"permission":{"bash":"allow"}}))
+          System.put_env("OPENCODE_INHERITED_SENTINEL", sentinel)
+
+          assert {:ok, _} = run_mock(workspace, "--mock-mode=env")
+        end
+      )
+
+      path = Path.join(workspace, "opencode-child-evidence.json")
+      raw = File.read!(path)
+      evidence = Jason.decode!(raw)
+
+      assert evidence["ANTHROPIC_API_KEY"] == true
+      assert evidence["LINEAR_API_KEY"] == false
+      assert evidence["OPENAI_API_KEY"] == false
+      assert evidence["OPENCODE_PERMISSION"] == false
+      assert evidence["OPENCODE_CONFIG_CONTENT"] == false
+      assert evidence["OPENCODE_DISABLE_PROJECT_CONFIG"] == true
+      assert evidence["OPENCODE_INHERITED_SENTINEL"] == false
+      refute raw =~ linear
+      refute raw =~ openai
+      refute raw =~ anthropic
+      refute raw =~ sentinel
+    end
+
+    @tag :windows_only
+    test "unauthorized provider credentials are rejected before launch", %{workspace: workspace} do
+      mock_exe = MockOpenCode.ensure_built!()
+
+      assert {:error, {:unauthorized_credential, "OPENAI_API_KEY"}} =
+               Adapter.start_session(
+                 workspace,
+                 "hello",
+                 provider: "anthropic",
+                 model: "claude-3-5-sonnet",
+                 executable: mock_exe,
+                 provider_auth: %{"OPENAI_API_KEY" => "not-allowed"}
+               )
+    end
+
+    @tag :windows_only
+    test "unknown tool permissions are rejected before launch", %{workspace: workspace} do
+      mock_exe = MockOpenCode.ensure_built!()
+
+      assert {:error, {:unknown_tool_permission, ["shell"]}} =
+               Adapter.start_session(
+                 workspace,
+                 "hello",
+                 provider: "anthropic",
+                 model: "claude-3-5-sonnet",
+                 executable: mock_exe,
+                 allowed_tools: ["shell"]
+               )
+    end
+
+    @tag :windows_only
+    test "prompts that look like options stay behind --", %{workspace: workspace} do
+      Enum.each(["--auto", "-leading", "hello world"], fn prompt ->
+        File.write!(Path.join(workspace, "opencode-mock-control.txt"), "mode=argv\n")
+
+        assert {:ok, _} = run_mock(workspace, prompt)
+
+        args = Jason.decode!(File.read!(Path.join(workspace, "opencode-argv.json")))["args"]
+        index = Enum.find_index(args, &(&1 == "--"))
+        assert is_integer(index)
+        assert Enum.at(args, index + 1) == prompt
+      end)
+    end
+
+    @tag :windows_only
+    test "exit 0 without completion, malformed JSON, or a tool error is not success", %{
+      workspace: workspace
+    } do
+      assert {:error, {{:incomplete_stream, :missing_completion_event}, partial}} =
+               run_mock(workspace, "--mock-mode=partial")
+
+      assert partial.exit_code == 0
+      assert partial.completion_state == :failed
+
+      assert {:error, {{:malformed_json_line, _line, _reason}, malformed}} =
+               run_mock(workspace, "--mock-mode=malformed")
+
+      assert malformed.exit_code == 0
+      assert malformed.completion_state == :failed
+
+      assert {:error, {{:tool_error, "read", "permission denied"}, tool_error}} =
+               run_mock(workspace, "--mock-mode=tool-error")
+
+      assert tool_error.exit_code == 0
+      assert tool_error.completion_state == :failed
+      assert tool_error.failure_info.failure_class == :persistent_worker_failure
+    end
+
+    @tag :windows_only
+    test "tool output, callbacks, and stderr do not expose secrets", %{workspace: workspace} do
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      linear = "lin_api_abcdefghijklmnopqrstuvwxyz"
+      {:ok, agent} = Agent.start_link(fn -> [] end)
+
+      assert {:ok, result} =
+               run_mock(workspace, "--mock-mode=secret", on_event: fn event -> Agent.update(agent, &[event | &1]) end)
+
+      payload = inspect(result) <> inspect(Agent.get(agent, & &1))
+      refute payload =~ secret
+      refute payload =~ linear
+      assert result.stderr =~ "[redacted]"
+      refute result.stderr =~ secret
+    end
+
+    @tag :windows_only
+    test "unconfirmed termination does not return success", %{workspace: workspace} do
+      assert WorkerContainment.containment_active?()
+      authority = Path.join(workspace, "authority-not-a-directory")
+      File.write!(authority, "x")
+
+      assert {:error, {:termination_unconfirmed, result}} =
+               run_mock(workspace, "Test prompt", authority_root: authority)
+
+      assert result.exit_code == 0
+      assert result.completion_state == :completed
+      assert result.failure_evidence == []
+      assert result.termination.status == :TERMINATION_UNCONFIRMED
+    end
+
+    @tag :windows_only
+    test "real OpenCode 1.18.28 keeps hostile project and parent overrides denied", %{
+      workspace: workspace
+    } do
+      exe =
+        case Adapter.resolve_executable([]) do
+          {:ok, path} -> path
+          {:error, reason} -> flunk("opencode executable unavailable: #{inspect(reason)}")
+        end
+
+      {version, 0} = System.cmd(exe, ["--version"], stderr_to_stdout: true)
+      assert version =~ "1.18.28"
+
+      File.write!(
+        Path.join(workspace, "opencode.json"),
+        ~s({"permission":{"*":"allow","bash":"allow","edit":"allow"}})
+      )
+
+      {:ok, dirs} = Environment.prepare_directories(workspace, "real-config-launch")
+      assert {:ok, _} = Config.write_config(dirs, allowed_tools: ["read"])
+
+      with_restored_env(["OPENCODE_PERMISSION", "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT"], fn ->
+        outside = Path.join(workspace, "hostile-override.json")
+        File.write!(outside, ~s({"permission":{"*":"allow","bash":"allow"}}))
+        System.put_env("OPENCODE_PERMISSION", ~s({"*":"allow","bash":"allow","edit":"allow"}))
+        System.put_env("OPENCODE_CONFIG_CONTENT", ~s({"permission":{"bash":"allow","edit":"allow"}}))
+        System.put_env("OPENCODE_CONFIG", outside)
+
+        {:ok, port_env} = Environment.build_port_env("anthropic", dirs, [])
+
+        env =
+          Enum.map(port_env, fn
+            {key, false} -> {List.to_string(key), nil}
+            {key, value} -> {List.to_string(key), List.to_string(value)}
+          end)
+
+        {config_out, config_status} =
+          System.cmd(exe, ["debug", "config", "--pure"], cd: workspace, env: env, stderr_to_stdout: true)
+
+        assert config_status == 0
+        parsed = Jason.decode!(config_out)
+        assert parsed["permission"]["*"] == "deny"
+        assert parsed["permission"]["bash"] == "deny"
+        assert parsed["permission"]["edit"] == "deny"
+        assert parsed["permission"]["read"] == "allow"
+
+        {paths_out, paths_status} =
+          System.cmd(exe, ["debug", "paths", "--pure"], cd: workspace, env: env, stderr_to_stdout: true)
+
+        assert paths_status == 0
+        normalized = paths_out |> String.replace("\\", "/") |> String.downcase()
+        home = dirs.home |> String.replace("\\", "/") |> String.downcase()
+        config = dirs.xdg_config |> Path.join("opencode") |> String.replace("\\", "/") |> String.downcase()
+        user_home = System.user_home!() |> String.replace("\\", "/") |> String.downcase()
+
+        assert normalized =~ home
+        assert normalized =~ config
+        refute normalized =~ user_home <> "/.config"
+        refute normalized =~ user_home <> "/.opencode"
+      end)
+    end
+  end
+
+  defp idle_event(session_id) do
+    Jason.encode!(%{
+      "type" => "session.status",
+      "timestamp" => 4,
+      "sessionID" => session_id,
+      "status" => %{"type" => "idle"}
+    }) <> "\n"
+  end
+
+  defp run_mock(workspace, prompt, extra \\ []) do
+    mock_exe = MockOpenCode.ensure_built!()
+
+    OpenCode.run(
+      workspace,
+      prompt,
+      Keyword.merge(
+        [
+          provider: "anthropic",
+          model: "claude-3-5-sonnet",
+          executable: mock_exe,
+          timeout_ms: 8_000
+        ],
+        extra
+      )
+    )
+  end
+
+  defp with_restored_env(keys, fun) do
+    previous = Map.new(keys, &{&1, System.get_env(&1)})
+
+    try do
+      fun.()
+    after
+      Enum.each(previous, fn
+        {key, nil} -> System.delete_env(key)
+        {key, value} -> System.put_env(key, value)
+      end)
     end
   end
 end

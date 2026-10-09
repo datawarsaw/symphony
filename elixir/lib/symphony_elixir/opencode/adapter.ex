@@ -5,19 +5,23 @@ defmodule SymphonyElixir.OpenCode.Adapter do
   Security and reliability invariants:
   - Explicit provider and model routing: rejects bare models and forbids automatic provider fallback.
   - Deny-by-default tool permissions: configuration is generated per launch with tools denied by default.
-  - Credential boundary: unrelated provider keys and tracker secrets are scrubbed from child environment.
+  - Effective config isolation: project config is disabled and inherited OpenCode config, permission, and home lookup are pinned to the launch directory.
+  - Credential boundary: the child environment is an allowlist limited to the selected provider.
   - State isolation: session, cache, and config dirs are isolated from the user's global ~/.local or ~/.config dirs.
   - Windows Job Object containment: integrated with jobrun wrapper (KILL_ON_JOB_CLOSE, positive death receipts).
-  - Clean lifecycle: supports natural process exits and forced termination with verifiable receipts.
+  - Positive completion: exit status 0 is not success without a completion event, clean JSONL, and confirmed termination.
+  - Clean lifecycle: stdin EOF is delivered to OpenCode without closing the containment stop pipe, and stop is idempotent.
   """
 
   require Logger
 
   alias SymphonyElixir.OpenCode.{Config, Environment, Failure, Parser}
+  alias SymphonyElixir.OpenCode.{Redactor, StdioHost}
   alias SymphonyElixir.PathSafety
   alias SymphonyElixir.WorkerContainment
 
   @default_timeout_ms 60_000
+  @stop_table :symphony_opencode_stop_latch
 
   @type session :: %{
           port: port(),
@@ -28,6 +32,7 @@ defmodule SymphonyElixir.OpenCode.Adapter do
           provider: String.t(),
           model: String.t(),
           launch_id: String.t(),
+          stderr_path: Path.t(),
           parser: %Parser.State{}
         }
 
@@ -35,6 +40,7 @@ defmodule SymphonyElixir.OpenCode.Adapter do
           optional(:failure_info) => map(),
           optional(:termination) => map() | nil,
           optional(:exit_code) => integer() | nil,
+          optional(:stderr) => String.t(),
           required(:session_id) => String.t() | nil,
           required(:message_ids) => [String.t()],
           required(:tool_events) => [map()],
@@ -42,10 +48,6 @@ defmodule SymphonyElixir.OpenCode.Adapter do
           required(:usage) => map(),
           required(:failure_evidence) => [term()]
         }
-
-  # ---------------------------------------------------------------------------
-  # High-level run/3
-  # ---------------------------------------------------------------------------
 
   @doc """
   Runs an OpenCode worker non-interactively in the given workspace.
@@ -57,17 +59,21 @@ defmodule SymphonyElixir.OpenCode.Adapter do
     with {:ok, session} <- start_session(workspace, prompt, opts) do
       try do
         timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
-        await_completion(session, timeout_ms, opts)
+
+        case await_completion(session, timeout_ms, opts) do
+          {:exit, status, parser} ->
+            termination = stop_session(session)
+            conclude(session, parser, status, termination)
+
+          {:timeout, parser} ->
+            termination = stop_session(session)
+            timeout_result(session, parser, termination)
+        end
       after
-        # Always confirm termination upon exit
         stop_session(session)
       end
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Session Lifecycle
-  # ---------------------------------------------------------------------------
 
   @doc """
   Starts an OpenCode process session.
@@ -76,92 +82,88 @@ defmodule SymphonyElixir.OpenCode.Adapter do
   """
   @spec start_session(Path.t(), String.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, prompt, opts \\ []) do
+    launch_id =
+      Keyword.get(opts, :launch_id) ||
+        "#{System.system_time(:millisecond)}-#{:erlang.unique_integer([:positive])}"
+
     with {:ok, {provider, model}} <- validate_model_selection(opts),
          {:ok, canonical_workspace} <- validate_workspace(workspace),
-         {:ok, executable} <- resolve_executable(opts) do
-      launch_id =
-        Keyword.get(opts, :launch_id) ||
-          "#{System.system_time(:millisecond)}-#{:erlang.unique_integer([:positive])}"
+         {:ok, executable} <- resolve_executable(opts),
+         {:ok, dirs} <- Environment.prepare_directories(canonical_workspace, launch_id),
+         {:ok, _config_file} <- Config.write_config(dirs, opts),
+         {:ok, port_env} <- Environment.build_port_env(provider, dirs, opts),
+         {:ok, host} <- StdioHost.ensure_built() do
+      worker_host = Keyword.get(opts, :worker_host)
+      contained? = WorkerContainment.contained_launch?(worker_host)
 
-      with {:ok, dirs} <- Environment.prepare_directories(canonical_workspace, launch_id),
-           {:ok, _config_file} <- Config.write_config(dirs.config, opts),
-           {:ok, port_env} <- Environment.build_port_env(provider, dirs, opts) do
-        worker_host = Keyword.get(opts, :worker_host)
-        contained? = WorkerContainment.contained_launch?(worker_host)
-
-        identity =
-          if contained? do
-            WorkerContainment.new_identity(
-              issue_id: Keyword.get(opts, :issue_id),
-              attempt_id: Keyword.get(opts, :attempt_id),
-              workspace: canonical_workspace,
-              worker_host: nil,
-              authority_root: Keyword.get(opts, :authority_root)
-            )
-          else
-            nil
-          end
-
-        child_args = build_opencode_args(provider, model, canonical_workspace, prompt, opts)
-
-        case start_port(canonical_workspace, executable, child_args, port_env, identity) do
-          {:ok, port} ->
-            session = %{
-              port: port,
-              identity: identity,
-              workspace: canonical_workspace,
-              dirs: dirs,
-              executable: executable,
-              provider: provider,
-              model: model,
-              launch_id: launch_id,
-              parser: Parser.new()
-            }
-
-            {:ok, session}
-
-          {:error, reason} ->
-            {:error, reason}
+      identity =
+        if contained? do
+          WorkerContainment.new_identity(
+            issue_id: Keyword.get(opts, :issue_id),
+            attempt_id: Keyword.get(opts, :attempt_id),
+            workspace: canonical_workspace,
+            worker_host: nil,
+            authority_root: Keyword.get(opts, :authority_root)
+          )
+        else
+          nil
         end
+
+      stderr_path = Path.join(dirs.tmp, "stderr.log")
+      opencode_args = build_opencode_args(provider, model, canonical_workspace, prompt, opts)
+      port_args = ["--stderr", stderr_path, "--", executable | opencode_args]
+
+      case start_port(canonical_workspace, host, port_args, port_env, identity) do
+        {:ok, port} ->
+          session = %{
+            port: port,
+            identity: attach_wrapper_pid(identity, port),
+            workspace: canonical_workspace,
+            dirs: dirs,
+            executable: executable,
+            provider: provider,
+            model: model,
+            launch_id: launch_id,
+            stderr_path: stderr_path,
+            parser: Parser.new()
+          }
+
+          {:ok, session}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     end
   end
 
   @doc """
   Stops an active OpenCode session and collects positive termination confirmation.
-  If running under Windows Job containment, confirms ActiveProcesses == 0 via receipt.
+  Repeated calls return the first confirmation and do not issue a second kill.
   """
   @spec stop_session(session()) :: map()
-  def stop_session(%{port: port, identity: identity}) do
-    if identity && is_port(port) do
-      grace_ms = WorkerContainment.grace_ms()
-      WorkerContainment.stop_and_confirm(port, identity, grace_ms)
-    else
-      if is_port(port) do
-        try do
-          Port.close(port)
-        rescue
-          _ -> :ok
-        end
-      end
+  def stop_session(%{port: port, identity: identity, launch_id: launch_id}) do
+    table = ensure_stop_table()
 
-      %{status: :NOT_APPLICABLE}
+    case :ets.insert_new(table, {launch_id, :pending}) do
+      true ->
+        confirmation = safe_stop(port, identity)
+        :ets.insert(table, {launch_id, confirmation})
+        confirmation
+
+      false ->
+        cached_stop(table, launch_id)
     end
   end
 
   def stop_session(_), do: %{status: :NOT_APPLICABLE}
 
-  # ---------------------------------------------------------------------------
-  # Stream processing & waiting
-  # ---------------------------------------------------------------------------
-
   defp await_completion(session, timeout_ms, opts) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     on_event = Keyword.get(opts, :on_event)
-    loop_stream(session.port, session.parser, deadline, on_event, session)
+    loop_stream(session.port, session.parser, deadline, on_event)
   end
 
-  defp loop_stream(port, parser, deadline, on_event, session) do
+  defp loop_stream(port, parser, deadline, on_event) do
     remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
@@ -175,55 +177,72 @@ defmodule SymphonyElixir.OpenCode.Adapter do
           end
         end
 
-        loop_stream(port, updated_parser, deadline, on_event, session)
+        loop_stream(port, updated_parser, deadline, on_event)
 
       {^port, {:exit_status, status}} ->
-        final_parser = Parser.finish(parser, status)
-        result = Parser.to_result(final_parser)
-
-        # Collect receipt evidence if contained
-        termination =
-          if session.identity do
-            confirmation = WorkerContainment.stop_and_confirm(port, session.identity, WorkerContainment.grace_ms())
-            confirmation
-          else
-            %{status: :NOT_APPLICABLE}
-          end
-
-        final_result =
-          result
-          |> Map.put(:termination, termination)
-          |> Map.put(:exit_code, status)
-
-        if status == 0 and final_parser.completion_state != :failed do
-          {:ok, final_result}
-        else
-          error_reason =
-            find_primary_failure_reason(final_parser.failure_evidence, status)
-
-          failure_info = Failure.failure_info(error_reason)
-          {:error, {error_reason, Map.put(final_result, :failure_info, failure_info)}}
-        end
+        {:exit, status, Parser.finish(parser, status)}
     after
       remaining_ms ->
-        # Timed out waiting for completion
-        termination = stop_session(session)
-        final_parser = Parser.finish(parser, 253)
-        result = Parser.to_result(final_parser)
-        failure_info = Failure.failure_info(:timeout)
-
-        final_result =
-          result
-          |> Map.put(:termination, termination)
-          |> Map.put(:exit_code, 253)
-          |> Map.put(:failure_info, failure_info)
-
-        {:error, {:timeout, final_result}}
+        {:timeout, parser}
     end
   end
 
+  defp conclude(session, parser, status, termination) do
+    result = assembled_result(session, parser, status, termination)
+
+    cond do
+      success?(parser, status, termination, session.identity) ->
+        {:ok, result}
+
+      protocol_succeeded?(parser, status) and not termination_ok?(session.identity, termination) ->
+        {:error, {:termination_unconfirmed, result}}
+
+      true ->
+        reason = find_primary_failure_reason(parser.failure_evidence, status)
+        {:error, {reason, Map.put(result, :failure_info, Failure.failure_info(reason))}}
+    end
+  end
+
+  defp timeout_result(session, parser, termination) do
+    final_parser = Parser.finish(parser, nil)
+    result = assembled_result(session, final_parser, 253, termination)
+    failure_info = Failure.failure_info(:timeout)
+    {:error, {:timeout, Map.put(result, :failure_info, failure_info)}}
+  end
+
+  defp assembled_result(session, parser, exit_code, termination) do
+    parser
+    |> Parser.to_result()
+    |> Map.put(:termination, termination)
+    |> Map.put(:exit_code, exit_code)
+    |> Map.put(:stderr, read_stderr(session))
+    |> Redactor.redact()
+  end
+
+  defp success?(parser, status, termination, identity) do
+    protocol_succeeded?(parser, status) and termination_ok?(identity, termination)
+  end
+
+  defp protocol_succeeded?(parser, 0) do
+    parser.completion_state == :completed and parser.failure_evidence == []
+  end
+
+  defp protocol_succeeded?(_parser, _status), do: false
+
+  defp termination_ok?(nil, %{status: :NOT_APPLICABLE}), do: true
+  defp termination_ok?(identity, %{status: :TERMINATED_CONFIRMED}) when is_map(identity), do: true
+  defp termination_ok?(_identity, _termination), do: false
+
+  defp read_stderr(%{stderr_path: path}) when is_binary(path) do
+    case File.read(path) do
+      {:ok, text} -> text
+      _ -> ""
+    end
+  end
+
+  defp read_stderr(_session), do: ""
+
   defp find_primary_failure_reason(evidence_list, status) do
-    # Prioritize specific protocol or tool errors over generic process exit code
     Enum.find(evidence_list, fn
       {:process_exit, _} -> false
       _ -> true
@@ -235,10 +254,6 @@ defmodule SymphonyElixir.OpenCode.Adapter do
   defp normalize_chunk(binary) when is_binary(binary), do: binary
   defp normalize_chunk(other), do: to_string(other)
 
-  # ---------------------------------------------------------------------------
-  # Process spawning (jobrun containment or direct)
-  # ---------------------------------------------------------------------------
-
   defp start_port(workspace, executable, child_args, env, nil) do
     port =
       Port.open(
@@ -246,7 +261,6 @@ defmodule SymphonyElixir.OpenCode.Adapter do
         [
           :binary,
           :exit_status,
-          :stderr_to_stdout,
           args: Enum.map(child_args, &String.to_charlist/1),
           cd: String.to_charlist(workspace),
           env: env
@@ -274,7 +288,6 @@ defmodule SymphonyElixir.OpenCode.Adapter do
           [
             :binary,
             :exit_status,
-            :stderr_to_stdout,
             args: wrapper_args,
             cd: String.to_charlist(workspace),
             env: env
@@ -288,13 +301,78 @@ defmodule SymphonyElixir.OpenCode.Adapter do
     error -> {:error, {:port_spawn_failed, Exception.message(error)}}
   end
 
-  # ---------------------------------------------------------------------------
-  # Validation & resolution
-  # ---------------------------------------------------------------------------
+  defp attach_wrapper_pid(nil, _port), do: nil
+
+  defp attach_wrapper_pid(identity, port) when is_map(identity) do
+    case :erlang.port_info(port, :os_pid) do
+      {:os_pid, os_pid} -> Map.put(identity, "wrapper_pid", to_string(os_pid))
+      _ -> identity
+    end
+  end
+
+  defp safe_stop(port, identity) do
+    if is_map(identity) and is_port(port) do
+      WorkerContainment.stop_and_confirm(port, identity, WorkerContainment.grace_ms())
+    else
+      close_port(port)
+      %{status: :NOT_APPLICABLE}
+    end
+  end
+
+  defp close_port(port) do
+    if is_port(port) do
+      try do
+        Port.close(port)
+      rescue
+        _ -> :ok
+      end
+    end
+
+    :ok
+  end
+
+  defp ensure_stop_table do
+    case :ets.whereis(@stop_table) do
+      :undefined ->
+        try do
+          :ets.new(@stop_table, [:named_table, :public, :set])
+        rescue
+          ArgumentError -> @stop_table
+        end
+
+      table ->
+        table
+    end
+  end
+
+  defp cached_stop(table, launch_id) do
+    deadline = System.monotonic_time(:millisecond) + 15_000
+    wait_for_cached_stop(table, launch_id, deadline)
+  end
+
+  defp wait_for_cached_stop(table, launch_id, deadline) do
+    case :ets.lookup(table, launch_id) do
+      [{^launch_id, confirmation}] when confirmation != :pending ->
+        confirmation
+
+      _ ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          %{
+            status: :TERMINATION_UNCONFIRMED,
+            receipt: nil,
+            exit_code: nil,
+            reason: :duplicate_stop_unresolved
+          }
+        else
+          Process.sleep(20)
+          wait_for_cached_stop(table, launch_id, deadline)
+        end
+    end
+  end
 
   @doc """
   Validates explicit provider/model selection.
-  Requires either `model: "provider/model_name"` or explicit `provider: "..."` and `model: "..."`.
+  Requires either \`model: "provider/model_name"\` or explicit \`provider: "..."\` and \`model: "..."\`.
   Rejects bare models without a provider to forbid automatic provider fallback.
   """
   @spec validate_model_selection(keyword()) :: {:ok, {String.t(), String.t()}} | {:error, term()}
@@ -309,7 +387,7 @@ defmodule SymphonyElixir.OpenCode.Adapter do
       is_binary(raw_provider) and String.trim(raw_provider) != "" ->
         provider = String.trim(raw_provider)
         model = raw_model |> to_string() |> String.trim()
-        # If model starts with provider/, strip it
+
         clean_model =
           if String.starts_with?(model, provider <> "/") do
             String.replace_prefix(model, provider <> "/", "")
@@ -331,7 +409,6 @@ defmodule SymphonyElixir.OpenCode.Adapter do
             {:ok, {provider, model}}
 
           _ ->
-            # Bare model without provider rejected (forbids automatic fallback)
             {:error, {:invalid_model_selection, "Model must be specified as 'provider/model'. Automatic fallback is forbidden."}}
         end
 
@@ -342,6 +419,7 @@ defmodule SymphonyElixir.OpenCode.Adapter do
 
   @doc """
   Builds CLI arguments vector for non-interactive OpenCode execution.
+  The prompt is placed after \`--\` so values such as \`--auto\` are not parsed as options.
   """
   @spec build_opencode_args(String.t(), String.t(), Path.t(), String.t(), keyword()) :: [String.t()]
   def build_opencode_args(provider, model, workspace, prompt, opts) do
@@ -376,13 +454,13 @@ defmodule SymphonyElixir.OpenCode.Adapter do
         args_with_variant
       end
 
-    args_with_title ++ [prompt]
+    args_with_title ++ ["--", prompt]
   end
 
   @doc """
   Resolves the OpenCode executable path.
-  Prioritizes explicit `executable` in opts, then looks for `opencode.exe` on Windows
-  or `opencode` in PATH.
+  Prioritizes explicit \`executable\` in opts, then looks for \`opencode.exe\` on Windows
+  or \`opencode\` in PATH.
   """
   @spec resolve_executable(keyword()) :: {:ok, String.t()} | {:error, term()}
   def resolve_executable(opts \\ []) do

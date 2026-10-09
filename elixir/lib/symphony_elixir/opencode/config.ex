@@ -1,13 +1,10 @@
 defmodule SymphonyElixir.OpenCode.Config do
   @moduledoc """
-  Generates isolated, secure OpenCode configuration with deny-by-default tool permissions.
+  Generates the isolated OpenCode configuration for one launch.
 
-  Security invariants:
-  - Deny-by-default: tools are set to "deny" unless explicitly allowlisted.
-  - Wildcard deny: "*" is explicitly set to "deny".
-  - Unrestricted permissions forbidden: requests to allow "*", "all", or disable
-    permission gates fail closed.
-  - Plugin isolation: external plugins are disabled ("plugin": []).
+  Every known tool is denied unless it is named in `allowed_tools`. Unknown
+  tool names and unrestricted grants fail closed. The same document is written
+  to the launch config directory and the isolated XDG config directory.
   """
 
   @schema_url "https://opencode.ai/config.json"
@@ -30,82 +27,103 @@ defmodule SymphonyElixir.OpenCode.Config do
     "skill"
   ]
 
-  @type permission_action :: :deny | :allow | :ask
-  @type tool_name :: String.t() | atom()
-
-  @doc """
-  Builds a structured OpenCode configuration map with deny-by-default permissions.
-  """
   @spec build(keyword()) :: {:ok, map()} | {:error, term()}
   def build(opts \\ []) do
-    with :ok <- validate_permission_opts(opts) do
-      allowed_tools =
-        opts
-        |> Keyword.get(:allowed_tools, [])
-        |> Enum.map(&normalize_tool_name/1)
-        |> MapSet.new()
+    with {:ok, allowed_tools} <- normalize_allowed_tools(opts) do
+      allowed = MapSet.new(allowed_tools)
 
       permissions =
         Enum.reduce(@known_tools, %{"*" => "deny"}, fn tool, acc ->
-          action = if MapSet.member?(allowed_tools, tool), do: "allow", else: "deny"
+          action = if MapSet.member?(allowed, tool), do: "allow", else: "deny"
           Map.put(acc, tool, action)
         end)
 
-      config = %{
-        "$schema" => @schema_url,
-        "plugin" => [],
-        "permission" => permissions
-      }
+      tools =
+        Map.new(@known_tools, fn tool ->
+          {tool, MapSet.member?(allowed, tool)}
+        end)
 
-      {:ok, config}
+      {:ok,
+       %{
+         "$schema" => @schema_url,
+         "plugin" => [],
+         "tools" => tools,
+         "permission" => permissions
+       }}
     end
   end
 
-  @doc """
-  Writes the generated OpenCode configuration to the target directory.
-  Creates `opencode.json` both directly in the directory and in an `opencode/`
-  subdirectory to ensure resolution across different OpenCode versions.
-  """
-  @spec write_config(Path.t(), keyword()) :: {:ok, Path.t()} | {:error, term()}
-  def write_config(config_dir, opts \\ []) do
-    with {:ok, config} <- build(opts) do
-      encoded = Jason.encode!(config, pretty: true)
-      opencode_sub = Path.join(config_dir, "opencode")
+  @spec write_config(Path.t() | map(), keyword()) :: {:ok, Path.t()} | {:error, term()}
+  def write_config(target, opts \\ [])
 
+  def write_config(target, opts) when is_map(target) do
+    with {:ok, encoded} <- encode(opts) do
+      config_dir = target.config
+      global_dir = Path.join(target.xdg_config, "opencode")
+      File.mkdir_p!(config_dir)
+      File.mkdir_p!(global_dir)
+      root = Path.join(config_dir, "opencode.json")
+      global = Path.join(global_dir, "opencode.json")
+      File.write!(root, encoded)
+      File.write!(global, encoded)
+      {:ok, root}
+    end
+  rescue
+    error in File.Error -> {:error, {:config_write_failed, error}}
+  end
+
+  def write_config(config_dir, opts) when is_binary(config_dir) do
+    with {:ok, encoded} <- encode(opts) do
+      opencode_sub = Path.join(config_dir, "opencode")
       File.mkdir_p!(opencode_sub)
       sub_file = Path.join(opencode_sub, "opencode.json")
       root_file = Path.join(config_dir, "opencode.json")
-
       File.write!(sub_file, encoded)
       File.write!(root_file, encoded)
-
       {:ok, sub_file}
     end
   rescue
     error in File.Error -> {:error, {:config_write_failed, error}}
   end
 
-  defp validate_permission_opts(opts) do
+  defp encode(opts) do
+    case build(opts) do
+      {:ok, config} -> {:ok, Jason.encode!(config, pretty: true)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp normalize_allowed_tools(opts) do
     allowed = Keyword.get(opts, :allowed_tools, [])
     unrestricted = Keyword.get(opts, :unrestricted_permissions, false)
     auto_approve = Keyword.get(opts, :auto_approve, false)
 
     cond do
-      unrestricted == true ->
-        {:error, :unrestricted_permissions_forbidden}
-
-      auto_approve == true ->
-        {:error, :unrestricted_permissions_forbidden}
-
-      is_list(allowed) and ("*" in allowed or :* in allowed or "all" in allowed or :all in allowed) ->
+      unrestricted == true or auto_approve == true ->
         {:error, :unrestricted_permissions_forbidden}
 
       not is_list(allowed) ->
         {:error, :invalid_allowed_tools}
 
       true ->
-        :ok
+        normalized = Enum.map(allowed, &normalize_tool_name/1)
+
+        cond do
+          Enum.any?(normalized, &unrestricted_name?/1) ->
+            {:error, :unrestricted_permissions_forbidden}
+
+          unknown = Enum.reject(normalized, &(&1 in @known_tools)) ->
+            if unknown == [] do
+              {:ok, normalized}
+            else
+              {:error, {:unknown_tool_permission, unknown}}
+            end
+        end
     end
+  end
+
+  defp unrestricted_name?(name) do
+    name in ["*", "all", "any", "auto", "auto_approve"]
   end
 
   defp normalize_tool_name(tool) when is_atom(tool), do: Atom.to_string(tool)
