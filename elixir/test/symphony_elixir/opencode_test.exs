@@ -282,6 +282,7 @@ defmodule SymphonyElixir.OpenCodeTest do
           "sessionID" => "ses_1",
           "part" => %{
             "messageID" => "msg_1",
+            "reason" => "stop",
             "tokens" => %{"input" => 50, "output" => 150, "reasoning" => 20, "cache" => %{"read" => 10, "write" => 5}},
             "cost" => 0.003
           }
@@ -292,7 +293,6 @@ defmodule SymphonyElixir.OpenCodeTest do
         |> Parser.feed(event1)
         |> Parser.feed(event2)
         |> Parser.feed(event3)
-        |> Parser.feed(idle_event("ses_1"))
         |> Parser.finish(0)
 
       res = Parser.to_result(state)
@@ -317,8 +317,7 @@ defmodule SymphonyElixir.OpenCodeTest do
       raw_stream =
         ~s({"type":"step_start","timestamp":100,"sessionID":"ses_frag"}\r\n) <>
           ~s({"type":"tool_use","timestamp":200,"sessionID":"ses_frag","part":{"tool":"edit","callID":"c1","messageID":"m1","state":{"status":"completed"}}}\n) <>
-          ~s({"type":"step_finish","timestamp":300,"sessionID":"ses_frag","part":{"messageID":"m1","tokens":{"input":12,"output":34}}}\r\n) <>
-          idle_event("ses_frag")
+          ~s({"type":"step_finish","timestamp":300,"sessionID":"ses_frag","part":{"messageID":"m1","reason":"stop","tokens":{"input":12,"output":34}}}\r\n)
 
       # Split into 3-byte chunks to test heavy fragmentation
       chunks =
@@ -462,6 +461,13 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert Failure.classify("status 401") == :auth_unavailable
       assert Failure.classify("unauthorized") == :auth_unavailable
       assert Failure.classify("HTTP 403 Forbidden") == :persistent_worker_failure
+      assert Failure.classify("error 403") == :persistent_worker_failure
+
+      assert Failure.classify(%{"status" => 403, "data" => %{"message" => "provider refused"}}) ==
+               :persistent_worker_failure
+
+      assert Failure.classify("processed 403 files") == :transient_worker_failure
+      assert Failure.classify("room 403 was empty") == :transient_worker_failure
       assert Failure.classify("unauthorized permission denied") == :persistent_worker_failure
       assert Failure.classify("permission denied") == :persistent_worker_failure
 
@@ -559,6 +565,153 @@ defmodule SymphonyElixir.OpenCodeTest do
     end
   end
 
+  describe "OpenCode 1.18.28 completion contract" do
+    test "successful single-step turn completes on terminal step_finish without session.status" do
+      stream =
+        step_start_event("ses_c1", "msg_1") <>
+          tool_use_completed_event("ses_c1", "msg_1", "read", "call_1", "file contents") <>
+          step_finish_event("ses_c1", "msg_1", "stop", 50, 150)
+
+      result =
+        Parser.new()
+        |> Parser.feed(stream)
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :completed
+      assert result.failure_evidence == []
+      assert result.session_id == "ses_c1"
+      assert result.message_ids == ["msg_1"]
+      assert result.usage.input_tokens == 50
+      assert result.usage.output_tokens == 150
+    end
+
+    test "successful multi-step turn completes only after the terminal step_finish" do
+      stream =
+        step_start_event("ses_c2", "msg_1") <>
+          step_finish_event("ses_c2", "msg_1", "tool-calls", 40, 60) <>
+          tool_use_completed_event("ses_c2", "msg_1", "read", "call_1", "data") <>
+          step_start_event("ses_c2", "msg_2") <>
+          step_finish_event("ses_c2", "msg_2", "stop", 60, 90)
+
+      result =
+        Parser.new()
+        |> Parser.feed(stream)
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :completed
+      assert result.failure_evidence == []
+      assert result.message_ids == ["msg_1", "msg_2"]
+      assert result.usage.input_tokens == 100
+      assert result.usage.output_tokens == 150
+      assert result.usage.total_tokens == 250
+    end
+
+    test "intermediate tool-calls step_finish does not complete the turn until the terminal finish" do
+      stream =
+        step_start_event("ses_c3", "msg_1") <>
+          step_finish_event("ses_c3", "msg_1", "tool-calls", 40, 60)
+
+      mid_state = Parser.new() |> Parser.feed(stream)
+      assert mid_state.completion_state == :running
+
+      result =
+        mid_state
+        |> Parser.feed(step_finish_event("ses_c3", "msg_1", "stop", 10, 20))
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :completed
+    end
+
+    test "tool-calls without terminal completion fails closed even with exit 0" do
+      stream =
+        step_start_event("ses_c4", "msg_1") <>
+          step_finish_event("ses_c4", "msg_1", "tool-calls", 40, 60) <>
+          tool_use_completed_event("ses_c4", "msg_1", "read", "call_1", "data")
+
+      result =
+        Parser.new()
+        |> Parser.feed(stream)
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :failed
+      assert {:incomplete_stream, :missing_completion_event} in result.failure_evidence
+    end
+
+    test "tool error with exit code 0 fails closed even after a terminal step_finish" do
+      stream =
+        tool_use_error_event("ses_c5", "msg_1", "bash", "call_1", "permission denied") <>
+          step_finish_event("ses_c5", "msg_1", "stop", 10, 20)
+
+      result =
+        Parser.new()
+        |> Parser.feed(stream)
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :failed
+      assert {:tool_error, "bash", "permission denied"} in result.failure_evidence
+    end
+
+    test "malformed JSON with a secret never leaks it and retains no decoder struct" do
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      linear = "lin_api_abcdefghijklmnopqrstuvwxyz"
+
+      malformed =
+        ~s({"type":"tool_use","broken":"#{secret} LINEAR_API_KEY=#{linear}) <>
+          " trailing data"
+
+      result =
+        Parser.new()
+        |> Parser.feed(malformed <> "\n")
+        |> Parser.feed(step_finish_event("ses_c6", "msg_1", "stop", 10, 20))
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :failed
+      assert [{:malformed_json_line, line, detail}] = result.failure_evidence
+
+      assert is_binary(line)
+      assert line =~ "[redacted]"
+      refute line =~ secret
+      refute line =~ linear
+      assert byte_size(line) <= 4_096 + byte_size("…[truncated]")
+
+      assert is_map(detail)
+      assert inspect(detail) =~ "position"
+      refute inspect(detail) =~ secret
+      refute inspect(detail) =~ "Jason.DecodeError"
+      refute inspect(result) =~ secret
+      refute inspect(result) =~ "Jason.DecodeError"
+
+      failure_info = Failure.failure_info({:malformed_json_line, line, detail})
+      assert failure_info.failure_class == :persistent_worker_failure
+      refute inspect(failure_info) =~ secret
+      refute inspect(failure_info) =~ "Jason.DecodeError"
+    end
+
+    test "session.status idle alone does not complete a turn" do
+      idle =
+        Jason.encode!(%{
+          "type" => "session.status",
+          "sessionID" => "ses_idle",
+          "status" => %{"type" => "idle"}
+        }) <> "\n"
+
+      result =
+        Parser.new()
+        |> Parser.feed(idle)
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :failed
+      assert {:incomplete_stream, :missing_completion_event} in result.failure_evidence
+    end
+  end
+
   describe "Completion evidence and redaction" do
     test "exit 0 without a completion event fails closed" do
       state =
@@ -571,10 +724,10 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert {:incomplete_stream, :missing_completion_event} in result.failure_evidence
     end
 
-    test "a tool error stays failed when a later idle event arrives" do
+    test "a tool error stays failed when a later terminal step_finish arrives" do
       stream =
-        ~s({"type":"tool_use","sessionID":"ses_tool","part":{"tool":"bash","callID":"c1","state":{"status":"error","error":"permission denied"}}}\n) <>
-          idle_event("ses_tool")
+        tool_use_error_event("ses_tool", "msg_1", "bash", "c1", "permission denied") <>
+          step_finish_event("ses_tool", "msg_1", "stop", 10, 20)
 
       result =
         Parser.new()
@@ -604,7 +757,7 @@ defmodule SymphonyElixir.OpenCodeTest do
 
       result =
         Parser.new()
-        |> Parser.feed(event <> idle_event("ses_secret"))
+        |> Parser.feed(event <> step_finish_event("ses_secret", "m1", "stop", 1, 1))
         |> Parser.finish(0)
         |> Parser.to_result()
 
@@ -616,6 +769,56 @@ defmodule SymphonyElixir.OpenCodeTest do
   end
 
   describe "Process boundary regressions" do
+    @tag :windows_only
+    test "a multi-step turn succeeds only after the terminal step_finish", %{workspace: workspace} do
+      assert {:ok, result} = run_mock(workspace, "--mock-mode=multi-step")
+
+      assert result.exit_code == 0
+      assert result.completion_state == :completed
+      assert result.failure_evidence == []
+      assert result.session_id == "ses_mock_123"
+      assert result.message_ids == ["msg_01", "msg_02"]
+      assert result.usage.input_tokens == 100
+      assert result.usage.output_tokens == 150
+      assert result.usage.total_tokens == 250
+      assert abs(result.usage.cost - 0.005) < 1.0e-9
+    end
+
+    @tag :windows_only
+    test "tool-calls without terminal completion is not success even with exit 0", %{workspace: workspace} do
+      assert {:error, {{:incomplete_stream, :missing_completion_event}, result}} =
+               run_mock(workspace, "--mock-mode=tool-calls-only")
+
+      assert result.exit_code == 0
+      assert result.completion_state == :failed
+      assert result.usage.input_tokens == 40
+      assert result.failure_info.failure_class == :persistent_worker_failure
+    end
+
+    @tag :windows_only
+    test "malformed JSON with secrets exposes nothing in results, callbacks, or failure info", %{
+      workspace: workspace
+    } do
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      linear = "lin_api_abcdefghijklmnopqrstuvwxyz"
+      {:ok, agent} = Agent.start_link(fn -> [] end)
+
+      assert {:error, {{:malformed_json_line, line, detail}, result}} =
+               run_mock(workspace, "--mock-mode=malformed-secret", on_event: fn event -> Agent.update(agent, &[event | &1]) end)
+
+      payload = inspect(result) <> inspect(Agent.get(agent, & &1)) <> inspect(result.failure_info)
+      refute payload =~ secret
+      refute payload =~ linear
+      refute payload =~ "Jason.DecodeError"
+
+      assert is_binary(line)
+      assert line =~ "[redacted]"
+      assert is_map(detail)
+      assert result.exit_code == 0
+      assert result.completion_state == :failed
+      assert result.failure_info.failure_class == :persistent_worker_failure
+    end
+
     @tag :windows_only
     test "the child receives stdin EOF before OpenCode would block", %{workspace: workspace} do
       assert {:ok, result} = run_mock(workspace, "--mock-mode=stdin", timeout_ms: 5_000)
@@ -832,12 +1035,73 @@ defmodule SymphonyElixir.OpenCodeTest do
     end
   end
 
-  defp idle_event(session_id) do
+  defp step_start_event(session_id, message_id) do
     Jason.encode!(%{
-      "type" => "session.status",
-      "timestamp" => 4,
+      "type" => "step_start",
+      "timestamp" => 1,
       "sessionID" => session_id,
-      "status" => %{"type" => "idle"}
+      "part" => %{
+        "type" => "step-start",
+        "id" => "step_s1",
+        "sessionID" => session_id,
+        "messageID" => message_id
+      }
+    }) <> "\n"
+  end
+
+  defp step_finish_event(session_id, message_id, reason, input, output) do
+    Jason.encode!(%{
+      "type" => "step_finish",
+      "timestamp" => 2,
+      "sessionID" => session_id,
+      "part" => %{
+        "type" => "step-finish",
+        "id" => "step_f1",
+        "sessionID" => session_id,
+        "messageID" => message_id,
+        "reason" => reason,
+        "cost" => 0.001,
+        "tokens" => %{
+          "input" => input,
+          "output" => output,
+          "reasoning" => 0,
+          "cache" => %{"read" => 0, "write" => 0}
+        }
+      }
+    }) <> "\n"
+  end
+
+  defp tool_use_completed_event(session_id, message_id, tool, call_id, output) do
+    Jason.encode!(%{
+      "type" => "tool_use",
+      "timestamp" => 2,
+      "sessionID" => session_id,
+      "part" => %{
+        "type" => "tool",
+        "id" => "toolu_1",
+        "sessionID" => session_id,
+        "messageID" => message_id,
+        "tool" => tool,
+        "callID" => call_id,
+        "state" => %{"status" => "completed", "output" => output}
+      }
+    }) <> "\n"
+  end
+
+  defp tool_use_error_event(session_id, message_id, tool, call_id, error) do
+    Jason.encode!(%{
+      "type" => "tool_use",
+      "timestamp" => 2,
+      "sessionID" => session_id,
+      "part" => %{
+        "type" => "tool",
+        "id" => "toolu_1",
+        "sessionID" => session_id,
+        "messageID" => message_id,
+        "tool" => tool,
+        "callID" => call_id,
+        "state" => %{"status" => "error", "error" => error}
+      }
     }) <> "\n"
   end
 

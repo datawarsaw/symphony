@@ -148,6 +148,9 @@ defmodule SymphonyElixir.OpenCode.Failure do
       status == 401 ->
         :auth_unavailable
 
+      status == 403 ->
+        :persistent_worker_failure
+
       status == 429 ->
         :provider_rate_limit
 
@@ -228,10 +231,9 @@ defmodule SymphonyElixir.OpenCode.Failure do
   ]
   @environment_signals [~r/outside_workspace/, ~r/workspace_not_a_directory/]
   @infrastructure_signals [~r/executable_not_found/, ~r/\bjobrun\b/, ~r/shell_start/]
-  @ambiguous_http_signals [
+  @forbidden_signals [
     ~r/\bforbidden\b/,
-    ~r/(?:http|status|error)\s+403\b/,
-    ~r/(?<!\d)403(?!\d)/
+    ~r/(?:http|status|error)\s+403\b/
   ]
 
   defp classify_text(text, fallback) do
@@ -270,7 +272,7 @@ defmodule SymphonyElixir.OpenCode.Failure do
       signal?(normalized, @infrastructure_signals) ->
         :probe_infrastructure_error
 
-      signal?(normalized, @ambiguous_http_signals) ->
+      signal?(normalized, @forbidden_signals) ->
         :persistent_worker_failure
 
       true ->

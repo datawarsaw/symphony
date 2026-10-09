@@ -3,8 +3,9 @@ defmodule SymphonyElixir.OpenCode.Redactor do
   Redacts and bounds sensitive text before OpenCode output leaves the adapter.
 
   Tool output, parser evidence, callbacks, stderr and failure records pass
-  through this boundary. Binaries are scrubbed and truncated. Lists and plain
-  maps are walked. Atoms, numbers and structs are left unchanged.
+  through this boundary. Binaries are scrubbed, truncated, and scrubbed again
+  so a secret split by the byte bound cannot survive as a partial token. Lists
+  and plain maps are walked. Atoms, numbers and structs are left unchanged.
   """
 
   @max_bytes 4_096
@@ -29,6 +30,7 @@ defmodule SymphonyElixir.OpenCode.Redactor do
     value
     |> scrub()
     |> bound()
+    |> scrub()
   end
 
   def redact(value) when is_list(value), do: Enum.map(value, &redact/1)
@@ -56,5 +58,36 @@ defmodule SymphonyElixir.OpenCode.Redactor do
 
   defp bound(value) when byte_size(value) <= @max_bytes, do: value
 
-  defp bound(value), do: binary_part(value, 0, @max_bytes) <> @truncated
+  defp bound(value) do
+    value
+    |> binary_part(0, @max_bytes)
+    |> drop_partial_codepoint()
+    |> Kernel.<>(@truncated)
+  end
+
+  # binary_part/3 can split a multi-byte codepoint at the bound. Drop the
+  # dangling bytes so bounded evidence stays valid UTF-8.
+  defp drop_partial_codepoint(binary) do
+    size = byte_size(binary)
+
+    if String.valid?(binary) or size == 0 do
+      binary
+    else
+      dangling = count_dangling_bytes(binary, min(size, 4), 0)
+      binary_part(binary, 0, size - dangling)
+    end
+  end
+
+  defp count_dangling_bytes(_binary, 0, count), do: count
+
+  defp count_dangling_bytes(binary, left, count) do
+    size = byte_size(binary)
+    <<byte>> = binary_part(binary, size - 1, 1)
+
+    if byte >= 0x80 do
+      count_dangling_bytes(binary_part(binary, 0, size - 1), left - 1, count + 1)
+    else
+      count
+    end
+  end
 end

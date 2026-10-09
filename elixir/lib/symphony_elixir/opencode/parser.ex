@@ -15,6 +15,17 @@ defmodule SymphonyElixir.OpenCode.Parser do
   - Windows CRLF and standard LF line endings are supported.
   - Malformed or corrupt JSON lines do not crash the stream parser; they are
     captured into failure_evidence so the run fails closed with deterministic evidence.
+
+  Completion semantics (grounded in the OpenCode 1.18.28 `run --format json`
+  event contract):
+  - The JSON CLI formatter never emits `session.status` on stdout, so completion
+    never depends on it.
+  - A `step_finish` event whose `part.reason` is `"tool-calls"` is intermediate:
+    the model continues with tool calls and the turn is not complete.
+  - A `step_finish` with a terminal reason (`"stop"`, `"length"`,
+    `"content-filter"`, `"unknown"`) is valid terminal completion evidence.
+  - Missing, unknown, or `"error"` finish reasons are not terminal; the stream
+    fails closed as incomplete at finish.
   """
 
   alias SymphonyElixir.OpenCode.Redactor
@@ -38,6 +49,9 @@ defmodule SymphonyElixir.OpenCode.Parser do
               failure_evidence: [],
               events: []
   end
+
+  @intermediate_step_reason "tool-calls"
+  @terminal_step_reasons ~w(stop length content-filter unknown)
 
   @doc """
   Initializes a new parser accumulator state.
@@ -152,7 +166,7 @@ defmodule SymphonyElixir.OpenCode.Parser do
           process_event(state, event)
 
         {:error, reason} ->
-          evidence = {:malformed_json_line, Redactor.redact(trimmed), reason}
+          evidence = {:malformed_json_line, Redactor.redact(trimmed), decode_error_detail(reason)}
 
           %{
             state
@@ -161,6 +175,20 @@ defmodule SymphonyElixir.OpenCode.Parser do
           }
       end
     end
+  end
+
+  # Sanitizes decoder failures into bounded, redacted evidence. The raw
+  # Jason.DecodeError struct is never retained: its :data field carries the
+  # complete unbounded source line, which can include secrets.
+  defp decode_error_detail(%Jason.DecodeError{} = error) do
+    %{
+      position: error.position,
+      token: error.token |> to_string() |> Redactor.redact()
+    }
+  end
+
+  defp decode_error_detail(reason) do
+    %{reason: reason |> inspect() |> Redactor.redact()}
   end
 
   defp process_event(state, event) do
@@ -244,7 +272,27 @@ defmodule SymphonyElixir.OpenCode.Parser do
       cost: cur_usage.cost + cost
     }
 
-    %{state | usage: new_usage}
+    state
+    |> Map.put(:usage, new_usage)
+    |> apply_step_finish_reason(part)
+  end
+
+  # "tool-calls" is intermediate: the model continues the turn with tool calls,
+  # so it must never be mistaken for final completion. Only terminal reasons
+  # complete the turn, and only while the stream is still clean and running.
+  defp apply_step_finish_reason(state, part) do
+    reason = Map.get(part, "reason")
+
+    cond do
+      reason == @intermediate_step_reason ->
+        state
+
+      reason in @terminal_step_reasons and state.completion_state == :running ->
+        %{state | completion_state: :completed}
+
+      true ->
+        state
+    end
   end
 
   defp process_tool_use(state, event) do
@@ -319,13 +367,6 @@ defmodule SymphonyElixir.OpenCode.Parser do
         get_in(event, ["status", "type"])
 
     case status_type do
-      "idle" ->
-        if state.completion_state == :running do
-          %{state | completion_state: :completed}
-        else
-          state
-        end
-
       "error" ->
         %{state | completion_state: :failed}
 

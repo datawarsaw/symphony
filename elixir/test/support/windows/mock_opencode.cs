@@ -58,29 +58,53 @@ class MockOpenCode
 
         if (mode == "partial")
         {
-            Console.WriteLine("{\"type\":\"step_start\",\"timestamp\":1700000000000,\"sessionID\":\"ses_mock_123\"}");
+            WriteStepStart("msg_01");
             return 0;
         }
 
         if (mode == "malformed")
         {
             Console.WriteLine("not-json-at-all");
-            WriteIdle();
+            WriteSuccess();
+            return 0;
+        }
+
+        if (mode == "malformed-secret")
+        {
+            Console.WriteLine("{\"type\":\"tool_use\",\"broken\":\"sk-ant-api03-abcdefghijklmnopqrstuvwxyz LINEAR_API_KEY=lin_api_abcdefghijklmnopqrstuvwxyz");
+            WriteSuccess();
+            return 0;
+        }
+
+        if (mode == "tool-calls-only")
+        {
+            WriteStepStart("msg_01");
+            WriteStepFinish("tool-calls", "msg_01", 40, 60, 10, 5, 5, 0.002);
+            return 0;
+        }
+
+        if (mode == "multi-step")
+        {
+            WriteStepStart("msg_01");
+            WriteStepFinish("tool-calls", "msg_01", 40, 60, 10, 5, 5, 0.002);
+            Console.WriteLine("{\"type\":\"tool_use\",\"timestamp\":1700000000150,\"sessionID\":\"ses_mock_123\",\"part\":{\"type\":\"tool\",\"id\":\"toolu_01\",\"sessionID\":\"ses_mock_123\",\"messageID\":\"msg_01\",\"tool\":\"read\",\"callID\":\"call_99\",\"state\":{\"status\":\"completed\",\"output\":\"file contents\"}}}");
+            WriteStepStart("msg_02");
+            WriteStepFinish("stop", "msg_02", 60, 90, 15, 10, 5, 0.003);
             return 0;
         }
 
         if (mode == "tool-error")
         {
-            Console.WriteLine("{\"type\":\"tool_use\",\"timestamp\":1700000000100,\"sessionID\":\"ses_mock_123\",\"part\":{\"tool\":\"read\",\"callID\":\"call_err\",\"state\":{\"status\":\"error\",\"error\":\"permission denied\"},\"messageID\":\"msg_err\"}}");
-            WriteIdle();
+            Console.WriteLine("{\"type\":\"tool_use\",\"timestamp\":1700000000100,\"sessionID\":\"ses_mock_123\",\"part\":{\"type\":\"tool\",\"id\":\"toolu_err\",\"sessionID\":\"ses_mock_123\",\"messageID\":\"msg_err\",\"tool\":\"read\",\"callID\":\"call_err\",\"state\":{\"status\":\"error\",\"error\":\"permission denied\"}}}");
+            WriteStepFinish("stop", "msg_err", 100, 200, 25, 50, 10, 0.005);
             return 0;
         }
 
         if (mode == "secret")
         {
-            Console.WriteLine("{\"type\":\"tool_use\",\"timestamp\":1700000000100,\"sessionID\":\"ses_mock_123\",\"part\":{\"tool\":\"read\",\"callID\":\"call_secret\",\"state\":{\"status\":\"completed\",\"output\":\"sk-ant-api03-abcdefghijklmnopqrstuvwxyz LINEAR_API_KEY=lin_api_abcdefghijklmnopqrstuvwxyz\"},\"messageID\":\"msg_secret\"}}");
+            Console.WriteLine("{\"type\":\"tool_use\",\"timestamp\":1700000000100,\"sessionID\":\"ses_mock_123\",\"part\":{\"type\":\"tool\",\"id\":\"toolu_secret\",\"sessionID\":\"ses_mock_123\",\"messageID\":\"msg_secret\",\"tool\":\"read\",\"callID\":\"call_secret\",\"state\":{\"status\":\"completed\",\"output\":\"sk-ant-api03-abcdefghijklmnopqrstuvwxyz LINEAR_API_KEY=lin_api_abcdefghijklmnopqrstuvwxyz\"}}}");
+            WriteStepFinish("stop", "msg_secret", 10, 20, 0, 0, 0, 0.0);
             Console.Error.WriteLine("stderr sk-ant-api03-abcdefghijklmnopqrstuvwxyz LINEAR_API_KEY=lin_api_abcdefghijklmnopqrstuvwxyz");
-            WriteIdle();
             return 0;
         }
 
@@ -98,7 +122,7 @@ class MockOpenCode
 
         if (mode == "hang")
         {
-            Console.WriteLine("{\"type\":\"step_start\",\"timestamp\":1700000000000,\"sessionID\":\"ses_mock_123\"}");
+            WriteStepStart("msg_01");
             Console.Out.Flush();
             Thread.Sleep(60000);
             return 0;
@@ -109,16 +133,20 @@ class MockOpenCode
 
     static void WriteSuccess()
     {
-        Console.WriteLine("{\"type\":\"step_start\",\"timestamp\":1700000000000,\"sessionID\":\"ses_mock_123\"}");
-        Console.WriteLine("{\"type\":\"tool_use\",\"timestamp\":1700000000100,\"sessionID\":\"ses_mock_123\",\"part\":{\"tool\":\"read\",\"callID\":\"call_99\",\"state\":{\"status\":\"completed\",\"output\":\"file contents\"},\"messageID\":\"msg_01\"}}");
-        Console.WriteLine("{\"type\":\"step_finish\",\"timestamp\":1700000000200,\"sessionID\":\"ses_mock_123\",\"part\":{\"tokens\":{\"input\":100,\"output\":200,\"reasoning\":25,\"cache\":{\"read\":50,\"write\":10}},\"cost\":0.005,\"messageID\":\"msg_01\"}}");
-        WriteIdle();
+        WriteStepStart("msg_01");
+        Console.WriteLine("{\"type\":\"tool_use\",\"timestamp\":1700000000100,\"sessionID\":\"ses_mock_123\",\"part\":{\"type\":\"tool\",\"id\":\"toolu_01\",\"sessionID\":\"ses_mock_123\",\"messageID\":\"msg_01\",\"tool\":\"read\",\"callID\":\"call_99\",\"state\":{\"status\":\"completed\",\"output\":\"file contents\"}}}");
+        WriteStepFinish("stop", "msg_01", 100, 200, 25, 50, 10, 0.005);
         Console.Error.WriteLine("not-json-stderr-marker");
     }
 
-    static void WriteIdle()
+    static void WriteStepStart(string messageId)
     {
-        Console.WriteLine("{\"type\":\"session.status\",\"timestamp\":1700000000300,\"sessionID\":\"ses_mock_123\",\"status\":{\"type\":\"idle\"}}");
+        Console.WriteLine("{\"type\":\"step_start\",\"timestamp\":1700000000000,\"sessionID\":\"ses_mock_123\",\"part\":{\"type\":\"step-start\",\"id\":\"step_s1\",\"sessionID\":\"ses_mock_123\",\"messageID\":\"" + messageId + "\"}}");
+    }
+
+    static void WriteStepFinish(string reason, string messageId, int input, int output, int reasoning, int cacheRead, int cacheWrite, double cost)
+    {
+        Console.WriteLine("{\"type\":\"step_finish\",\"timestamp\":1700000000200,\"sessionID\":\"ses_mock_123\",\"part\":{\"type\":\"step-finish\",\"id\":\"step_f1\",\"sessionID\":\"ses_mock_123\",\"messageID\":\"" + messageId + "\",\"reason\":\"" + reason + "\",\"cost\":" + cost.ToString(System.Globalization.CultureInfo.InvariantCulture) + ",\"tokens\":{\"input\":" + input + ",\"output\":" + output + ",\"reasoning\":" + reasoning + ",\"cache\":{\"read\":" + cacheRead + ",\"write\":" + cacheWrite + "}}}}");
     }
 
     static string EnvEvidence()
