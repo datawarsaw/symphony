@@ -423,10 +423,13 @@ defmodule SymphonyElixir.WorkerEventTest do
 
     test "multibyte evidence is truncated on a codepoint boundary within the byte budget" do
       secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
-      # 2000 euro signs are 6000 bytes; the 4082-byte prefix cuts the 1361st sign
-      # after two of its three bytes, so the raw byte limit lands mid-codepoint.
-      body = String.duplicate("€", 2_000)
-      output = secret <> " " <> body
+      suffix = "…[truncated]"
+      budget = 4_096 - byte_size(suffix)
+      head = "[redacted] "
+      pad = if rem(budget - byte_size(head), 3) == 0, do: "x", else: ""
+      assert rem(budget - byte_size(head <> pad), 3) != 0
+
+      output = secret <> " " <> pad <> String.duplicate("€", 2_000)
 
       event =
         WorkerEvent.from_opencode(%{
@@ -446,53 +449,88 @@ defmodule SymphonyElixir.WorkerEventTest do
 
       assert String.valid?(bounded)
       assert byte_size(bounded) <= 4_096
-      assert bounded =~ "[truncated]"
+      assert String.ends_with?(bounded, "[truncated]")
+      assert bounded =~ "€"
       refute bounded =~ secret
+      refute bounded =~ "sk-ant"
       refute inspect(update) =~ secret
       assert is_binary(Jason.encode!(update))
     end
 
-    test "callback accumulator is linked to its creator and stops once the recipient dies" do
-      parent = self()
+    test "truncation does not reintroduce a secret that straddles the byte budget" do
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      suffix = "…[truncated]"
+      budget = 4_096 - byte_size(suffix)
+      fragment = binary_part(secret, 0, 8)
+      assert fragment == "sk-ant-a"
+      separator = " "
+      lead = String.duplicate("a", budget - byte_size(fragment) - byte_size(separator))
+      output = lead <> separator <> secret <> separator <> String.duplicate("€", 30)
 
-      recipient =
-        spawn(fn ->
-          receive do
-            :stop -> :ok
-          after
-            5_000 -> :ok
-          end
-        end)
+      event =
+        WorkerEvent.from_opencode(%{
+          "type" => "tool_use",
+          "sessionID" => "ses-boundary",
+          "timestamp" => 1_728_490_000,
+          "part" => %{
+            "tool" => "bash",
+            "callID" => "call-boundary",
+            "messageID" => "m-boundary",
+            "state" => %{"status" => "completed", "output" => output}
+          }
+        })
 
-      creator =
-        spawn(fn ->
-          callback = WorkerEvent.callback(recipient, "ISS-800")
-          {:links, links} = Process.info(self(), :links)
-          send(parent, {:accumulator, self(), links, callback})
+      update = WorkerEvent.to_update(event)
+      bounded = update.payload.output
 
-          receive do
-            {:event, raw} -> send(parent, {:dispatch, callback.(raw)})
-          after
-            5_000 -> :ok
-          end
-        end)
-
-      on_exit(fn ->
-        if Process.alive?(creator), do: Process.exit(creator, :kill)
-        if Process.alive?(recipient), do: Process.exit(recipient, :kill)
-      end)
-
-      assert_receive {:accumulator, ^creator, links, _callback}
-      assert [accumulator] = links
-      assert Process.alive?(accumulator)
-
-      # The accumulator is linked to its creator, so creator teardown is bounded.
-      Process.exit(creator, :kill)
-      refute alive_after?(accumulator)
+      assert String.valid?(bounded)
+      assert byte_size(bounded) <= 4_096
+      assert String.ends_with?(bounded, "[truncated]")
+      refute bounded =~ secret
+      refute bounded =~ "sk-ant"
+      refute inspect(update.raw) =~ "sk-ant"
+      assert is_binary(Jason.encode!(update))
     end
 
-    test "callback stops accumulating for a recipient that can no longer receive events" do
+    test "callback delivers the final event and then stops its helper" do
       parent = self()
+      issue_id = "ISS-FINAL-800"
+
+      recipient =
+        spawn(fn ->
+          receive do
+            {:codex_worker_update, ^issue_id, update} ->
+              send(parent, {:delivered, update})
+
+              receive do
+                :stop -> :ok
+              after
+                5_000 -> :ok
+              end
+          after
+            5_000 -> :ok
+          end
+        end)
+
+      callback = WorkerEvent.callback(recipient, issue_id)
+      helper = callback_helper!(issue_id)
+      assert Process.alive?(helper)
+
+      assert :ok = callback.(step_line("m-final", "stop", 3, 4))
+      assert_receive {:delivered, update}
+      assert update.usage.input_tokens == 3
+      assert Process.alive?(helper)
+
+      send(recipient, :stop)
+      refute alive_after?(helper)
+      assert :ok = callback.(step_line("m-after", "stop", 1, 1))
+      refute_receive {:delivered, _}, 50
+      assert callback_helper(issue_id) == nil
+    end
+
+    test "callback helper exits when its creator exits" do
+      parent = self()
+      issue_id = "ISS-OWNER-801"
 
       recipient =
         spawn(fn ->
@@ -505,12 +543,11 @@ defmodule SymphonyElixir.WorkerEventTest do
 
       creator =
         spawn(fn ->
-          callback = WorkerEvent.callback(recipient, "ISS-801")
-          {:links, [accumulator]} = Process.info(self(), :links)
-          send(parent, {:accumulator, self(), accumulator, callback})
+          _callback = WorkerEvent.callback(recipient, issue_id)
+          send(parent, :ready)
 
           receive do
-            {:event, raw} -> send(parent, {:dispatch, callback.(raw)})
+            :stop -> :ok
           after
             5_000 -> :ok
           end
@@ -521,15 +558,12 @@ defmodule SymphonyElixir.WorkerEventTest do
         if Process.alive?(recipient), do: Process.exit(recipient, :kill)
       end)
 
-      assert_receive {:accumulator, ^creator, accumulator, _callback}
-      assert Process.alive?(accumulator)
+      assert_receive :ready
+      helper = callback_helper!(issue_id)
+      assert Process.alive?(helper)
 
-      Process.exit(recipient, :kill)
-      refute alive_after?(recipient)
-
-      send(creator, {:event, step_line("m-cleanup", "stop", 1, 1)})
-      assert_receive {:dispatch, :ok}
-      refute alive_after?(accumulator)
+      Process.exit(creator, :kill)
+      refute alive_after?(helper)
     end
 
     test "malformed issue ids, dead recipients, and session changes do not dispatch" do
@@ -595,6 +629,34 @@ defmodule SymphonyElixir.WorkerEventTest do
       alive_after?(pid, attempts - 1)
     else
       false
+    end
+  end
+
+  defp callback_helper!(issue_id) do
+    pid = callback_helper(issue_id, 20)
+    assert is_pid(pid)
+    pid
+  end
+
+  defp callback_helper(issue_id, attempts \\ 1)
+
+  defp callback_helper(_issue_id, 0), do: nil
+
+  defp callback_helper(issue_id, attempts) do
+    case Enum.find(Process.list(), &callback_helper?(&1, issue_id)) do
+      nil ->
+        Process.sleep(10)
+        callback_helper(issue_id, attempts - 1)
+
+      pid ->
+        pid
+    end
+  end
+
+  defp callback_helper?(pid, issue_id) do
+    case Process.info(pid, :dictionary) do
+      {:dictionary, dict} -> dict[:symphony_worker_event_callback] == issue_id
+      _ -> false
     end
   end
 

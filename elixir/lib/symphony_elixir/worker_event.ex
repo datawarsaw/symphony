@@ -640,11 +640,10 @@ defmodule SymphonyElixir.WorkerEvent do
   step events are dropped. The callback cannot reintroduce raw evidence that
   redaction removed, and it cannot mark an OpenCode execution successful.
 
-  The accumulator is started with `Agent.start_link/1`, so it shares the lifetime
-  of the process that builds the callback and is torn down with it. It also stops
-  itself once the recipient is no longer alive, so a long-lived creator cannot
-  keep accumulating per-issue state for a consumer that can no longer receive
-  events. Events are dropped only after the recipient is gone.
+  The accumulator is an unlinked helper. It monitors the process that built the
+  callback and the recipient, and exits after the current event once either of
+  them is gone. An event already accepted is delivered before that exit, so
+  cleanup does not drop the final event or leave the helper behind.
   """
   @spec callback(pid() | nil, term(), keyword()) :: (term() -> :ok)
   def callback(recipient, issue_or_id, opts \\ []) do
@@ -655,58 +654,96 @@ defmodule SymphonyElixir.WorkerEvent do
     if not valid_recipient?(recipient) or not valid_identifier?(issue_id) do
       fn _raw_event -> :ok end
     else
-      {:ok, accumulator} =
-        Agent.start_link(fn ->
+      accumulator =
+        start_callback_server(
+          recipient,
+          issue_id,
           init_accumulator(%{
             session_id: if(valid_identifier?(bound_session), do: bound_session, else: nil)
           })
-        end)
+        )
 
       fn raw_event ->
-        dispatch_event(accumulator, recipient, issue_id, channel, raw_event)
+        submit_callback_event(accumulator, recipient, issue_id, channel, raw_event)
       end
     end
   end
 
-  defp dispatch_event(accumulator, recipient, issue_id, channel, raw_event) do
-    with true <- Process.alive?(accumulator),
-         true <- valid_recipient?(recipient) do
-      deliver_event(accumulator, recipient, issue_id, channel, raw_event)
-    else
-      false ->
-        stop_accumulator(accumulator)
-        :ok
-    end
-  end
+  defp start_callback_server(recipient, issue_id, initial_state) do
+    owner = self()
 
-  defp deliver_event(accumulator, recipient, issue_id, channel, raw_event) do
-    case accumulate_into(accumulator, raw_event) do
-      {:ok, event} ->
-        send(recipient, {channel, issue_id, to_update(event)})
-        :ok
+    spawn(fn ->
+      Process.put(:symphony_worker_event_callback, issue_id)
 
-      _ ->
-        :ok
-    end
-  end
-
-  defp accumulate_into(accumulator, raw_event) do
-    Agent.get_and_update(accumulator, fn state ->
-      case accumulate(state, raw_event) do
-        {:ok, new_state, event} -> {{:ok, event}, new_state}
-        {:duplicate, new_state} -> {:duplicate, new_state}
-        {:rejected, new_state} -> {:rejected, new_state}
-      end
+      callback_loop(%{
+        state: initial_state,
+        owner_ref: Process.monitor(owner),
+        recipient_ref: Process.monitor(recipient)
+      })
     end)
   end
 
-  # Idempotent and race-safe: a concurrent caller may have stopped the
-  # accumulator or let the link tear it down already.
-  defp stop_accumulator(accumulator) do
-    if Process.alive?(accumulator), do: Agent.stop(accumulator, :normal, 5_000)
-    :ok
-  catch
-    :exit, _reason -> :ok
+  defp callback_loop(server) do
+    receive do
+      {:worker_event, caller, ref, recipient, issue_id, channel, raw_event} ->
+        new_state = accept_callback_event(server.state, recipient, issue_id, channel, raw_event)
+        send(caller, {ref, :ok})
+        callback_loop(%{server | state: new_state})
+
+      {:DOWN, ref, :process, _pid, _reason}
+      when ref == server.owner_ref or ref == server.recipient_ref ->
+        flush_callback_events(server)
+    end
+  end
+
+  # A DOWN can sit ahead of an event that was already sent. Deliver those
+  # queued events, then exit. Do not wait for anything that arrives later.
+  defp flush_callback_events(server) do
+    receive do
+      {:worker_event, caller, ref, recipient, issue_id, channel, raw_event} ->
+        new_state = accept_callback_event(server.state, recipient, issue_id, channel, raw_event)
+        send(caller, {ref, :ok})
+        flush_callback_events(%{server | state: new_state})
+    after
+      0 -> :ok
+    end
+  end
+
+  defp accept_callback_event(state, recipient, issue_id, channel, raw_event) do
+    case accumulate(state, raw_event) do
+      {:ok, new_state, event} ->
+        send(recipient, {channel, issue_id, to_update(event)})
+        new_state
+
+      {:duplicate, new_state} ->
+        new_state
+
+      {:rejected, new_state} ->
+        new_state
+    end
+  end
+
+  defp submit_callback_event(server, recipient, issue_id, channel, raw_event) do
+    if is_pid(server) and Process.alive?(server) do
+      ref = make_ref()
+      monitor_ref = Process.monitor(server)
+      send(server, {:worker_event, self(), ref, recipient, issue_id, channel, raw_event})
+
+      receive do
+        {^ref, :ok} ->
+          Process.demonitor(monitor_ref, [:flush])
+          :ok
+
+        {:DOWN, ^monitor_ref, :process, ^server, _reason} ->
+          :ok
+      after
+        5_000 ->
+          Process.demonitor(monitor_ref, [:flush])
+          :ok
+      end
+    else
+      :ok
+    end
   end
 
   @doc """
@@ -1102,6 +1139,7 @@ defmodule SymphonyElixir.WorkerEvent do
     |> scrub()
     |> bound()
     |> scrub()
+    |> fit_after_scrub()
   end
 
   defp redact(value) when is_list(value), do: Enum.map(value, &redact/1)
@@ -1148,4 +1186,48 @@ defmodule SymphonyElixir.WorkerEvent do
 
     if String.valid?(trimmed), do: trimmed, else: drop_trailing_byte(trimmed)
   end
+
+  # The second scrub can replace a fragment exposed by the cut. Keep that
+  # redaction, then fit the suffix inside the same 4096-byte budget.
+  defp fit_after_scrub(value) when byte_size(value) <= @max_evidence_bytes, do: value
+
+  defp fit_after_scrub(value) do
+    body =
+      value
+      |> strip_truncation_suffix()
+      |> take_prefix(@truncation_budget)
+      |> shrink_until_redacted(@truncation_budget, 4)
+
+    body <> @truncated
+  end
+
+  defp shrink_until_redacted(binary, budget, attempts) do
+    scrubbed = binary |> trim_partial_codepoint() |> scrub()
+
+    cond do
+      byte_size(scrubbed) <= budget and String.valid?(scrubbed) ->
+        scrubbed
+
+      attempts <= 0 or scrubbed == "" ->
+        scrubbed |> take_prefix(budget) |> trim_partial_codepoint()
+
+      true ->
+        overflow = max(byte_size(scrubbed) - budget, 1)
+        shrink_until_redacted(take_prefix(scrubbed, byte_size(scrubbed) - overflow), budget, attempts - 1)
+    end
+  end
+
+  defp strip_truncation_suffix(value) do
+    suffix = @truncated
+    size = byte_size(suffix)
+
+    if byte_size(value) >= size and binary_part(value, byte_size(value) - size, size) == suffix do
+      binary_part(value, 0, byte_size(value) - size)
+    else
+      value
+    end
+  end
+
+  defp take_prefix(value, bytes) when byte_size(value) <= bytes, do: value
+  defp take_prefix(value, bytes), do: binary_part(value, 0, bytes)
 end
