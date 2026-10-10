@@ -29,35 +29,60 @@ defmodule SymphonyElixir.HarnessSelectionTest do
   end
 
   describe "select/2 fail-closed configuration" do
-    test "an enabled pilot without an explicit provider and model stays on Codex" do
+    test "an enabled pilot without an explicit provider and model refuses an authorized issue" do
       incomplete = %OpenCode{
         enabled: true,
         allowed_tools: ["read"],
         allowed_issues: ["MIC-300"]
       }
 
-      assert {:codex, :opencode_incomplete} = HarnessSelection.select(@authorized_issue, incomplete)
+      assert {:error, :invalid_opencode_config} =
+               HarnessSelection.select(@authorized_issue, incomplete)
     end
 
-    test "an enabled pilot without any allowed tool stays on Codex" do
+    test "an enabled pilot without any allowed tool refuses an authorized issue" do
       no_tools = %{@pilot | allowed_tools: []}
 
-      assert {:codex, :opencode_incomplete} = HarnessSelection.select(@authorized_issue, no_tools)
+      assert {:error, :invalid_opencode_config} =
+               HarnessSelection.select(@authorized_issue, no_tools)
     end
 
-    test "a blank identifier entry never grants the harness" do
+    test "a blank tool entry never grants the harness" do
       blank_tool = %{@pilot | allowed_tools: [""]}
 
-      assert {:codex, :opencode_incomplete} = HarnessSelection.select(@authorized_issue, blank_tool)
+      assert {:error, :invalid_opencode_config} =
+               HarnessSelection.select(@authorized_issue, blank_tool)
     end
 
-    test "a map the schema rejects fails closed" do
+    test "a hand-built struct cannot bypass the tool or timeout checks" do
+      invalid_sections = [
+        %{@pilot | allowed_tools: ["*"]},
+        %{@pilot | allowed_tools: ["teleport"]},
+        %{@pilot | timeout_ms: 0},
+        %{@pilot | timeout_ms: 3_600_001}
+      ]
+
+      for section <- invalid_sections do
+        assert {:error, :invalid_opencode_config} =
+                 HarnessSelection.select(@authorized_issue, section)
+      end
+    end
+
+    test "an invalid section for an issue outside its scope stays on Codex" do
+      invalid = %{@pilot | allowed_tools: ["*"]}
+
       assert {:codex, :invalid_opencode_config} =
+               HarnessSelection.select(@other_issue, invalid)
+    end
+
+    test "a map the schema rejects refuses an authorized issue" do
+      assert {:error, :invalid_opencode_config} =
                HarnessSelection.select(@authorized_issue, %{enabled: true, allowed_issues: ["MIC-300"]})
     end
 
-    test "a non-map configuration fails closed" do
-      assert {:codex, :invalid_opencode_config} = HarnessSelection.select(@authorized_issue, :missing)
+    test "a non-map configuration stays on Codex" do
+      assert {:codex, :invalid_opencode_config} =
+               HarnessSelection.select(@authorized_issue, :missing)
     end
   end
 

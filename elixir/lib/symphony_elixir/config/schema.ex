@@ -224,17 +224,47 @@ defmodule SymphonyElixir.Config.Schema do
     environment, and no provider fallback.
 
     Fails closed. An enabled section must name an explicit provider and model
-    and at least one allowed tool, and must not grant an unrestricted tool. The
-    issue allowlist is optional; an empty allowlist authorizes no issue, so an
-    enabled section without one never selects OpenCode. Codex stays the default
-    harness in every other case.
+    and at least one allowed tool, and must not grant an unrestricted or unknown
+    tool or an execution timeout outside the supported budget. The issue
+    allowlist is optional; an empty allowlist authorizes no issue, so an enabled
+    section without one never selects OpenCode. Codex stays the default harness
+    in every other case.
+
+    Validation runs on workflow maps and on already-built `%OpenCode{}` structs
+    alike, so a hand-built struct cannot bypass the unrestricted-tool, unknown
+    tool, or timeout checks.
     """
 
     use Ecto.Schema
     import Ecto.Changeset
 
     @default_timeout_ms 900_000
+    @max_timeout_ms 3_600_000
     @unrestricted_tool_names ~w(* all any auto auto_approve unrestricted)
+
+    # Tool contract of the OpenCode adapter (`SymphonyElixir.OpenCode.Config`,
+    # adapter candidate 5df80de / da78cbf). The accepted names are declared once,
+    # here, instead of being copied into a second free-standing allowlist:
+    # integration removes the adapter's private tool list and reads this contract
+    # instead. While both lists exist, the contract test in `OpenCodeConfigTest`
+    # fails as soon as they drift.
+    @known_tool_names ~w(
+      read
+      edit
+      glob
+      grep
+      list
+      bash
+      task
+      external_directory
+      todowrite
+      question
+      webfetch
+      websearch
+      lsp
+      doom_loop
+      skill
+    )
 
     @primary_key false
     embedded_schema do
@@ -255,6 +285,32 @@ defmodule SymphonyElixir.Config.Schema do
             allowed_issues: [String.t()]
           }
 
+    @doc """
+    Tool names the OpenCode adapter accepts in `allowed_tools`.
+    """
+    @spec known_tool_names() :: [String.t()]
+    def known_tool_names, do: @known_tool_names
+
+    @doc """
+    Validates a section from any source.
+
+    Accepts the parsed `%OpenCode{}` struct or a plain map with the same keys.
+    A struct is re-checked from its own fields, so a hand-built struct cannot
+    skip the changeset validations.
+    """
+    @spec validate(t() | map()) :: {:ok, t()} | {:error, Ecto.Changeset.t()}
+    def validate(%__MODULE__{} = opencode) do
+      %__MODULE__{}
+      |> changeset(Map.from_struct(opencode))
+      |> apply_action(:validate)
+    end
+
+    def validate(attrs) when is_map(attrs) do
+      %__MODULE__{}
+      |> changeset(attrs)
+      |> apply_action(:validate)
+    end
+
     @spec changeset(t(), map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
@@ -263,7 +319,10 @@ defmodule SymphonyElixir.Config.Schema do
         [:enabled, :provider, :model, :timeout_ms, :allowed_tools, :allowed_issues],
         empty_values: []
       )
-      |> validate_number(:timeout_ms, greater_than: 0)
+      |> validate_number(:timeout_ms,
+        greater_than: 0,
+        less_than_or_equal_to: @max_timeout_ms
+      )
       |> validate_change(:allowed_tools, fn :allowed_tools, tools -> tool_entry_errors(tools) end)
       |> validate_change(:allowed_issues, fn :allowed_issues, issues -> issue_entry_errors(issues) end)
       |> validate_enabled_identity()
@@ -271,6 +330,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     defp tool_entry_errors(tools) do
       unrestricted = unrestricted_tools(tools)
+      unknown = unknown_tools(tools)
 
       cond do
         Enum.any?(tools, &blank_entry?/1) ->
@@ -278,6 +338,11 @@ defmodule SymphonyElixir.Config.Schema do
 
         unrestricted != [] ->
           [allowed_tools: "must not grant unrestricted tools: #{Enum.join(unrestricted, ", ")}"]
+
+        unknown != [] ->
+          [
+            allowed_tools: "must name tools from the OpenCode adapter contract: #{Enum.join(unknown, ", ")}"
+          ]
 
         true ->
           []
@@ -334,6 +399,14 @@ defmodule SymphonyElixir.Config.Schema do
     defp unrestricted_tools(tools) when is_list(tools) do
       Enum.filter(tools, fn tool ->
         is_binary(tool) and String.downcase(String.trim(tool)) in @unrestricted_tool_names
+      end)
+    end
+
+    defp unknown_tools(tools) when is_list(tools) do
+      contract = MapSet.new(@known_tool_names)
+
+      Enum.reject(tools, fn tool ->
+        is_binary(tool) and MapSet.member?(contract, String.trim(tool))
       end)
     end
 

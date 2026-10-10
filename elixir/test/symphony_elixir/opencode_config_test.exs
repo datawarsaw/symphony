@@ -7,6 +7,10 @@ defmodule SymphonyElixir.OpenCodeConfigTest do
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.Workflow
 
+  # The OpenCode adapter candidate (5df80de / da78cbf) is developed on its own
+  # branch. When it is present, the tool contract below is compared against it.
+  @adapter_contract_module SymphonyElixir.OpenCode.Config
+
   @valid_pilot [
     opencode_enabled: true,
     opencode_provider: "opencode-go",
@@ -126,6 +130,74 @@ defmodule SymphonyElixir.OpenCodeConfigTest do
       assert message =~ "opencode.timeout_ms"
     end
 
+    test "an execution timeout above the supported execution budget is rejected" do
+      for timeout_ms <- [3_600_001, 86_400_000] do
+        write_workflow_file!(
+          Workflow.workflow_file_path(),
+          Keyword.merge(@valid_pilot, opencode_timeout_ms: timeout_ms)
+        )
+
+        assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+        assert message =~ "opencode.timeout_ms"
+      end
+    end
+
+    test "the upper bound keeps the largest practical pilot budget valid" do
+      write_workflow_file!(
+        Workflow.workflow_file_path(),
+        Keyword.merge(@valid_pilot, opencode_timeout_ms: 3_600_000)
+      )
+
+      assert :ok = Config.validate!()
+      assert Config.settings!().opencode.timeout_ms == 3_600_000
+    end
+
+    test "a tool name outside the OpenCode adapter contract is rejected" do
+      for tools <- [["teleport"], ["read", "execute"], ["Read"]] do
+        write_workflow_file!(
+          Workflow.workflow_file_path(),
+          Keyword.merge(@valid_pilot, opencode_allowed_tools: tools)
+        )
+
+        assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+        assert message =~ "opencode.allowed_tools"
+        assert message =~ "OpenCode adapter contract"
+      end
+    end
+
+    test "an unknown tool name is rejected even while the harness is disabled" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        opencode_enabled: false,
+        opencode_allowed_tools: ["teleport"]
+      )
+
+      assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+      assert message =~ "OpenCode adapter contract"
+    end
+
+    test "a hand-built section is re-validated instead of trusted" do
+      assert {:ok, %OpenCode{}} = OpenCode.validate(%OpenCode{})
+
+      rejected = [
+        %OpenCode{enabled: false, allowed_tools: ["*"]},
+        %OpenCode{enabled: false, timeout_ms: 0},
+        %OpenCode{enabled: false, allowed_tools: ["teleport"]},
+        %OpenCode{enabled: true, allowed_tools: ["read"]}
+      ]
+
+      for section <- rejected do
+        assert {:error, _changeset} = OpenCode.validate(section)
+      end
+    end
+
+    test "the declared tool contract is a unique, non-empty list" do
+      contract = OpenCode.known_tool_names()
+
+      assert is_list(contract)
+      refute contract == []
+      assert contract == Enum.uniq(contract)
+    end
+
     test "blank allowlist entries are rejected" do
       write_workflow_file!(
         Workflow.workflow_file_path(),
@@ -152,6 +224,24 @@ defmodule SymphonyElixir.OpenCodeConfigTest do
       refute opencode.enabled
       assert opencode.provider == nil
       assert opencode.timeout_ms == 900_000
+    end
+  end
+
+  # The adapter candidate is developed on its own branch. While it is absent
+  # this block is not compiled, so the declared contract is only checked for
+  # shape; as soon as the adapter is present the two tool sets must match.
+  if Code.ensure_loaded?(@adapter_contract_module) do
+    describe "OpenCode adapter tool contract" do
+      test "the declared contract matches the adapter's accepted tool set" do
+        contract = OpenCode.known_tool_names()
+
+        assert {:ok, adapter_config} = @adapter_contract_module.build(allowed_tools: contract)
+
+        assert adapter_config["tools"] |> Map.keys() |> Enum.sort() == Enum.sort(contract)
+
+        assert {:error, {:unknown_tool_permission, ["teleport"]}} =
+                 @adapter_contract_module.build(allowed_tools: ["teleport"])
+      end
     end
   end
 

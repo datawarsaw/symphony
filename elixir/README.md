@@ -302,8 +302,8 @@ opencode:
   enabled: false                        # default; must be true to make the harness eligible
   provider: "opencode-go"               # required while enabled; explicit provider identity
   model: "muse-spark-1.3-contributor"   # required while enabled; explicit model identity
-  timeout_ms: 900000                    # default; bounded execution timeout for one run
-  allowed_tools: ["read", "grep"]       # required while enabled; explicit tool allowlist
+  timeout_ms: 900000                    # default; max 3600000 for one bounded run
+  allowed_tools: ["read", "grep"]       # required while enabled; OpenCode adapter tool names
   allowed_issues: ["MIC-300"]           # optional; the only issues the pilot authorizes
 ```
 
@@ -312,19 +312,30 @@ Fields:
 - `enabled` (boolean, default `false`).
 - `provider`, `model` (strings). Required and non-blank while `enabled` is `true`. There is no
   provider or model inference, and no provider fallback.
-- `timeout_ms` (positive integer, default `900000`). Bounds one OpenCode execution.
+- `timeout_ms` (integer, default `900000`, maximum `3600000`). Bounds one OpenCode execution. The
+  default is the practical M1 pilot budget; the maximum keeps a single run inside the one-hour Codex
+  turn budget, so the pilot cannot outlive the surrounding worker.
 - `allowed_tools` (list of strings). Required and non-empty while `enabled` is `true`. Blank entries
   fail validation, and wildcard or unrestricted grants (`*`, `all`, `any`, `auto`, `auto_approve`,
-  `unrestricted`, case-insensitive) are rejected whether or not the section is enabled.
+  `unrestricted`, case-insensitive) are rejected whether or not the section is enabled. Names outside
+  the OpenCode adapter contract (`SymphonyElixir.OpenCode.Config`, the tool set the adapter accepts
+  at launch) are rejected too. The accepted names are declared once in
+  `SymphonyElixir.Config.Schema.OpenCode` (`known_tool_names/0`): integration removes the adapter's
+  private copy and reads that contract, and the focused contract test compares both sets whenever the
+  adapter is present.
 - `allowed_issues` (list of strings). Optional pilot scope compared case-insensitively after
   trimming. An empty or missing list authorizes no issue, so an enabled section without one never
   selects OpenCode.
 
 Changes apply on the next workflow reload. Selection is a pure decision owned by
-`SymphonyElixir.HarnessSelection.select/2`: given an issue and the parsed `opencode` section it
-returns `{:opencode, :opencode_selected}` only when the section is enabled, fully specified, and the
-issue identifier is listed; every other case returns `{:codex, reason}`. It launches no process,
-writes no state, and leaves dispatch, retry, and containment gates untouched.
+`SymphonyElixir.HarnessSelection.select/2`, which re-validates the section - maps and hand-built
+structs alike - before deciding: `{:opencode, :opencode_selected}` when the section is enabled,
+valid, and the issue is listed; `{:codex, :opencode_disabled}` when no section is configured or it is
+disabled; `{:codex, :issue_not_authorized}` when a valid section does not list the issue;
+`{:codex, :invalid_opencode_config}` for an invalid section that does not list the issue; and
+`{:error, :invalid_opencode_config}` when an invalid section still lists the issue, so an intended
+OpenCode pilot is never silently replaced by Codex. It launches no process, writes no state, and
+leaves dispatch, retry, and containment gates untouched.
 
 ### Linear adapter profile
 
