@@ -230,9 +230,23 @@ defmodule SymphonyElixir.Config.Schema do
     section without one never selects OpenCode. Codex stays the default harness
     in every other case.
 
+    An explicit `null` for the security-critical `enabled` and `timeout_ms`
+    fields is rejected in this module: a null `enabled` is neither consent nor
+    refusal, and a null timeout is an unbounded execution. Ecto records an
+    explicit nil parameter as a change and `validate_number/3` then skips it,
+    so the rejection inspects the cast changes directly instead of relying on
+    the number validation.
+
     Validation runs on workflow maps and on already-built `%OpenCode{}` structs
     alike, so a hand-built struct cannot bypass the unrestricted-tool, unknown
-    tool, or timeout checks.
+    tool, timeout, or null checks.
+
+    `Schema.parse/1` is the one deliberate exception: it strips null values
+    before this changeset runs, so a YAML `null` means "absent" and keeps the
+    safe defaults (`enabled: false`, `timeout_ms: 900000`). A null in a
+    workflow file can therefore never enable the harness or lift the timeout;
+    a null that reaches `validate/1` directly - from a plain map or a struct -
+    is an error.
     """
 
     use Ecto.Schema
@@ -319,6 +333,8 @@ defmodule SymphonyElixir.Config.Schema do
         [:enabled, :provider, :model, :timeout_ms, :allowed_tools, :allowed_issues],
         empty_values: []
       )
+      |> reject_explicit_nil(:enabled, "must not be null: explicit true or false required")
+      |> reject_explicit_nil(:timeout_ms, "must not be null")
       |> validate_number(:timeout_ms,
         greater_than: 0,
         less_than_or_equal_to: @max_timeout_ms
@@ -326,6 +342,20 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_change(:allowed_tools, fn :allowed_tools, tools -> tool_entry_errors(tools) end)
       |> validate_change(:allowed_issues, fn :allowed_issues, issues -> issue_entry_errors(issues) end)
       |> validate_enabled_identity()
+    end
+
+    # cast/4 accepts an explicit nil parameter as a change and validate_number/3
+    # and validate_change/3 both skip nil changes, so a null enabled or timeout
+    # would reach apply_action unvalidated. The cast changes are inspected
+    # directly to fail closed. Only Schema.parse/1 neutralizes nulls before
+    # this changeset runs (a YAML null means "absent" and keeps the safe
+    # defaults); every direct map or struct caller is rejected.
+    defp reject_explicit_nil(changeset, field, message) do
+      case Map.fetch(changeset.changes, field) do
+        {:ok, nil} -> add_error(changeset, field, message)
+        :error -> changeset
+        {:ok, _value} -> changeset
+      end
     end
 
     defp tool_entry_errors(tools) do

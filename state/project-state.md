@@ -264,3 +264,116 @@ Validated on this host (Windows, Elixir 1.19.5 / OTP 28):
 The broad Windows test processes printed their complete ExUnit summaries and stayed open; they were
 interrupted after results were captured, so their process exits are not claimed as successful.
 Dispatch integration and independent exact-head review remain the next separate steps.
+
+## M1-C OpenCode configuration contract hardening — 2026-10-10
+
+Branch `codex/m1-c-opencode-config-routing-gate`, base `c90e2ad71a70310e6d71b94777f6cbaca081b6c5`, worktree
+`C:/AI/symphony-workspaces/m1-c-opencode-config-routing-gate`. Hardening commit `6a3c020` on top of the
+implementation candidate `371687c` / `2bdfefd`. Implementation-only candidate: no push, PR, merge, deployment, or
+Linear write, and the deployed runtime configuration is unchanged.
+
+- `Config.Schema.OpenCode.validate/1` re-checks a hand-built `%OpenCode{}` struct from its own fields, so a struct
+  can no longer bypass the unrestricted-tool, unknown-tool, or timeout validation for non-null values.
+  `HarnessSelection.select/2` routes maps and structs through it. (Correction recorded with the M1-C-F2 entry
+  below: an explicit `null` for `enabled` or `timeout_ms` still bypassed these checks at this commit — Ecto
+  records a nil parameter as a change and `validate_number/3` skips nil changes — and `select/2` matched only
+  `enabled: false`, so a null `enabled` still selected OpenCode without explicit consent. The blanket "no longer
+  bypass" claim above was inaccurate until the M1-C-F2 remediation closed it.)
+- `timeout_ms` gained a finite upper bound of `3600000` (one hour). The `900000` default remains the practical M1
+  pilot budget; the cap keeps one run inside the `codex.turn_timeout_ms` default so the pilot cannot outlive the
+  surrounding worker.
+- Tool names are validated against the OpenCode adapter contract. The accepted set is declared once, in
+  `OpenCode.known_tool_names/0`, rather than in a second free-standing allowlist; `unknown_tools/1` rejects anything
+  outside it (case-sensitive, matching the adapter's trim-only normalization), while wildcard and unrestricted
+  rejection stays case-insensitive and unchanged.
+- Harness selection no longer collapses every non-selected outcome onto `{:codex, reason}`. An invalid section that
+  still lists the issue returns `{:error, :invalid_opencode_config}`; an invalid section that does not list the issue
+  returns `{:codex, :invalid_opencode_config}`; absent or disabled sections keep `{:codex, :opencode_disabled}` and a
+  non-listed issue keeps `{:codex, :issue_not_authorized}`. An intended OpenCode pilot is therefore never silently
+  replaced by Codex. The policy stays pure: `select/2` is still the only public function, and it launches no process,
+  writes no state, and reads no runtime configuration.
+
+Compatibility dependency on the OpenCode adapter source:
+
+- The adapter candidate `5df80de` / `da78cbf` owns the accepted tool names in the private `@known_tools` of
+  `SymphonyElixir.OpenCode.Config` and rejects unknown names through its public `build/1`. This branch does not
+  contain that module, so `OpenCode.known_tool_names/0` mirrors its 15 names and is the single declared source here.
+- Integration resolves the dependency in one step: land the adapter branch (or its successor) and remove the adapter's
+  private list so `SymphonyElixir.OpenCode.Config` reads the contract from `OpenCode.known_tool_names/0`. The focused
+  contract test compiles only when `SymphonyElixir.OpenCode.Config` is loadable and then asserts that the adapter's
+  accepted tool map equals `OpenCode.known_tool_names/0` and that an unknown name is rejected, so the two sets cannot
+  drift silently once both exist.
+
+Validated on this host (Windows, Elixir 1.19.5 / OTP 28):
+
+- `mix compile --warnings-as-errors` passes (only the benign Phoenix LiveView `:eperm` `node_modules` symlink
+  warning).
+- `mix specs.check` passes; `mix format --check-formatted` (whole project) passes; `git diff --check` is clean.
+- Focused suites `opencode_config_test` + `harness_selection_test`: 35 tests, 0 failures at seed 424242.
+- `mix lint`: exit 30 with 9 warnings, 37 refactoring opportunities, 76 readability issues, and 4 design suggestions -
+  identical to the finding counts recorded for the previous candidate, and `mix credo --strict` on the four changed
+  files reports no issues.
+- Focused routing regression at seed 424242 (the two suites plus dispatch_router_test, worker_routing_test,
+  fallback_routing_test, fallback_policy_test): 131 tests, 21 failures, all `FallbackRoutingTest`. A pristine
+  `c90e2ad` worktree on this host at the same seed gives 96 tests with an identical failure-name set; no introduced
+  failure.
+- Config regression at seed 424242 (workspace_and_config_test, core_test, extensions_test, source_canonicality_test):
+  139 tests, 12 failures with failure names identical to the pristine `c90e2ad` worktree at the same seed
+  (pre-existing CoreTest and WorkspaceAndConfigTest host failures).
+- The broad Windows test processes printed their complete ExUnit summaries and stayed open; they were interrupted
+  after results were captured, so their process exits are not claimed as successful. The baseline comparison used a
+  temporary detached worktree at `c90e2ad` (`C:/AI/symphony-workspaces/_m1c-baseline-c90e2ad`), removed after use.
+
+Remaining work before dispatch: wire `HarnessSelection.select/2` into the dispatch path (AgentRunner, Orchestrator,
+DispatchRouter), land the OpenCode adapter branch and reconcile the tool contract, and complete independent exact-head
+review. `AgentRunner`, `Orchestrator`, `DispatchRouter`, `LaunchMarker`, the OpenCode adapter, `WORKFLOW.md`, and
+the deployed runtime configuration are untouched.
+
+## M1-C-F2 OpenCode config nil-bypass remediation — 2026-10-10
+
+Branch `codex/m1-c-opencode-config-routing-gate`, on top of `80028c4` (implementation `371687c` / `2bdfefd`,
+hardening `6a3c020`), worktree `C:/AI/symphony-workspaces/m1-c-opencode-config-routing-gate`. Bounded remediation of
+the independent-review M1-C-R2 HIGH finding: no push, PR, merge, deployment, or Linear write, and no dispatch wiring,
+AgentRunner, or OpenCode adapter change. No other worktree was modified.
+
+- Finding, reproduced at `80028c4`: an explicit `null` for `opencode.enabled` or `opencode.timeout_ms` validated
+  successfully in `Config.Schema.OpenCode.validate/1` for both plain maps and hand-built `%OpenCode{}` structs —
+  Ecto's `cast/4` records a nil parameter as a change while `validate_number/3` and `validate_change/3` skip nil
+  changes — and `HarnessSelection.select/2` matched only `enabled: false`, so a null `enabled` fell into the enabled
+  clause and returned `{:opencode, :opencode_selected}` for an allowlisted issue with no explicit opt-in, no
+  provider/model/tool identity check, and a null (unbounded) timeout likewise accepted.
+- Fix: `OpenCode.changeset/2` rejects an explicit null for the security-critical fields by inspecting the cast
+  changes directly — `enabled` with "must not be null: explicit true or false required" and `timeout_ms` with "must
+  not be null". `HarnessSelection.select/2` now selects OpenCode only on the literal `%OpenCode{enabled: true}`;
+  every other validated section keeps `{:codex, :opencode_disabled}`.
+- `Schema.parse/1` YAML null semantics are deliberately preserved: `drop_nil_values/1` strips nulls before the
+  OpenCode changeset runs, so a workflow-file null means "absent" and keeps the safe defaults (`enabled: false`,
+  `timeout_ms: 900000`), and nulls never lift the enabled-identity requirements (an `enabled: true` section with
+  null provider/model/tools still fails on all three). The direct-vs-parse distinction is documented in the
+  `OpenCode` moduledoc: a null that reaches `validate/1` from a map or struct is an error.
+- Fail-closed selection preserved and extended: an invalid section that still lists the issue returns
+  `{:error, :invalid_opencode_config}` — never a silent Codex substitution and never OpenCode authorization — and
+  the same invalid section without the issue keeps `{:codex, :invalid_opencode_config}`. Issue allowlisting, tool
+  validation, the 3600000 timeout cap, and the provider/model requirements are unchanged. The inaccurate
+  "no longer bypass" claim recorded by the previous hardening entry was corrected above.
+
+Validated on this host (Windows, Elixir 1.19.5 / OTP 28):
+
+- Focused suites `opencode_config_test` + `harness_selection_test`: 45 tests, 0 failures at seed 424242 (35 before
+  this change). The six new null-rejection tests fail at `80028c4` — verified by running the new test files against
+  stashed HEAD code (45 tests, 6 failures) — and pass after the fix. The four new preserved-behavior tests (absent
+  defaults, valid map/struct equivalence, and the two YAML-null parse tests) pass unchanged on both, as intended.
+- `mix compile --warnings-as-errors`, `mix specs.check`, and `mix format --check-formatted` (whole project) pass;
+  `mix credo --strict` on the four changed files reports no issues; `git diff --check` is clean.
+- Config regression at seed 424242 (workspace_and_config_test, core_test, extensions_test, source_canonicality_test):
+  139 tests, 12 failures, matching the recorded baseline failure set for this host (the `$VAR` expansion failure and
+  the pre-existing CoreTest MIC-164 `:epipe` / Git-Bash path-mangling failures).
+- Routing regression at seed 424242 (both focused suites plus dispatch_router_test, worker_routing_test,
+  fallback_routing_test, fallback_policy_test): 141 tests, 21 failures, all `FallbackRoutingTest` with the recorded
+  pre-existing `ISS-FB-*` KeyError signature — the recorded baseline is 131 tests with the identical 21 failures,
+  and the +10 are this change's new tests.
+- Broad Windows suites were run with output redirected to log files and exited on their own; logs are retained at
+  `C:/tmp/m1cf2-config-a.log`, `C:/tmp/m1cf2-config-b.log`, and `C:/tmp/m1cf2-routing.log`.
+
+Scope remains configuration and policy only: dispatch integration, the adapter branch, `WORKFLOW.md`, and the
+deployed runtime configuration are untouched, and OpenCode remains unreachable until dispatch wiring lands.

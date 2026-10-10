@@ -68,6 +68,49 @@ defmodule SymphonyElixir.HarnessSelectionTest do
       end
     end
 
+    test "a null enabled never selects OpenCode, for maps and structs alike" do
+      null_map = %{
+        "enabled" => nil,
+        "provider" => "opencode-go",
+        "model" => "muse-spark-1.3-contributor",
+        "timeout_ms" => 120_000,
+        "allowed_tools" => ["read"],
+        "allowed_issues" => ["MIC-300"]
+      }
+
+      null_struct = %{@pilot | enabled: nil}
+
+      for section <- [null_map, null_struct] do
+        assert {:error, :invalid_opencode_config} =
+                 HarnessSelection.select(@authorized_issue, section)
+      end
+    end
+
+    test "a null timeout_ms never selects OpenCode, for maps and structs alike" do
+      null_map = %{
+        "enabled" => true,
+        "provider" => "opencode-go",
+        "model" => "muse-spark-1.3-contributor",
+        "timeout_ms" => nil,
+        "allowed_tools" => ["read"],
+        "allowed_issues" => ["MIC-300"]
+      }
+
+      null_struct = %{@pilot | timeout_ms: nil}
+
+      for section <- [null_map, null_struct] do
+        assert {:error, :invalid_opencode_config} =
+                 HarnessSelection.select(@authorized_issue, section)
+      end
+    end
+
+    test "a null section that does not list the issue stays on Codex" do
+      null_unlisted = %{@pilot | enabled: nil, allowed_issues: ["MIC-301"]}
+
+      assert {:codex, :invalid_opencode_config} =
+               HarnessSelection.select(@authorized_issue, null_unlisted)
+    end
+
     test "an invalid section for an issue outside its scope stays on Codex" do
       invalid = %{@pilot | allowed_tools: ["*"]}
 

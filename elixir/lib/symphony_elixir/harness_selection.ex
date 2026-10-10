@@ -14,7 +14,9 @@ defmodule SymphonyElixir.HarnessSelection do
 
   Selecting OpenCode requires all of:
 
-    * `opencode.enabled` is `true`;
+    * `opencode.enabled` is exactly `true`. The schema rejects an explicit
+      null, and any section that is not the literal `true` - disabled,
+      defaulted, or otherwise - keeps Codex;
     * the section passes the `OpenCode` schema: a non-blank `provider` and
       `model`, at least one allowed tool, a timeout inside the supported budget,
       and no unrestricted or unknown tool;
@@ -60,8 +62,10 @@ defmodule SymphonyElixir.HarnessSelection do
   @doc """
   Selects the harness for an issue under the supplied OpenCode pilot settings.
 
-  Returns `{:opencode, :opencode_selected}` only when the pilot is explicitly
-  enabled, validates, and the issue is authorized. Otherwise it returns
+  Returns `{:opencode, :opencode_selected}` only when the pilot is enabled
+  with the literal `true`, validates, and the issue is authorized. A section
+  whose `enabled` is not exactly `true` - disabled, defaulted, or an explicit
+  null the schema rejects - never selects OpenCode. Otherwise it returns
   `{:codex, reason}`, so a caller can branch on the first element and normally
   needs no fallback path. One case returns `{:error, :invalid_opencode_config}`:
   an explicitly authorized issue whose section is invalid, where Codex is not a
@@ -75,11 +79,11 @@ defmodule SymphonyElixir.HarnessSelection do
   @spec select(Issue.t() | nil, OpenCode.t() | map() | nil) :: decision()
   def select(issue, settings) do
     case normalize(settings) do
-      {:ok, %OpenCode{enabled: false}} ->
-        {:codex, :opencode_disabled}
-
-      {:ok, %OpenCode{} = opencode} ->
+      {:ok, %OpenCode{enabled: true} = opencode} ->
         select_authorized(opencode, issue)
+
+      {:ok, %OpenCode{}} ->
+        {:codex, :opencode_disabled}
 
       :disabled ->
         {:codex, :opencode_disabled}

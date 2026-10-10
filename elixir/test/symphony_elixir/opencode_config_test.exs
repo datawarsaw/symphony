@@ -227,6 +227,111 @@ defmodule SymphonyElixir.OpenCodeConfigTest do
     end
   end
 
+  describe "opencode explicit null validation" do
+    @null_base %{
+      "provider" => "opencode-go",
+      "model" => "muse-spark-1.3-contributor",
+      "timeout_ms" => 600_000,
+      "allowed_tools" => ["read"],
+      "allowed_issues" => ["MIC-300"]
+    }
+    @null_base_struct %OpenCode{
+      provider: "opencode-go",
+      model: "muse-spark-1.3-contributor",
+      timeout_ms: 600_000,
+      allowed_tools: ["read"],
+      allowed_issues: ["MIC-300"]
+    }
+
+    test "an explicit null enabled is rejected for maps and structs alike" do
+      for section <- [Map.put(@null_base, "enabled", nil), %{@null_base_struct | enabled: nil}] do
+        assert {:error, changeset} = OpenCode.validate(section)
+        assert null_errors(changeset) == %{enabled: ["must not be null: explicit true or false required"]}
+      end
+    end
+
+    test "an explicit null timeout_ms is rejected for maps and structs alike" do
+      for section <- [
+            Map.merge(@null_base, %{"enabled" => true, "timeout_ms" => nil}),
+            %{@null_base_struct | enabled: true, timeout_ms: nil}
+          ] do
+        assert {:error, changeset} = OpenCode.validate(section)
+        assert null_errors(changeset) == %{timeout_ms: ["must not be null"]}
+      end
+    end
+
+    test "a null-only section reports both fields instead of falling back to defaults" do
+      assert {:error, changeset} = OpenCode.validate(%{"enabled" => nil, "timeout_ms" => nil})
+
+      assert null_errors(changeset) == %{
+               enabled: ["must not be null: explicit true or false required"],
+               timeout_ms: ["must not be null"]
+             }
+    end
+
+    test "absent values are not nulls and keep the disabled defaults" do
+      assert {:ok, opencode} = OpenCode.validate(%{})
+      assert %OpenCode{} = opencode
+      refute opencode.enabled
+      assert opencode.timeout_ms == 900_000
+      assert opencode.allowed_tools == []
+      assert opencode.allowed_issues == []
+    end
+
+    test "explicit valid values keep validating for maps and structs alike" do
+      valid_map = Map.put(@null_base, "enabled", true)
+      valid_struct = %{@null_base_struct | enabled: true}
+
+      assert {:ok, from_map} = OpenCode.validate(valid_map)
+      assert {:ok, from_struct} = OpenCode.validate(valid_struct)
+
+      assert from_map == from_struct
+      assert from_map.enabled
+      assert from_map.timeout_ms == 600_000
+    end
+  end
+
+  describe "opencode YAML null semantics through Schema.parse" do
+    test "a YAML null means absent and keeps the safe defaults" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        opencode_enabled: nil,
+        opencode_provider: "opencode-go",
+        opencode_model: "muse-spark-1.3-contributor",
+        opencode_timeout_ms: nil,
+        opencode_allowed_tools: ["read"],
+        opencode_allowed_issues: ["MIC-300"]
+      )
+
+      assert :ok = Config.validate!()
+
+      opencode = Config.settings!().opencode
+      refute opencode.enabled
+      assert opencode.timeout_ms == 900_000
+
+      assert {:codex, :opencode_disabled} =
+               HarnessSelection.select(
+                 %Issue{id: "issue-1", identifier: "MIC-300", dispatchable: true},
+                 opencode
+               )
+    end
+
+    test "a YAML null never lifts the enabled identity requirements" do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        opencode_enabled: true,
+        opencode_provider: nil,
+        opencode_model: nil,
+        opencode_timeout_ms: nil,
+        opencode_allowed_tools: nil,
+        opencode_allowed_issues: nil
+      )
+
+      assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+      assert message =~ "opencode.provider"
+      assert message =~ "opencode.model"
+      assert message =~ "opencode.allowed_tools"
+    end
+  end
+
   # The adapter candidate is developed on its own branch. While it is absent
   # this block is not compiled, so the declared contract is only checked for
   # shape; as soon as the adapter is present the two tool sets must match.
@@ -283,5 +388,9 @@ defmodule SymphonyElixir.OpenCodeConfigTest do
 
       assert {:codex, :issue_not_authorized} = HarnessSelection.select(issue, opencode)
     end
+  end
+
+  defp null_errors(changeset) do
+    Ecto.Changeset.traverse_errors(changeset, fn {message, _opts} -> message end)
   end
 end
