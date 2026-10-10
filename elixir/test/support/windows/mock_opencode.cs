@@ -166,13 +166,22 @@ class MockOpenCode
         {
             WriteStepStart(sessionId, "msg_01");
             Console.Out.Flush();
-            while (true)
+            // Uncontained launches (remote hosts) are never killed locally, so a
+            // stop-less hang must self-exit instead of looping forever.
+            if (!string.IsNullOrEmpty(stopFile))
             {
-                if (!string.IsNullOrEmpty(stopFile) && File.Exists(stopFile))
+                while (true)
                 {
-                    break;
+                    if (File.Exists(stopFile))
+                    {
+                        break;
+                    }
+                    Thread.Sleep(500);
                 }
-                Thread.Sleep(500);
+            }
+            else
+            {
+                Thread.Sleep(60000);
             }
             return exitCode;
         }
