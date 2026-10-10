@@ -73,7 +73,8 @@ defmodule SymphonyElixir.OpenCode.Parser do
                 cost: 0.0
               },
               failure_evidence: [],
-              events: []
+              events: [],
+              event_count: 0
   end
 
   @intermediate_step_reason "tool-calls"
@@ -178,6 +179,22 @@ defmodule SymphonyElixir.OpenCode.Parser do
   end
 
   @doc """
+  Returns the events recorded between two parser states, oldest-first.
+
+  Events are prepended to the accumulator, so the delta of `after_state` over
+  `before_state` is a newest-first prefix of `after_state.events`. This returns
+  that prefix reversed (chronological order) for one-shot callback dispatch,
+  touching only the newly recorded events — never the processed history.
+  """
+  @spec events_between(%State{}, %State{}) :: [map()]
+  def events_between(
+        %State{event_count: before_count},
+        %State{event_count: after_count, events: events}
+      ) do
+    events |> Enum.take(after_count - before_count) |> Enum.reverse()
+  end
+
+  @doc """
   Converts the parser accumulator into a structured summary map.
   """
   @spec to_result(%State{}) :: map()
@@ -191,7 +208,7 @@ defmodule SymphonyElixir.OpenCode.Parser do
       finish_reason: state.finish_reason,
       usage: state.usage,
       failure_evidence: Enum.reverse(state.failure_evidence),
-      event_count: length(state.events)
+      event_count: state.event_count
     }
   end
 
@@ -457,7 +474,7 @@ defmodule SymphonyElixir.OpenCode.Parser do
   end
 
   defp record_event(state, event) do
-    %{state | events: [event | state.events]}
+    %{state | events: [event | state.events], event_count: state.event_count + 1}
   end
 
   defp process_step_finish(state, event, session_accepted?) do

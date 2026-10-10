@@ -76,7 +76,7 @@ defmodule SymphonyElixir.OpenCode.Adapter do
 
           {:timeout, parser} ->
             termination = stop_session(session)
-            timeout_result(session, parser, termination)
+            timeout_result(session, parser, termination, Keyword.get(opts, :on_event))
         end
       after
         stop_session(session)
@@ -200,21 +200,37 @@ defmodule SymphonyElixir.OpenCode.Adapter do
       {^port, {:data, data}} ->
         chunk = normalize_chunk(data)
         updated_parser = Parser.feed(parser, chunk)
-
-        if is_function(on_event, 1) do
-          for event <- updated_parser.events -- parser.events do
-            on_event.(event)
-          end
-        end
+        dispatch_events(parser, updated_parser, on_event)
 
         loop_stream(port, updated_parser, deadline, on_event)
 
       {^port, {:exit_status, status}} ->
-        {:exit, status, Parser.finish(parser, status)}
+        {:exit, status, finish_and_dispatch(parser, status, on_event)}
     after
       remaining_ms ->
         {:timeout, parser}
     end
+  end
+
+  # Delivery contract: every decoded JSONL line reaches :on_event exactly once,
+  # in parse order — oldest-first within each chunk, so the observer stream is
+  # chronological regardless of how the OS segments the pipe. Duplicate events
+  # are delivered per occurrence and deduplication stays the consumer's policy.
+  # Events finalized by Parser.finish from the trailing buffer (a final line
+  # without newline) are dispatched at both finish sites, so the callback
+  # stream never loses the terminal event the run result still reports.
+  defp dispatch_events(before_parser, after_parser, on_event) do
+    if is_function(on_event, 1) do
+      for event <- Parser.events_between(before_parser, after_parser) do
+        on_event.(event)
+      end
+    end
+  end
+
+  defp finish_and_dispatch(parser, status, on_event) do
+    final_parser = Parser.finish(parser, status)
+    dispatch_events(parser, final_parser, on_event)
+    final_parser
   end
 
   defp conclude(session, parser, status, termination) do
@@ -233,8 +249,11 @@ defmodule SymphonyElixir.OpenCode.Adapter do
     end
   end
 
-  defp timeout_result(session, parser, termination) do
-    final_parser = Parser.finish(parser, :timeout)
+  defp timeout_result(session, parser, termination, on_event) do
+    # M1-INT-F timeout fusion: the parser's timeout status is always the
+    # explicit :timeout atom — never nil — so downstream completion semantics
+    # (SEM/TERM) can distinguish a timed-out stream from a silent one.
+    final_parser = finish_and_dispatch(parser, :timeout, on_event)
     result = assembled_result(session, final_parser, 253, termination)
     failure_info = Failure.failure_info(:timeout)
     {:error, {:timeout, Map.put(result, :failure_info, failure_info)}}
