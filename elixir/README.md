@@ -291,6 +291,41 @@ hooks:
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 
+### OpenCode worker pilot profile
+
+`opencode` is an optional extension section for the harness-selection pilot. It is
+disabled by default, and no dispatch path consumes it yet: Symphony still launches Codex for
+every issue.
+
+```yaml
+opencode:
+  enabled: false                        # default; must be true to make the harness eligible
+  provider: "opencode-go"               # required while enabled; explicit provider identity
+  model: "muse-spark-1.3-contributor"   # required while enabled; explicit model identity
+  timeout_ms: 900000                    # default; bounded execution timeout for one run
+  allowed_tools: ["read", "grep"]       # required while enabled; explicit tool allowlist
+  allowed_issues: ["MIC-300"]           # optional; the only issues the pilot authorizes
+```
+
+Fields:
+
+- `enabled` (boolean, default `false`).
+- `provider`, `model` (strings). Required and non-blank while `enabled` is `true`. There is no
+  provider or model inference, and no provider fallback.
+- `timeout_ms` (positive integer, default `900000`). Bounds one OpenCode execution.
+- `allowed_tools` (list of strings). Required and non-empty while `enabled` is `true`. Blank entries
+  fail validation, and wildcard or unrestricted grants (`*`, `all`, `any`, `auto`, `auto_approve`,
+  `unrestricted`, case-insensitive) are rejected whether or not the section is enabled.
+- `allowed_issues` (list of strings). Optional pilot scope compared case-insensitively after
+  trimming. An empty or missing list authorizes no issue, so an enabled section without one never
+  selects OpenCode.
+
+Changes apply on the next workflow reload. Selection is a pure decision owned by
+`SymphonyElixir.HarnessSelection.select/2`: given an issue and the parsed `opencode` section it
+returns `{:opencode, :opencode_selected}` only when the section is enabled, fully specified, and the
+issue identifier is listed; every other case returns `{:codex, reason}`. It launches no process,
+writes no state, and leaves dispatch, retry, and containment gates untouched.
+
 ### Linear adapter profile
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default

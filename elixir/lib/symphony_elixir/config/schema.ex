@@ -213,6 +213,135 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule OpenCode do
+    @moduledoc """
+    OpenCode pilot configuration for the M1 harness-selection gate.
+
+    The section carries only the identity and the bounds of a pilot: whether
+    the harness is enabled, which provider and model it must use, how long one
+    execution may run, which tools it may use, and which issues are authorized
+    for the pilot. It carries no launch surface: no command, no credentials, no
+    environment, and no provider fallback.
+
+    Fails closed. An enabled section must name an explicit provider and model
+    and at least one allowed tool, and must not grant an unrestricted tool. The
+    issue allowlist is optional; an empty allowlist authorizes no issue, so an
+    enabled section without one never selects OpenCode. Codex stays the default
+    harness in every other case.
+    """
+
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @default_timeout_ms 900_000
+    @unrestricted_tool_names ~w(* all any auto auto_approve unrestricted)
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:provider, :string)
+      field(:model, :string)
+      field(:timeout_ms, :integer, default: @default_timeout_ms)
+      field(:allowed_tools, {:array, :string}, default: [])
+      field(:allowed_issues, {:array, :string}, default: [])
+    end
+
+    @type t :: %__MODULE__{
+            enabled: boolean(),
+            provider: String.t() | nil,
+            model: String.t() | nil,
+            timeout_ms: integer() | nil,
+            allowed_tools: [String.t()],
+            allowed_issues: [String.t()]
+          }
+
+    @spec changeset(t(), map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [:enabled, :provider, :model, :timeout_ms, :allowed_tools, :allowed_issues],
+        empty_values: []
+      )
+      |> validate_number(:timeout_ms, greater_than: 0)
+      |> validate_change(:allowed_tools, fn :allowed_tools, tools -> tool_entry_errors(tools) end)
+      |> validate_change(:allowed_issues, fn :allowed_issues, issues -> issue_entry_errors(issues) end)
+      |> validate_enabled_identity()
+    end
+
+    defp tool_entry_errors(tools) do
+      unrestricted = unrestricted_tools(tools)
+
+      cond do
+        Enum.any?(tools, &blank_entry?/1) ->
+          [allowed_tools: "entries must not be blank"]
+
+        unrestricted != [] ->
+          [allowed_tools: "must not grant unrestricted tools: #{Enum.join(unrestricted, ", ")}"]
+
+        true ->
+          []
+      end
+    end
+
+    defp issue_entry_errors(issues) do
+      if Enum.any?(issues, &blank_entry?/1) do
+        [allowed_issues: "entries must not be blank"]
+      else
+        []
+      end
+    end
+
+    defp validate_enabled_identity(changeset) do
+      if enabled?(changeset) do
+        changeset
+        |> require_value(:provider, "is required when opencode.enabled is true")
+        |> require_value(:model, "is required when opencode.enabled is true")
+        |> require_tool_allowlist()
+      else
+        changeset
+      end
+    end
+
+    defp require_value(changeset, field, message) do
+      if nonblank?(field_value(changeset, field)) do
+        changeset
+      else
+        add_error(changeset, field, message)
+      end
+    end
+
+    defp require_tool_allowlist(changeset) do
+      if nonempty_list?(field_value(changeset, :allowed_tools)) do
+        changeset
+      else
+        add_error(changeset, :allowed_tools, "is required when opencode.enabled is true")
+      end
+    end
+
+    defp nonempty_list?([_head | _tail]), do: true
+    defp nonempty_list?(_other), do: false
+
+    defp enabled?(changeset) do
+      match?({_source, true}, fetch_field(changeset, :enabled))
+    end
+
+    defp field_value(changeset, field) do
+      {_source, value} = fetch_field(changeset, field)
+      value
+    end
+
+    defp unrestricted_tools(tools) when is_list(tools) do
+      Enum.filter(tools, fn tool ->
+        is_binary(tool) and String.downcase(String.trim(tool)) in @unrestricted_tool_names
+      end)
+    end
+
+    defp blank_entry?(value), do: not (is_binary(value) and String.trim(value) != "")
+
+    defp nonblank?(value), do: is_binary(value) and String.trim(value) != ""
+  end
+
   defmodule Codex do
     @moduledoc false
     use Ecto.Schema
@@ -412,6 +541,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:discovery, Discovery, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:opencode, OpenCode, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
@@ -513,6 +643,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:discovery, with: &Discovery.changeset/2)
+    |> cast_embed(:opencode, with: &OpenCode.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
@@ -587,7 +718,31 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    opencode = %{
+      settings.opencode
+      | provider: normalize_optional_string(settings.opencode.provider),
+        model: normalize_optional_string(settings.opencode.model),
+        allowed_tools: normalize_name_list(settings.opencode.allowed_tools),
+        allowed_issues: normalize_name_list(settings.opencode.allowed_issues)
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, opencode: opencode}
+  end
+
+  defp normalize_optional_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_optional_string(value), do: value
+
+  defp normalize_name_list(values) when is_list(values) do
+    values
+    |> Enum.map(fn value -> value |> to_string() |> String.trim() end)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
   end
 
   defp normalize_keys(value) when is_map(value) do

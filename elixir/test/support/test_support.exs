@@ -538,6 +538,12 @@ defmodule SymphonyElixir.TestSupport do
           codex_fallback_enabled: false,
           codex_fallback_model: nil,
           codex_fallback_reasoning_effort: "medium",
+          opencode_enabled: nil,
+          opencode_provider: nil,
+          opencode_model: nil,
+          opencode_timeout_ms: nil,
+          opencode_allowed_tools: nil,
+          opencode_allowed_issues: nil,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -583,6 +589,12 @@ defmodule SymphonyElixir.TestSupport do
     codex_fallback_enabled = Keyword.get(config, :codex_fallback_enabled)
     codex_fallback_model = Keyword.get(config, :codex_fallback_model)
     codex_fallback_reasoning_effort = Keyword.get(config, :codex_fallback_reasoning_effort)
+    opencode_enabled = Keyword.get(config, :opencode_enabled)
+    opencode_provider = Keyword.get(config, :opencode_provider)
+    opencode_model = Keyword.get(config, :opencode_model)
+    opencode_timeout_ms = Keyword.get(config, :opencode_timeout_ms)
+    opencode_allowed_tools = Keyword.get(config, :opencode_allowed_tools)
+    opencode_allowed_issues = Keyword.get(config, :opencode_allowed_issues)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -636,6 +648,14 @@ defmodule SymphonyElixir.TestSupport do
         "    enabled: #{yaml_value(codex_fallback_enabled)}",
         "    model: #{yaml_value(codex_fallback_model)}",
         "    reasoning_effort: #{yaml_value(codex_fallback_reasoning_effort)}",
+        opencode_yaml(
+          opencode_enabled,
+          opencode_provider,
+          opencode_model,
+          opencode_timeout_ms,
+          opencode_allowed_tools,
+          opencode_allowed_issues
+        ),
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
@@ -731,6 +751,23 @@ defmodule SymphonyElixir.TestSupport do
       host && "  host: #{yaml_value(host)}"
     ]
     |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  # The OpenCode pilot section is omitted unless a test opts in, so the shared
+  # workflow fixture keeps its previous byte-for-byte content by default.
+  defp opencode_yaml(nil, nil, nil, nil, nil, nil), do: nil
+
+  defp opencode_yaml(enabled, provider, model, timeout_ms, allowed_tools, allowed_issues) do
+    [
+      "opencode:",
+      "  enabled: #{yaml_value(enabled)}",
+      "  provider: #{yaml_value(provider)}",
+      "  model: #{yaml_value(model)}",
+      "  timeout_ms: #{yaml_value(timeout_ms)}",
+      "  allowed_tools: #{yaml_value(allowed_tools)}",
+      "  allowed_issues: #{yaml_value(allowed_issues)}"
+    ]
     |> Enum.join("\n")
   end
 
