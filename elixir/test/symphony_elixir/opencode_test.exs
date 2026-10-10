@@ -1058,6 +1058,105 @@ defmodule SymphonyElixir.OpenCodeTest do
         refute redacted =~ secret
         refute redacted =~ "my-secret-auth-token"
         assert redacted =~ "[redacted]"
+        assert redacted =~ "\uFFFD"
+      end
+    end
+
+    test "malformed chardata with invalid bytes and list-shaped RestData is sanitized to valid UTF-8 with replacement characters" do
+      secret = "sk-ant-api03-chardata-secret-xyz"
+
+      chardata = [
+        <<0xFF, 0xFE>>,
+        ["hello ", <<0x80>>, secret],
+        [10_000_000, " more "]
+      ]
+
+      redacted = Redactor.redact(chardata)
+      assert is_list(redacted)
+      assert match?({:ok, _}, Jason.encode(redacted))
+
+      sanitized = Redactor.ensure_valid_utf8(chardata)
+      assert is_binary(sanitized)
+      assert String.valid?(sanitized)
+      assert sanitized =~ "\uFFFD"
+      assert match?({:ok, _}, Jason.encode(sanitized))
+
+      sanitized_iodata = Redactor.sanitize_utf8([<<0xFF>>, <<0xFE>>, "ok"], [])
+      bin = IO.iodata_to_binary(sanitized_iodata)
+      assert String.valid?(bin)
+      assert bin =~ "\uFFFD"
+      assert bin =~ "ok"
+    end
+
+    test "pathological long invalid input runs in bounded time and memory without amplification" do
+      secret = "sk-ant-api03-boundary-secret-9876543210"
+      large_invalid = :binary.copy(<<0xFF>>, 500_000)
+      large_with_secret = :binary.copy(<<0xFF>>, 100_000) <> secret <> :binary.copy(<<0xFE>>, 100_000)
+
+      {elapsed_micro_1, redacted_1} =
+        :timer.tc(fn -> Redactor.redact(large_invalid) end)
+
+      assert is_binary(redacted_1)
+      assert String.valid?(redacted_1)
+      assert byte_size(redacted_1) <= 4_096
+      assert String.ends_with?(redacted_1, "…[truncated]")
+      assert redacted_1 =~ "\uFFFD"
+      assert match?({:ok, _}, Jason.encode(redacted_1))
+      assert elapsed_micro_1 < 250_000
+
+      {elapsed_micro_2, redacted_2} =
+        :timer.tc(fn -> Redactor.redact(large_with_secret) end)
+
+      assert is_binary(redacted_2)
+      assert String.valid?(redacted_2)
+      assert byte_size(redacted_2) <= 4_096
+      refute redacted_2 =~ secret
+      assert match?({:ok, _}, Jason.encode(redacted_2))
+      assert elapsed_micro_2 < 250_000
+    end
+
+    test "hardened token redaction scrubs secrets with word-character prefixes bypassing word boundaries" do
+      secrets = [
+        {"sk-ant-api03-abcdefghijklmnopqrstuvwxyz", "prefix_sk-ant-api03-abcdefghijklmnopqrstuvwxyz"},
+        {"sk-ant-api03-abcdefghijklmnopqrstuvwxyz", "wordsk-ant-api03-abcdefghijklmnopqrstuvwxyz"},
+        {"ghp_12345678901234567890", "var_ghp_12345678901234567890"},
+        {"ghp_12345678901234567890", "tokenghp_12345678901234567890"},
+        {"lin_api_abcdefghijklmnopqrstuvwxyz", "env_lin_api_abcdefghijklmnopqrstuvwxyz"},
+        {"AKIA1234567890123456", "aws_AKIA1234567890123456"},
+        {"xoxb-1234567890123", "slack_xoxb-1234567890123"},
+        {"sk-openai-key-secret-123456", "my_sk-openai-key-secret-123456"},
+        {"my-secret-bearer-token", "auth_bearer my-secret-bearer-token"},
+        {"secret_pass_1234", "db_password=secret_pass_1234"},
+        {"api_val_5678", "my_api_key=api_val_5678"}
+      ]
+
+      for {raw_secret, glued} <- secrets do
+        redacted = Redactor.redact(glued)
+        refute redacted =~ raw_secret
+        assert redacted =~ "[redacted]"
+        assert String.valid?(redacted)
+        assert match?({:ok, _}, Jason.encode(redacted))
+      end
+    end
+
+    test "repeated redaction is idempotent and preserves valid bounds" do
+      inputs = [
+        "already normal text",
+        <<0xFF, 0xFE>> <> "sk-ant-api03-abcdefghijklmnopqrstuvwxyz" <> <<0x80>>,
+        String.duplicate("long text with secret sk-ant-api03-abcdefghijklmnopqrstuvwxyz ", 200),
+        "glued_ghp_12345678901234567890 and var_lin_api_12345678901234"
+      ]
+
+      for input <- inputs do
+        once = Redactor.redact(input)
+        twice = Redactor.redact(once)
+        thrice = Redactor.redact(twice)
+
+        assert twice == once
+        assert thrice == once
+        assert String.valid?(twice)
+        assert byte_size(twice) <= 4_096
+        assert match?({:ok, _}, Jason.encode(twice))
       end
     end
 
