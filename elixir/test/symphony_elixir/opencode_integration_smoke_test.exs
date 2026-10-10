@@ -23,10 +23,11 @@ defmodule SymphonyElixir.OpenCodeIntegrationSmokeTest do
   - `SymphonyElixir.OpenCode.Adapter.validate_model_selection/1` rejects a bare
     model. That is the no-fallback guarantee. The `error` mock's nonzero exit
     does not satisfy it.
-  - A production selector, distinct from `OpenCodeWorkerFixture.resolve_worker_route/2`,
-    chooses an OpenCode worker from an explicit label or config and returns the
-    Codex default when OpenCode is disabled. Baseline `DispatchRouter.materialize/3`
-    only accepts `:primary` and `:fallback`.
+  - The production selector — `SymphonyElixir.HarnessSelection`, wired into the
+    orchestrator dispatch boundary (M1-D) — chooses an OpenCode worker from
+    explicit configuration and returns the Codex default when OpenCode is
+    disabled. `OpenCodeWorkerFixture.resolve_worker_route/2` is fixture-only
+    and must not satisfy that gate.
   """
 
   use SymphonyElixir.TestSupport
@@ -99,8 +100,12 @@ defmodule SymphonyElixir.OpenCodeIntegrationSmokeTest do
         ])
       end
 
+      # i1 adapter contract: the run summary reports the completion state as
+      # `:completion_state` (required key of run_result); success additionally
+      # requires clean JSONL, exit 0 and TERMINATED_CONFIRMED containment
+      # evidence, which run/3 has already verified before returning :ok.
       assert {:ok, summary} = run_fn.()
-      assert summary.status == :completed
+      assert summary.completion_state == :completed
       assert summary.usage.total_tokens > 0
     end
 
@@ -114,33 +119,33 @@ defmodule SymphonyElixir.OpenCodeIntegrationSmokeTest do
       mock_exe = MockOpenCode.ensure_built!()
       issue_id = "ISSUE-OC-GATE-#{System.unique_integer([:positive])}"
 
-      # Verify production start_session records marker before process and cleans up
-      adapter_mod = SymphonyElixir.OpenCode.Adapter
-
-      identity =
-        SymphonyElixir.WorkerContainment.new_identity(
-          issue_id: issue_id,
-          attempt_id: 1,
-          workspace: ws,
-          worker_host: nil
-        )
-
+      # i1 adapter contract: the adapter derives the fenceable identity from
+      # the issue-keyed launch opts (`issue_id:`/`attempt_id:`/`identifier:`)
+      # and records the marker into the store pinned by `:authority_root`
+      # (the app-env `launch_marker_root` override in this test) BEFORE the
+      # child process exists.
       session_opts = [
         provider: "anthropic",
         model: "claude-3-5-sonnet",
         executable: mock_exe,
-        identity: identity,
-        authority_root: mr
+        issue_id: issue_id,
+        attempt_id: 1,
+        identifier: "OC-GATE",
+        authority_root: ws
       ]
 
-      assert {:ok, session} = apply(adapter_mod, :start_session, [ws, "prompt", session_opts])
+      assert {:ok, session} = SymphonyElixir.OpenCode.Adapter.start_session(ws, "prompt", session_opts)
 
-      # Marker must exist during active session
+      # Marker must exist during active session and name the OpenCode harness
       marker_path = LaunchMarker.marker_path(issue_id, root: mr)
       assert File.exists?(marker_path)
 
+      assert {:ok, marker} = LaunchMarker.read(issue_id, root: mr)
+      assert marker["worker_identity"]["harness"] == "opencode"
+      assert marker["issue_id"] == issue_id
+
       # Clean stop clears marker
-      assert %{status: :TERMINATED_CONFIRMED} = apply(adapter_mod, :stop_session, [session])
+      assert %{status: :TERMINATED_CONFIRMED} = SymphonyElixir.OpenCode.Adapter.stop_session(session)
       refute File.exists?(marker_path)
     end
 
@@ -220,13 +225,62 @@ defmodule SymphonyElixir.OpenCodeIntegrationSmokeTest do
     end
 
     test "production OpenCode worker selection is not the fixture router" do
-      flunk(
-        "M1 INTEGRATION BLOCKED: production DispatchRouter selection of an OpenCode worker is not assembled. " <>
-          "Baseline DispatchRouter.materialize/3 accepts only :primary and :fallback and returns a Codex Selection " <>
-          "with no worker_type. Gate after assembly: the production selector must choose worker_type :opencode from " <>
-          "an explicit label or config, and must return the Codex default when OpenCode is disabled. " <>
-          "OpenCodeWorkerFixture.resolve_worker_route/2 is fixture-only and must not satisfy this gate."
+      # M1-D gate: the production selector is SymphonyElixir.HarnessSelection,
+      # wired into the orchestrator's dispatch boundary (one decision per
+      # dispatch attempt). It authorizes OpenCode from explicit configuration
+      # (enabled + pinned provider/model + tool allowlist + per-issue
+      # allowlist) and answers Codex for everything else. The fixture router
+      # `OpenCodeWorkerFixture.resolve_worker_route/2` is fixture-only and
+      # must not satisfy this gate.
+      assert Code.ensure_loaded?(SymphonyElixir.HarnessSelection),
+             "M1 INTEGRATION BLOCKED: SymphonyElixir.HarnessSelection is not assembled"
+
+      assert function_exported?(SymphonyElixir.HarnessSelection, :select, 2),
+             "M1 INTEGRATION BLOCKED: HarnessSelection.select/2 is missing from the assembled tree"
+
+      pilot = %{
+        "enabled" => true,
+        "provider" => "opencode-go",
+        "model" => "muse-spark-1.3-contributor",
+        "allowed_tools" => ["read"],
+        "allowed_issues" => ["MIC-SEL-1"]
+      }
+
+      authorized = %Issue{id: "issue-sel-1", identifier: "MIC-SEL-1", labels: ["worker:opencode"]}
+      unauthorized = %Issue{id: "issue-sel-2", identifier: "MIC-SEL-2", labels: ["worker:opencode"]}
+
+      # The production selector chooses OpenCode only for the authorized issue
+      assert {:opencode, :opencode_selected} = SymphonyElixir.HarnessSelection.select(authorized, pilot)
+
+      # A label alone never selects OpenCode: authorization is configuration
+      assert {:codex, :issue_not_authorized} = SymphonyElixir.HarnessSelection.select(unauthorized, pilot)
+
+      # Disabled or absent configuration keeps the Codex default
+      assert {:codex, :opencode_disabled} = SymphonyElixir.HarnessSelection.select(authorized, nil)
+      assert {:codex, :opencode_disabled} = SymphonyElixir.HarnessSelection.select(authorized, %{"enabled" => false})
+
+      # The dispatch boundary consumes the selector: with the pilot section
+      # configured, the orchestrator's per-dispatch decision selects OpenCode
+      # for the authorized issue and Codex for every other issue.
+      write_workflow_file!(
+        Workflow.workflow_file_path(),
+        opencode_enabled: true,
+        opencode_provider: "opencode-go",
+        opencode_model: "muse-spark-1.3-contributor",
+        opencode_allowed_tools: ["read"],
+        opencode_allowed_issues: ["MIC-SEL-1"]
       )
+
+      assert {:opencode, pilot_selection} = Orchestrator.dispatch_harness_for_test(authorized)
+      assert pilot_selection.provider == "opencode-go"
+      assert pilot_selection.model == "muse-spark-1.3-contributor"
+
+      assert {:codex, :issue_not_authorized} = Orchestrator.dispatch_harness_for_test(unauthorized)
+
+      # Route materialization stays Codex-shaped: harness selection is a
+      # separate dispatch decision, not a Selection field.
+      selection = SymphonyElixir.DispatchRouter.materialize(:primary, authorized, [])
+      refute Map.has_key?(Map.from_struct(selection), :worker_type)
     end
   end
 end

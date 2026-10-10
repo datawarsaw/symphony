@@ -1428,15 +1428,80 @@ defmodule SymphonyElixir.Orchestrator do
 
     route = current_dispatch_route(state, issue.id)
 
+    # M1-D: the harness is selected ONCE per dispatch attempt, from the same
+    # already-refreshed issue the route intent was decided for, and the
+    # decision (including the pinned OpenCode pilot identity it selected on)
+    # is carried immutably through dispatch opts. AgentRunner never
+    # re-resolves it, so no later configuration change can swap the harness
+    # under a running attempt, and a selected OpenCode worker is never
+    # silently replaced by Codex mid-flight.
+    case dispatch_harness(issue) do
+      {:opencode, pilot} ->
+        Logger.info(
+          "Dispatch harness selected for #{issue_context(issue)} harness=opencode " <>
+            "provider=#{pilot.provider} model=#{pilot.model} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
+        )
+
+        spawn_with_selection(
+          state,
+          issue,
+          attempt,
+          recipient,
+          worker_host,
+          resumed?,
+          route,
+          :opencode,
+          dispatch_opts ++ [harness: :opencode, opencode: pilot]
+        )
+
+      {:codex, harness_reason} ->
+        dispatch_codex_issue(state, issue, attempt, recipient, worker_host, resumed?, route, dispatch_opts, harness_reason)
+    end
+  end
+
+  # One harness decision per dispatch attempt. HarnessSelection is the pure
+  # production selector: OpenCode only for an explicitly enabled, complete,
+  # issue-authorized pilot section; every disabled, incomplete, unauthorized,
+  # or unreadable configuration fails closed to the default Codex harness.
+  # The returned pilot struct is the dispatch-time snapshot AgentRunner pins
+  # the launch to (provider, model, tool allowlist, timeout) so a WORKFLOW.md
+  # reload between dispatch and launch cannot change the selected identity.
+  defp dispatch_harness(%Issue{} = issue) do
+    case Config.settings() do
+      {:ok, %{opencode: opencode}} ->
+        case SymphonyElixir.HarnessSelection.select(issue, opencode) do
+          {:opencode, :opencode_selected} -> {:opencode, opencode}
+          {:codex, reason} -> {:codex, reason}
+        end
+
+      _unavailable ->
+        {:codex, :settings_unavailable}
+    end
+  rescue
+    _error -> {:codex, :opencode_settings_unreadable}
+  end
+
+  defp dispatch_codex_issue(%State{} = state, issue, attempt, recipient, worker_host, resumed?, route, dispatch_opts, harness_reason) do
     case DispatchRouter.materialize(route, issue, dispatch_opts) do
       %DispatchRouter.Selection{} = dispatch_selection ->
         Logger.info(
           "Dispatch route materialized for #{issue_context(issue)} intent=#{route} model=#{dispatch_selection.model} " <>
             "reasoning_effort=#{dispatch_selection.reasoning_effort} route_source=#{dispatch_selection.route_source} " <>
-            "pinned=#{dispatch_selection.pinned} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
+            "pinned=#{dispatch_selection.pinned} harness=codex harness_reason=#{inspect(harness_reason)} " <>
+            "attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
         )
 
-        spawn_with_selection(state, issue, attempt, recipient, worker_host, resumed?, route, dispatch_selection, dispatch_opts)
+        spawn_with_selection(
+          state,
+          issue,
+          attempt,
+          recipient,
+          worker_host,
+          resumed?,
+          route,
+          :codex,
+          dispatch_opts ++ [dispatch_selection: dispatch_selection]
+        )
 
       {:error, reason} ->
         handle_dispatch_route_materialization_error(state, issue, attempt, worker_host, route, reason)
@@ -1455,15 +1520,15 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp spawn_with_selection(%State{} = state, issue, attempt, recipient, worker_host, resumed?, route, dispatch_selection, dispatch_opts) do
+  defp spawn_with_selection(%State{} = state, issue, attempt, recipient, worker_host, resumed?, route, harness, dispatch_opts) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, dispatch_opts ++ [dispatch_selection: dispatch_selection])
+           AgentRunner.run(issue, recipient, dispatch_opts)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
         resumed_log = if resumed?, do: " (resumed)", else: ""
-        Logger.info("Dispatching issue to agent#{resumed_log}: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+        Logger.info("Dispatching issue to agent#{resumed_log}: #{issue_context(issue)} pid=#{inspect(pid)} harness=#{harness} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
         running =
           Map.put(state.running, issue.id, %{
@@ -1474,6 +1539,10 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: nil,
             workspace_root: nil,
+            # M1-D: the dispatch-time harness decision rides with the running
+            # entry so lifecycle, retry, and observability paths can see which
+            # harness owns the attempt without re-resolving configuration.
+            harness: harness,
             # MIC-223: the pre-launch termination expectation. Set BEFORE risky
             # worker execution via the same canonical predicate AppServer uses
             # to create the worker identity, so a managed attempt whose
@@ -2330,6 +2399,10 @@ defmodule SymphonyElixir.Orchestrator do
   def next_dispatch_route_for_test(%State{} = state, issue_id) when is_binary(issue_id) do
     current_dispatch_route(state, issue_id)
   end
+
+  @doc false
+  @spec dispatch_harness_for_test(Issue.t()) :: {:opencode, term()} | {:codex, atom()}
+  def dispatch_harness_for_test(%Issue{} = issue), do: dispatch_harness(issue)
 
   @spec note_failure(term(), String.t(), term()) ::
           {:retry | {:park, atom()}, atom(), map(), term()}

@@ -108,7 +108,11 @@ defmodule SymphonyElixir.OpenCode.Adapter do
             attempt_id: Keyword.get(opts, :attempt_id),
             workspace: canonical_workspace,
             worker_host: nil,
-            authority_root: Keyword.get(opts, :authority_root)
+            authority_root: Keyword.get(opts, :authority_root),
+            # M1-D: the durable marker names the harness that owns the launch
+            # so reuse/cleanup/audit paths can distinguish an OpenCode launch
+            # from a Codex launch without inferring it from the executable.
+            harness: :opencode
           )
         else
           nil
@@ -535,12 +539,14 @@ defmodule SymphonyElixir.OpenCode.Adapter do
 
   @doc """
   Resolves the OpenCode executable path.
-  Prioritizes explicit \`executable\` in opts, then looks for \`opencode.exe\` on Windows
+  Prioritizes explicit \`executable\` in opts, then the
+  \`:opencode_executable\` app env override (explicit test/tool seam, mirroring
+  \`:jobrun_helper_path\`), then looks for \`opencode.exe\` on Windows
   or \`opencode\` in PATH.
   """
   @spec resolve_executable(keyword()) :: {:ok, String.t()} | {:error, term()}
   def resolve_executable(opts \\ []) do
-    case Keyword.get(opts, :executable) do
+    case Keyword.get(opts, :executable) || Application.get_env(:symphony_elixir, :opencode_executable) do
       path when is_binary(path) and path != "" ->
         validate_executable_path(path)
 

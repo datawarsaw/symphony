@@ -1,6 +1,10 @@
 defmodule SymphonyElixir.AgentRunner do
   @moduledoc """
-  Executes a single tracker work item in its workspace with Codex.
+  Executes a single tracker work item in its workspace with the harness
+  selected at dispatch time: Codex by default, or the OpenCode adapter for an
+  issue the HarnessSelection gate explicitly authorized. The harness decision
+  arrives pinned in the dispatch opts and is never re-resolved here, so a
+  selected OpenCode worker is never silently replaced by Codex.
   """
 
   require Logger
@@ -71,8 +75,7 @@ defmodule SymphonyElixir.AgentRunner do
       {:error, reason} ->
         publish_launch_never_started(codex_update_recipient, issue, worker_host)
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        info = AppServer.failure_info({:error, reason})
-        class = classify_failure(reason, info)
+        {class, info} = failure_classification(opts, reason)
 
         raise FailureError,
           message: "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}",
@@ -81,6 +84,28 @@ defmodule SymphonyElixir.AgentRunner do
           reason: reason
     end
   end
+
+  # M1-D no-silent-fallback: the harness decided at dispatch time owns the
+  # failure taxonomy. An OpenCode dispatch classifies through OpenCode.Failure
+  # (never the Codex AppServer reason mapper), so an OpenCode error retries or
+  # parks inside the same retry envelope without ever being reinterpreted as,
+  # or silently replaced by, a Codex worker.
+  defp failure_classification(opts, reason) do
+    if opencode_dispatch?(opts) do
+      info = opencode_failure_info(reason)
+      {SymphonyElixir.FailureClass.classify(info), info}
+    else
+      info = AppServer.failure_info({:error, reason})
+      {classify_failure(reason, info), info}
+    end
+  end
+
+  # Adapter errors carry the structured failure map the adapter already
+  # classified ({reason, result_with_failure_info}); pre-launch errors are
+  # bare reasons OpenCode.Failure maps itself. Both stay redacted: the map
+  # comes from OpenCode.Failure.failure_info/1, which redacts on construction.
+  defp opencode_failure_info({_reason, %{failure_info: info}}) when is_map(info), do: info
+  defp opencode_failure_info(reason), do: SymphonyElixir.OpenCode.Failure.failure_info(reason)
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     if Discovery.discovery?(issue) do
@@ -104,7 +129,12 @@ defmodule SymphonyElixir.AgentRunner do
                root_opts <- workspace_root_opts(opts),
                {:ok, provenance} <- Workspace.capture_provenance(workspace, issue, worker_host, route, root_opts) do
             log_workspace_provenance(issue, provenance)
-            run_codex_turns(workspace, workspace_root, issue, codex_update_recipient, opts, worker_host, provenance)
+
+            if opencode_dispatch?(opts) do
+              run_opencode_worker(workspace, issue, codex_update_recipient, opts, worker_host, provenance)
+            else
+              run_codex_turns(workspace, workspace_root, issue, codex_update_recipient, opts, worker_host, provenance)
+            end
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -114,6 +144,120 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason}
     end
   end
+
+  # M1-D: the OpenCode harness path. The dispatch-time decision arrives as
+  # `harness: :opencode` plus the pinned pilot snapshot; this branch NEVER
+  # falls back to the Codex path, on any error — a broken snapshot fails
+  # closed as a classified failure and the orchestrator's retry envelope
+  # decides what happens next.
+  defp run_opencode_worker(workspace, issue, codex_update_recipient, opts, worker_host, provenance) do
+    case opencode_launch_settings(opts) do
+      {:ok, opencode} ->
+        prompt = build_turn_prompt(issue, opts, provenance, 1, 1)
+
+        adapter_opts = [
+          provider: opencode.provider,
+          model: opencode.model,
+          allowed_tools: opencode.allowed_tools,
+          timeout_ms: opencode.timeout_ms,
+          worker_host: worker_host,
+          issue_id: issue.id,
+          attempt_id: Keyword.get(opts, :attempt),
+          identifier: issue.identifier,
+          authority_root: Keyword.get(opts, :authority_root),
+          on_event: worker_event_callback(codex_update_recipient, issue)
+        ]
+
+        Logger.info(
+          "Starting OpenCode worker attempt for #{issue_context(issue)} " <>
+            "provider=#{opencode.provider} model=#{opencode.model} worker_host=#{worker_host_for_log(worker_host)}"
+        )
+
+        result = SymphonyElixir.OpenCode.run(workspace, prompt, adapter_opts)
+
+        # MIC-223 ordering: the adapter's termination confirmation is the
+        # evidence channel for the orchestrator's reuse gate. It must be
+        # published from this task process BEFORE it exits — on success and
+        # failure alike — so the DOWN handler never sees a managed attempt
+        # with missing termination evidence.
+        report_opencode_termination(codex_update_recipient, issue, result)
+
+        case result do
+          {:ok, run_result} ->
+            Logger.info(
+              "Completed OpenCode worker run for #{issue_context(issue)} session_id=#{inspect(run_result[:session_id])} " <>
+                "completion_state=#{inspect(run_result[:completion_state])} " <>
+                "usage_total=#{opencode_usage_total(run_result)} termination=#{inspect(opencode_termination_status(run_result))}"
+            )
+
+            :ok
+
+          {:error, reason} ->
+            Logger.error("OpenCode worker run failed for #{issue_context(issue)}: #{inspect(reason)}")
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # The pinned dispatch-time pilot snapshot. Only the validated schema struct
+  # materialized by the orchestrator's harness selection is accepted; anything
+  # else (missing section, bare map, unlocked identity, non-positive timeout)
+  # fails closed rather than launching an OpenCode worker with unresolved
+  # provider/model/tools or an unbounded execution budget.
+  defp opencode_launch_settings(opts) do
+    case Keyword.get(opts, :opencode) do
+      %SymphonyElixir.Config.Schema.OpenCode{
+        provider: provider,
+        model: model,
+        allowed_tools: tools,
+        timeout_ms: timeout_ms
+      }
+      when is_binary(provider) and provider != "" and is_binary(model) and model != "" and is_list(tools) and tools != [] and
+             is_integer(timeout_ms) and timeout_ms > 0 ->
+        {:ok, %SymphonyElixir.Config.Schema.OpenCode{provider: provider, model: model, allowed_tools: tools, timeout_ms: timeout_ms}}
+
+      invalid ->
+        {:error, {:opencode_launch_settings_invalid, invalid}}
+    end
+  end
+
+  defp report_opencode_termination(recipient, issue, result) do
+    send_worker_termination_info(recipient, issue, %{
+      # The durable launch marker (written by the adapter before the child
+      # existed) is the identity authority for reuse/cleanup fences; the
+      # in-memory channel carries the adapter's termination confirmation so
+      # the orchestrator's reuse gate sees fence-grade evidence, never
+      # streaming events alone.
+      worker_identity: nil,
+      worker_termination: opencode_termination_confirmation(result)
+    })
+  end
+
+  defp opencode_termination_confirmation({_status, %{} = run_result}) when is_map_key(run_result, :termination),
+    do: Map.get(run_result, :termination)
+
+  defp opencode_termination_confirmation({_status, {_reason, %{} = run_result}})
+       when is_map_key(run_result, :termination),
+    do: Map.get(run_result, :termination)
+
+  defp opencode_termination_confirmation(_other), do: nil
+
+  defp opencode_usage_total(run_result) do
+    usage = Map.get(run_result, :usage) || %{}
+    Map.get(usage, :total_tokens) || Map.get(usage, "total_tokens") || 0
+  end
+
+  defp opencode_termination_status(run_result) do
+    case Map.get(run_result, :termination) do
+      %{status: status} -> status
+      _other -> nil
+    end
+  end
+
+  defp opencode_dispatch?(opts), do: Keyword.get(opts, :harness) == :opencode
 
   # The orchestrator's boot-pinned mutation roots, translated into Workspace
   # option names. Absent in unpinned contexts, where configuration resolves
