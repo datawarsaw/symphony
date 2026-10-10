@@ -201,3 +201,51 @@ Validated for the MIC-221 + MIC-224 integration (Windows, Elixir 1.19.5 / OTP 28
 - `git diff --check` and `git diff --cached --check` pass.
 
 Baseline comparison ran in a separate clone of the same repository bundle checked out at `c540a299`, with the same TEMP override and the same seed. The integration introduces no new failure on this host.
+
+## M1-C OpenCode configuration and routing gate candidate — 2026-10-10
+
+Branch `codex/m1-c-opencode-config-routing-gate`, base `c90e2ad71a70310e6d71b94777f6cbaca081b6c5` (the accepted
+baseline, equal to `origin/main`), worktree `C:/AI/symphony-workspaces/m1-c-opencode-config-routing-gate`.
+Implementation commit `371687c`. Implementation-only candidate; no push, PR, merge, deployment, or
+Linear write was performed, and the deployed runtime configuration is unchanged.
+
+- New optional `opencode` front-matter section in `Config.Schema`: `enabled` (default false), explicit
+  `provider` and `model` identity, a bounded `timeout_ms` (default 900000), an explicit
+  `allowed_tools` allowlist, and an optional `allowed_issues` pilot scope. The section carries no
+  command, credential, environment, or provider-fallback field.
+- Validation fails closed. While `enabled` is true, `provider` and `model` must be non-blank and
+  `allowed_tools` must be non-empty. Wildcard or unrestricted tool grants (`*`, `all`, `any`, `auto`,
+  `auto_approve`, `unrestricted`, case-insensitive) and blank allowlist entries are rejected whether
+  or not the section is enabled; a non-positive or non-numeric `timeout_ms` is rejected. An empty
+  `allowed_issues` list validates but authorizes no issue.
+- `HarnessSelection.select/2` is the pure policy: `{:opencode, :opencode_selected}` only when the section
+  is enabled, fully specified, and the issue identifier is listed; `{:codex, reason}` otherwise,
+  with reason in `:opencode_disabled`, `:opencode_incomplete`, `:issue_not_authorized`, or
+  `:invalid_opencode_config`. It reads only its two arguments, launches no process, writes no
+  state, and leaves dispatch, retry, and containment gates untouched.
+- Configuration and policy only. No dispatch integration was performed: AgentRunner,
+  Orchestrator, WorkerContainment, LaunchMarker, DispatchRouter, the OpenCode adapter branches,
+  `WORKFLOW.md`, and the deployed runtime configuration are untouched. OpenCode remains
+  unreachable until a separate later step wires the decision in.
+
+Validated on this host (Windows, Elixir 1.19.5 / OTP 28):
+
+- `mix compile --warnings-as-errors` passes.
+- `mix specs.check` passes and `mix format --check-formatted` (whole project) passes.
+- New focused suites: 27 tests, 0 failures; `mix test --cover` reports 100% line coverage for
+  `SymphonyElixir.HarnessSelection` and `SymphonyElixir.Config.Schema.OpenCode`.
+- Focused routing regression at seed 424242 (the two new suites plus dispatch_router_test,
+  worker_routing_test, fallback_routing_test, fallback_policy_test): 123 tests, 21 failures. The
+  pristine `c90e2ad` baseline on this host gives 96 tests with the identical 21 failing
+  FallbackRoutingTest names; no introduced failure.
+- Config regression at seed 424242 (workspace_and_config_test, core_test, extensions_test,
+  source_canonicality_test): 139 tests, 12 failures with a failure-name set identical to the
+  pristine baseline at the same seed (pre-existing CoreTest and WorkspaceAndConfigTest host and
+  sandbox failures).
+- `mix lint` (credo --strict) exits 30 on both candidate and pristine baseline with identical
+  finding counts (9 warnings, 37 refactoring, 76 readability, 4 design); no finding points at a
+  changed file. `git diff --check` is clean.
+
+The broad Windows test processes printed their complete ExUnit summaries and stayed open; they were
+interrupted after results were captured, so their process exits are not claimed as successful.
+Dispatch integration and independent exact-head review remain the next separate steps.
