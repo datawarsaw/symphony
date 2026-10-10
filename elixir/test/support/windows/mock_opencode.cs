@@ -22,6 +22,8 @@ class MockOpenCode
         string grandchildExe = null;
         string grandchildArgs = null;
         string stopFile = null;
+        string partsDir = null;
+        int partDelayMs = 0;
 
         foreach (var arg in args)
         {
@@ -48,6 +50,8 @@ class MockOpenCode
                 else if (line.StartsWith("exit_code=")) int.TryParse(line.Substring(10).Trim(), out exitCode);
                 else if (line.StartsWith("tokens_in=")) int.TryParse(line.Substring(10).Trim(), out tokensIn);
                 else if (line.StartsWith("tokens_out=")) int.TryParse(line.Substring(11).Trim(), out tokensOut);
+                else if (line.StartsWith("parts_dir=")) partsDir = line.Substring(10).Trim();
+                else if (line.StartsWith("part_delay_ms=")) int.TryParse(line.Substring(14).Trim(), out partDelayMs);
             }
         }
 
@@ -100,6 +104,30 @@ class MockOpenCode
                 Path.Combine(Directory.GetCurrentDirectory(), "opencode-argv.json"),
                 EncodeArgs(args));
             WriteSuccess(sessionId, tokensIn, tokensOut, tokensReasoning, cacheRead, cacheWrite, cost);
+            return exitCode;
+        }
+
+        if (mode == "emit-parts")
+        {
+            // Writes author-controlled stdout parts byte-exactly: every *.part file
+            // in parts_dir (ordinal name order) becomes exactly one flushed write,
+            // spaced by part_delay_ms so the consumer observes the intended chunk
+            // boundaries. A missing or empty directory writes nothing.
+            if (!string.IsNullOrEmpty(partsDir) && Directory.Exists(partsDir))
+            {
+                string[] files = Directory.GetFiles(partsDir, "*.part");
+                Array.Sort(files, StringComparer.Ordinal);
+                using (Stream stdout = Console.OpenStandardOutput())
+                {
+                    foreach (string file in files)
+                    {
+                        byte[] payload = File.ReadAllBytes(file);
+                        stdout.Write(payload, 0, payload.Length);
+                        stdout.Flush();
+                        if (partDelayMs > 0) Thread.Sleep(partDelayMs);
+                    }
+                }
+            }
             return exitCode;
         }
 
