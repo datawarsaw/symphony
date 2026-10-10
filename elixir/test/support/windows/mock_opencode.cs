@@ -119,6 +119,7 @@ class MockOpenCode
 
         if (mode == "malformed-secret")
         {
+            // Raw secret bytes. This mode does not redact.
             Console.WriteLine("{\"type\":\"tool_use\",\"broken\":\"sk-ant-api03-abcdefghijklmnopqrstuvwxyz LINEAR_API_KEY=lin_api_abcdefghijklmnopqrstuvwxyz");
             Console.Out.Flush();
             WriteSuccess(sessionId, tokensIn, tokensOut, tokensReasoning, cacheRead, cacheWrite, cost);
@@ -152,6 +153,7 @@ class MockOpenCode
 
         if (mode == "secret")
         {
+            // Valid JSON and stderr both keep the raw secret. Redaction is not done here.
             WriteToolUse(sessionId, "toolu_secret", "msg_secret", "read", "call_secret", "completed", "sk-ant-api03-abcdefghijklmnopqrstuvwxyz LINEAR_API_KEY=lin_api_abcdefghijklmnopqrstuvwxyz");
             WriteStepFinish(sessionId, "stop", "msg_secret", 10, 20, 0, 0, 0, 0.0);
             Console.Out.Flush();
@@ -185,6 +187,7 @@ class MockOpenCode
 
         if (mode == "error")
         {
+            // Observed process failure only. This does not apply a no-fallback policy.
             Console.WriteLine("{\"type\":\"error\",\"timestamp\":1700000000000,\"sessionID\":\"" + sessionId + "\",\"error\":{\"name\":\"ModelNotFoundError\",\"data\":{\"message\":\"Model not found: test/not-found\"} }}");
             Console.Out.Flush();
             return (exitCode != 0) ? exitCode : 1;

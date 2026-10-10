@@ -11,6 +11,7 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
   alias SymphonyElixir.TestSupport.ScratchProcess
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkerContainment
+  alias SymphonyElixir.DispatchRouter
 
   setup do
     workspace =
@@ -124,7 +125,7 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
       assert tool_event["part"]["state"]["error"] == "permission denied"
     end
 
-    test "simulates malformed JSONL without parser crash and exposes secret for redaction", %{workspace: ws} do
+    test "malformed-secret fixture emits raw secrets and does not redact them", %{workspace: ws} do
       {output, exit_code} =
         OpenCodeWorkerFixture.run_mock_direct(ws, [
           "--mock-mode=malformed-secret"
@@ -133,11 +134,20 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
       assert exit_code == 0
       lines = String.split(output, ["\r\n", "\n"], trim: true)
 
-      assert Enum.any?(lines, fn line ->
-               String.contains?(line, "sk-ant-api03-") and String.contains?(line, "LINEAR_API_KEY=")
-             end)
+      markers = OpenCodeWorkerFixture.raw_secret_markers()
 
-      # Valid terminal JSON line is also emitted
+      broken =
+        Enum.find(lines, fn line ->
+          String.contains?(line, markers.anthropic) and String.contains?(line, "LINEAR_API_KEY=")
+        end)
+
+      assert is_binary(broken)
+      assert broken =~ markers.linear
+      assert {:error, _reason} = Jason.decode(broken)
+      refute output =~ "[redacted]"
+
+      # The mock still appends a valid terminal line. Decoding that line here
+      # is not the production parser, and the raw secret above was not removed.
       valid_finishes =
         Enum.filter(lines, fn line ->
           case Jason.decode(line) do
@@ -147,6 +157,68 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
         end)
 
       assert length(valid_finishes) >= 1
+    end
+
+    test "secret fixture emits raw secrets on stdout and stderr", %{workspace: ws} do
+      {output, exit_code} =
+        OpenCodeWorkerFixture.run_mock_direct(ws, [
+          "--mock-mode=secret"
+        ])
+
+      assert exit_code == 0
+      markers = OpenCodeWorkerFixture.raw_secret_markers()
+      lines = output_lines(output)
+
+      assert output =~ markers.anthropic
+      assert output =~ "LINEAR_API_KEY="
+      assert output =~ markers.linear
+      assert output =~ "stderr " <> markers.anthropic
+      refute output =~ "[redacted]"
+
+      secret_tool =
+        Enum.find_value(lines, fn line ->
+          case Jason.decode(line) do
+            {:ok, %{"type" => "tool_use"} = map} -> map
+            _ -> nil
+          end
+        end)
+
+      assert secret_tool["part"]["state"]["output"] =~ markers.anthropic
+      assert secret_tool["part"]["state"]["output"] =~ markers.linear
+    end
+
+    test "error mode observes a nonzero exit and error event without proving no-fallback", %{
+      workspace: ws
+    } do
+      {output, exit_code} =
+        OpenCodeWorkerFixture.run_mock_direct(ws, [
+          "--mock-mode=error"
+        ])
+
+      assert exit_code == 1
+
+      assert OpenCodeWorkerFixture.process_failure_scope() == %{
+               observed: :process_failure,
+               production_no_fallback: :unwired
+             }
+
+      error_event =
+        Enum.find_value(output_lines(output), fn line ->
+          case Jason.decode(line) do
+            {:ok, %{"type" => "error"} = map} -> map
+            _ -> nil
+          end
+        end)
+
+      assert error_event["error"]["name"] == "ModelNotFoundError"
+      assert error_event["error"]["data"]["message"] =~ "Model not found"
+
+      refute Enum.any?(output_lines(output), fn line ->
+               case Jason.decode(line) do
+                 {:ok, %{"type" => "step_finish"}} -> true
+                 _ -> false
+               end
+             end)
     end
 
     test "simulates interrupted execution with non-zero exit and missing terminal event", %{workspace: ws} do
@@ -278,7 +350,7 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
         end)
 
       assert is_integer(grandchild_pid)
-      assert OpenCodeWorkerFixture.pid_alive?(grandchild_pid)
+      assert OpenCodeWorkerFixture.pid_liveness(grandchild_pid) == :alive
 
       # Now stop and confirm the parent session through Job Object containment
       confirmation = OpenCodeWorkerFixture.stop_and_confirm_worker(session, 2000)
@@ -288,6 +360,31 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
 
       # Both parent wrapper AND grandchild process must be dead!
       assert OpenCodeWorkerFixture.assert_no_orphaned_processes([session.wrapper_pid, grandchild_pid]) == :ok
+    end
+  end
+
+  describe "PID liveness probe" do
+    test "tasklist failure is unknown and is not treated as a clean tree" do
+      failing = fn _args -> {"tasklist failed", 1} end
+      quoted_other = fn _args -> {~S["other.exe","11","Console","1","1 K"], 0} end
+      empty = fn _args -> {"", 0} end
+      missing = fn _args -> raise "tasklist missing" end
+      healthy_miss = fn _args -> {"INFO: No tasks are running which match the specified criteria.", 0} end
+      alive = fn _args -> {~S["mock_opencode.exe","4242","Console"], 0} end
+
+      assert OpenCodeWorkerFixture.pid_liveness(4242, probe: failing) == :unknown
+      assert OpenCodeWorkerFixture.pid_liveness(4242, probe: quoted_other) == :unknown
+      assert OpenCodeWorkerFixture.pid_liveness(4242, probe: empty) == :unknown
+      assert OpenCodeWorkerFixture.pid_liveness(4242, probe: missing) == :unknown
+      assert OpenCodeWorkerFixture.pid_liveness(0, probe: healthy_miss) == :unknown
+      assert OpenCodeWorkerFixture.pid_liveness(4242, probe: healthy_miss) == :gone
+      assert OpenCodeWorkerFixture.pid_liveness(4242, probe: alive) == :alive
+
+      assert {:probe_unknown, [4242]} =
+               OpenCodeWorkerFixture.assert_no_orphaned_processes([4242],
+                 timeout_ms: 0,
+                 probe: failing
+               )
     end
   end
 
@@ -328,6 +425,64 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
       refute File.exists?(marker_path)
       assert LaunchMarker.reuse_gate(issue_id, root: mr) == :allowed
     end
+
+    test "simulated interruption keeps the LaunchMarker blocked and is not BEAM recovery", %{
+      workspace: ws,
+      marker_root: mr
+    } do
+      issue_id = "ISSUE-INTERRUPTED-#{System.unique_integer([:positive])}"
+
+      identity =
+        WorkerContainment.new_identity(
+          issue_id: issue_id,
+          attempt_id: 1,
+          workspace: ws,
+          worker_host: nil
+        )
+
+      :ok = LaunchMarker.record(identity, identifier: issue_id, root: mr)
+
+      :ok =
+        LaunchMarker.record_wrapper_identity(
+          Map.put(identity, "wrapper_pid", "999999"),
+          identifier: issue_id,
+          root: mr
+        )
+
+      {output, exit_code} =
+        OpenCodeWorkerFixture.run_mock_direct(ws, [
+          "--mock-mode=interrupted",
+          "--mock-exit-code=130"
+        ])
+
+      assert exit_code == 130
+      assert output =~ "partial text before sudden interruption"
+
+      refute Enum.any?(output_lines(output), fn line ->
+               case Jason.decode(line) do
+                 {:ok, %{"type" => "step_finish"}} -> true
+                 _ -> false
+               end
+             end)
+
+      assert {:ok, stored} = LaunchMarker.read(issue_id, root: mr)
+      assert stored["issue_id"] == issue_id
+      assert stored["worker_identity"]["wrapper_pid"] == "999999"
+      assert LaunchMarker.fence_verdict(issue_id, root: mr) == {:error, :unknown}
+
+      assert LaunchMarker.reuse_gate(issue_id, root: mr) ==
+               {:blocked, :worker_termination_unproven}
+
+      assert LaunchMarker.cleanup_gate(issue_id, root: mr) ==
+               {:blocked, :worker_termination_unproven}
+
+      assert File.exists?(LaunchMarker.marker_path(issue_id, root: mr))
+
+      assert OpenCodeWorkerFixture.interruption_scope() == %{
+               kind: :simulated_process_exit,
+               beam_restart_recovery: :not_exercised
+             }
+    end
   end
 
   # ===========================================================================
@@ -345,6 +500,8 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
       route = OpenCodeWorkerFixture.resolve_worker_route([opencode_enabled: true], issue)
 
       assert route.worker_type == :opencode
+      assert route.authority == :fixture_only
+      assert route.production_dispatch_router == :not_consulted
       assert route.model == "claude-3-5-sonnet"
       assert route.route_source == :explicit_override
     end
@@ -359,6 +516,8 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
       # opencode_enabled: false
       route = OpenCodeWorkerFixture.resolve_worker_route([opencode_enabled: false], issue)
 
+      assert route.authority == :fixture_only
+      assert route.production_dispatch_router == :not_consulted
       assert route.worker_type == :codex
       assert route.model == "gpt-6-astra"
       assert route.reasoning_effort == "medium"
@@ -379,10 +538,35 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
         )
 
       assert route.worker_type == :opencode
+      assert route.authority == :fixture_only
       assert route.model == "claude-3-5-sonnet"
     end
+
+    test "production DispatchRouter selection is not the fixture route" do
+      issue = %Issue{
+        id: "issue-router",
+        identifier: "MIC-OC-R",
+        labels: ["worker:opencode", "model:claude-3-5-sonnet"]
+      }
+
+      fixture_route = OpenCodeWorkerFixture.resolve_worker_route([opencode_enabled: true], issue)
+      assert fixture_route.worker_type == :opencode
+      assert fixture_route.authority == :fixture_only
+      assert fixture_route.production_dispatch_router == :not_consulted
+
+      selection = DispatchRouter.materialize(:primary, issue, [])
+
+      assert %DispatchRouter.Selection{route: :primary} = selection
+      refute Map.has_key?(Map.from_struct(selection), :worker_type)
+      assert selection.model == "claude-3-5-sonnet"
+      assert selection.route_source == :explicit_override
+    end
+  end
+
+  defp output_lines(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.trim_trailing(&1, "\r"))
+    |> Enum.reject(&(&1 == ""))
   end
 end
-
-
-

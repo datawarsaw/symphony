@@ -14,16 +14,21 @@ defmodule SymphonyElixir.TestSupport.OpenCodeWorkerFixture do
       * confirmed and unconfirmed process termination
   - Cumulative token and cost accounting verification across multi-step turns.
   - Windows Job Object containment and process termination assertions.
-  - No orphaned process verification via OS tasklist probing.
+  - Tri-state OS PID probing. A failed tasklist probe is `:unknown`, never death.
   - LaunchMarker lifecycle gate verification (pre-launch record, wrapper pid refresh,
     confirmed cleanup, fail-closed unconfirmed retention).
-  - Issue-to-worker routing resolution and fail-safe rollback to Codex.
+  - Fixture-only issue routing. This is not `DispatchRouter` selection.
   """
 
   alias SymphonyElixir.LaunchMarker
   alias SymphonyElixir.TestSupport.MockOpenCode
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.WorkerContainment
+
+  @raw_secret "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+  @raw_linear "lin_api_abcdefghijklmnopqrstuvwxyz"
+
+  @type pid_liveness :: :alive | :gone | :unknown
 
   # ---------------------------------------------------------------------------
   # Fixture Build & Path
@@ -254,7 +259,7 @@ defmodule SymphonyElixir.TestSupport.OpenCodeWorkerFixture do
 
   @spec malformed_jsonl(keyword()) :: String.t()
   def malformed_jsonl(opts \\ []) do
-    secret = Keyword.get(opts, :secret, "sk-ant-api03-abcdefghijklmnopqrstuvwxyz LINEAR_API_KEY=lin_api_abcdefghijklmnopqrstuvwxyz")
+    secret = Keyword.get(opts, :secret, raw_secret_fixture())
 
     """
     not-json-line-corrupted-stream
@@ -275,7 +280,9 @@ defmodule SymphonyElixir.TestSupport.OpenCodeWorkerFixture do
       jsonl_or_events
       |> String.split(["
 ", "
-"], trim: true)
+"],
+        trim: true
+      )
       |> Enum.flat_map(fn line ->
         case Jason.decode(line) do
           {:ok, map} -> [map]
@@ -468,54 +475,112 @@ defmodule SymphonyElixir.TestSupport.OpenCodeWorkerFixture do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Probes whether an OS PID is alive using Windows tasklist.
+  Tri-state OS PID probe aligned with `WorkerContainment.wrapper_liveness/1`.
+
+  `:gone` requires a healthy tasklist answer that does not list the PID.
+  A non-zero exit, a missing command, an exception, empty output, or CSV rows
+  that do not carry the probed PID return `:unknown`. `:unknown` is not
+  death. This function never raises.
+
+  `probe` replaces the tasklist invocation in tests. It receives the argv
+  and returns `{output, exit_code}`.
   """
-  @spec pid_alive?(integer()) :: boolean()
-  def pid_alive?(pid) when is_integer(pid) do
-    {output, 0} =
-      System.cmd("tasklist", ["/FI", "PID eq #{pid}", "/NH", "/FO", "CSV"], stderr_to_stdout: true)
+  @spec pid_liveness(term(), keyword()) :: pid_liveness()
+  def pid_liveness(pid, opts \\ [])
 
-    Regex.match?(~r/"#{pid}"/, output)
-  end
+  def pid_liveness(pid, opts) when is_integer(pid) and pid > 0 and is_list(opts) do
+    args = ["/FI", "PID eq #{pid}", "/NH", "/FO", "CSV"]
+    probe = Keyword.get(opts, :probe, &default_tasklist_probe/1)
 
-  @doc """
-  Awaits until the given PID exits, or times out. Returns true if gone, false if still alive.
-  """
-  @spec await_pid_gone(integer(), integer()) :: boolean()
-  def await_pid_gone(pid, timeout_ms \\ 10_000) when is_integer(pid) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-    do_await_pid_gone(pid, deadline)
-  end
-
-  defp do_await_pid_gone(pid, deadline) do
-    if pid_alive?(pid) do
-      if System.monotonic_time(:millisecond) >= deadline do
-        false
-      else
-        Process.sleep(100)
-        do_await_pid_gone(pid, deadline)
+    probe_result =
+      try do
+        case probe.(args) do
+          {output, 0} when is_binary(output) -> {:ok, output}
+          _ -> :probe_failed
+        end
+      rescue
+        _ -> :probe_failed
+      catch
+        _, _ -> :probe_failed
       end
-    else
-      true
+
+    case probe_result do
+      {:ok, output} -> classify_tasklist_output(pid, output)
+      :probe_failed -> :unknown
+    end
+  end
+
+  def pid_liveness(_pid, _opts), do: :unknown
+
+  defp default_tasklist_probe(args) do
+    System.cmd("tasklist", args, stderr_to_stdout: true)
+  end
+
+  # Same acceptance rule as WorkerContainment.wrapper_liveness/1: exit 0 with
+  # no output, or quoted rows that are not the probed PID, is not absence.
+  defp classify_tasklist_output(os_pid, output) do
+    cond do
+      Regex.match?(~r/"#{os_pid}"/, output) -> :alive
+      output == "" -> :unknown
+      String.contains?(output, "\"") -> :unknown
+      true -> :gone
     end
   end
 
   @doc """
-  Verifies that none of the provided PIDs are alive.
-  """
-  @spec assert_no_orphaned_processes([integer() | nil]) :: :ok | {:orphans_detected, [integer()]}
-  def assert_no_orphaned_processes(pids) when is_list(pids) do
-    valid_pids = Enum.reject(pids, &is_nil/1)
+  Polls until tasklist positively reports the PID gone, or the timeout elapses.
 
-    alive =
-      Enum.filter(valid_pids, fn pid ->
-        not await_pid_gone(pid, 3000)
+  The return value is the tri-state itself. `:unknown` is never coerced to
+  `:gone`.
+  """
+  @spec await_pid_liveness(integer(), keyword()) :: pid_liveness()
+  def await_pid_liveness(pid, opts \\ []) when is_integer(pid) and is_list(opts) do
+    timeout_ms = Keyword.get(opts, :timeout_ms, 10_000)
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_await_pid_liveness(pid, opts, deadline)
+  end
+
+  defp do_await_pid_liveness(pid, opts, deadline) do
+    case pid_liveness(pid, opts) do
+      :gone ->
+        :gone
+
+      state ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          state
+        else
+          Process.sleep(100)
+          do_await_pid_liveness(pid, opts, deadline)
+        end
+    end
+  end
+
+  @doc """
+  Verifies that every PID is positively gone.
+
+  `:unknown` fails closed as `{:probe_unknown, pids}` and is not reported
+  as a clean tree. Still-alive PIDs are `{:orphans_detected, pids}`.
+  """
+  @spec assert_no_orphaned_processes([integer() | nil], keyword()) ::
+          :ok | {:orphans_detected, [integer()]} | {:probe_unknown, [integer()]}
+  def assert_no_orphaned_processes(pids, opts \\ []) when is_list(pids) and is_list(opts) do
+    timeout_ms = Keyword.get(opts, :timeout_ms, 3_000)
+    probe_opts = Keyword.take(opts, [:probe])
+
+    states =
+      pids
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(fn pid ->
+        {pid, await_pid_liveness(pid, Keyword.put(probe_opts, :timeout_ms, timeout_ms))}
       end)
 
-    if alive == [] do
-      :ok
-    else
-      {:orphans_detected, alive}
+    unknown = for {pid, :unknown} <- states, do: pid
+    alive = for {pid, :alive} <- states, do: pid
+
+    cond do
+      unknown != [] -> {:probe_unknown, unknown}
+      alive != [] -> {:orphans_detected, alive}
+      true -> :ok
     end
   end
 
@@ -524,11 +589,17 @@ defmodule SymphonyElixir.TestSupport.OpenCodeWorkerFixture do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Simulates issue-to-worker routing resolution:
-  - If opencode is enabled (via option or issue label) -> routes to OpenCode
-  - If opencode is disabled -> rolls back cleanly to Codex default route (gpt-6-astra, medium)
+  Fixture-only routing simulation.
+
+  This does not call `SymphonyElixir.DispatchRouter`. On the accepted
+  baseline that router materializes Codex `:primary` / `:fallback`
+  selections and has no OpenCode worker type. A result from this function
+  is not evidence that production selected an OpenCode worker or rolled
+  back through the production router.
   """
   @spec resolve_worker_route(keyword(), Issue.t() | nil) :: %{
+          authority: :fixture_only,
+          production_dispatch_router: :not_consulted,
           worker_type: :opencode | :codex,
           model: String.t(),
           reasoning_effort: String.t(),
@@ -549,20 +620,56 @@ defmodule SymphonyElixir.TestSupport.OpenCodeWorkerFixture do
       model = Keyword.get(opts, :model) || extract_label_val(issue_labels, "model") || "claude-3-5-sonnet"
 
       %{
+        authority: :fixture_only,
+        production_dispatch_router: :not_consulted,
         worker_type: :opencode,
         model: model,
         reasoning_effort: "none",
         route_source: :explicit_override
       }
     else
-      # Rollback to Codex route
       %{
+        authority: :fixture_only,
+        production_dispatch_router: :not_consulted,
         worker_type: :codex,
         model: "gpt-6-astra",
         reasoning_effort: "medium",
         route_source: :default
       }
     end
+  end
+
+  @doc """
+  Raw secret literals emitted by the mock. They are fixture data, not
+  evidence that a sanitizer ran.
+  """
+  @spec raw_secret_markers() :: %{anthropic: String.t(), linear: String.t()}
+  def raw_secret_markers do
+    %{anthropic: @raw_secret, linear: @raw_linear}
+  end
+
+  @spec raw_secret_fixture() :: String.t()
+  def raw_secret_fixture, do: "#{@raw_secret} LINEAR_API_KEY=#{@raw_linear}"
+
+  @doc """
+  Scope label for the offline `error` mock. The process failure is
+  observed here. The production no-fallback guarantee is not.
+  """
+  @spec process_failure_scope() :: %{observed: :process_failure, production_no_fallback: :unwired}
+  def process_failure_scope do
+    %{observed: :process_failure, production_no_fallback: :unwired}
+  end
+
+  @doc """
+  Scope label for an interrupted mock process. Killing or exiting that
+  process is not BEAM restart recovery.
+  """
+  @spec interruption_scope() :: %{
+          kind: :simulated_process_exit,
+          beam_restart_recovery: :not_exercised
+        }
+  def interruption_scope do
+    %{kind: :simulated_process_exit, beam_restart_recovery: :not_exercised}
   end
 
   defp extract_label_val(labels, prefix) do
@@ -575,4 +682,3 @@ defmodule SymphonyElixir.TestSupport.OpenCodeWorkerFixture do
     end)
   end
 end
-

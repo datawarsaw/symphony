@@ -12,6 +12,21 @@ defmodule SymphonyElixir.OpenCodeIntegrationSmokeTest do
   - When run against the baseline, they fail explicitly identifying the exact
     unmerged integration dependencies awaiting wiring.
   - When the integration branch is merged, they run and pass automatically.
+
+  Gates that must go green only after the production modules are assembled:
+  - `SymphonyElixir.OpenCode.Adapter` is loaded and can start/stop the mock
+    behind `LaunchMarker`.
+  - `SymphonyElixir.OpenCode` runs the mock and returns a completed summary.
+  - `SymphonyElixir.WorkerEvent.from_opencode/1` normalizes the multi-step stream.
+  - `SymphonyElixir.OpenCode.Redactor.redact/1` removes the raw secrets emitted
+    by both `malformed-secret` and `secret` mock modes.
+  - `SymphonyElixir.OpenCode.Adapter.validate_model_selection/1` rejects a bare
+    model. That is the no-fallback guarantee. The `error` mock's nonzero exit
+    does not satisfy it.
+  - A production selector, distinct from `OpenCodeWorkerFixture.resolve_worker_route/2`,
+    chooses an OpenCode worker from an explicit label or config and returns the
+    Codex default when OpenCode is disabled. Baseline `DispatchRouter.materialize/3`
+    only accepts `:primary` and `:fallback`.
   """
 
   use SymphonyElixir.TestSupport
@@ -158,5 +173,60 @@ defmodule SymphonyElixir.OpenCodeIntegrationSmokeTest do
       assert step_2_finish.usage.output_tokens == 90
     end
   end
-end
 
+  describe "Sanitization, no-fallback, and production routing gates" do
+    test "production redactor sanitizes malformed-secret and secret mock output", %{workspace: ws} do
+      assert Code.ensure_loaded?(SymphonyElixir.OpenCode.Redactor),
+             "M1 INTEGRATION BLOCKED: SymphonyElixir.OpenCode.Redactor.redact/1 is not assembled. " <>
+               "Standalone malformed-secret and secret tests only prove the mock emits raw secrets. " <>
+               "Do not count raw fixture output as redacted."
+
+      markers = OpenCodeWorkerFixture.raw_secret_markers()
+
+      {malformed, malformed_exit} =
+        OpenCodeWorkerFixture.run_mock_direct(ws, ["--mock-mode=malformed-secret"])
+
+      {secret, secret_exit} = OpenCodeWorkerFixture.run_mock_direct(ws, ["--mock-mode=secret"])
+
+      assert malformed_exit == 0
+      assert secret_exit == 0
+      assert malformed =~ markers.anthropic
+      assert secret =~ markers.linear
+
+      for raw <- [malformed, secret] do
+        redacted = apply(SymphonyElixir.OpenCode.Redactor, :redact, [raw])
+        assert is_binary(redacted)
+        assert redacted =~ "[redacted]"
+        refute redacted =~ markers.anthropic
+        refute redacted =~ markers.linear
+      end
+    end
+
+    test "production adapter forbids automatic provider fallback" do
+      assert Code.ensure_loaded?(SymphonyElixir.OpenCode.Adapter),
+             "M1 INTEGRATION BLOCKED: SymphonyElixir.OpenCode.Adapter.validate_model_selection/1 " <>
+               "is not assembled. The error mock's nonzero exit and error event are observed " <>
+               "process failure only and are not the no-fallback guarantee."
+
+      assert function_exported?(SymphonyElixir.OpenCode.Adapter, :validate_model_selection, 1),
+             "M1 INTEGRATION BLOCKED: validate_model_selection/1 is missing from the assembled adapter"
+
+      assert {:error, {:invalid_model_selection, message}} =
+               apply(SymphonyElixir.OpenCode.Adapter, :validate_model_selection, [
+                 [model: "claude-3-5-sonnet"]
+               ])
+
+      assert message =~ "Automatic fallback is forbidden"
+    end
+
+    test "production OpenCode worker selection is not the fixture router" do
+      flunk(
+        "M1 INTEGRATION BLOCKED: production DispatchRouter selection of an OpenCode worker is not assembled. " <>
+          "Baseline DispatchRouter.materialize/3 accepts only :primary and :fallback and returns a Codex Selection " <>
+          "with no worker_type. Gate after assembly: the production selector must choose worker_type :opencode from " <>
+          "an explicit label or config, and must return the Codex default when OpenCode is disabled. " <>
+          "OpenCodeWorkerFixture.resolve_worker_route/2 is fixture-only and must not satisfy this gate."
+      )
+    end
+  end
+end
