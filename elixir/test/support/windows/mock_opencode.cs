@@ -276,6 +276,32 @@ class MockOpenCode
             return exitCode;
         }
 
+        if (mode == "terminal-then-hang")
+        {
+            // A terminal step_finish is emitted at the protocol level, but the
+            // worker never terminates. Contained launches are killed by the
+            // adapter's stop path; uncontained launches self-exit via a stop file.
+            WriteStepStart(sessionId, "msg_01");
+            WriteStepFinish(sessionId, "stop", "msg_01", tokensIn, tokensOut, tokensReasoning, cacheRead, cacheWrite, cost);
+            Console.Out.Flush();
+            if (!string.IsNullOrEmpty(stopFile))
+            {
+                while (true)
+                {
+                    if (File.Exists(stopFile))
+                    {
+                        break;
+                    }
+                    Thread.Sleep(500);
+                }
+            }
+            else
+            {
+                Thread.Sleep(60000);
+            }
+            return exitCode;
+        }
+
         if (mode == "interrupted")
         {
             WriteStepStart(sessionId, "msg_01");
