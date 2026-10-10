@@ -421,6 +421,117 @@ defmodule SymphonyElixir.WorkerEventTest do
       assert update.successful_completion? == false
     end
 
+    test "multibyte evidence is truncated on a codepoint boundary within the byte budget" do
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      # 2000 euro signs are 6000 bytes; the 4082-byte prefix cuts the 1361st sign
+      # after two of its three bytes, so the raw byte limit lands mid-codepoint.
+      body = String.duplicate("€", 2_000)
+      output = secret <> " " <> body
+
+      event =
+        WorkerEvent.from_opencode(%{
+          "type" => "tool_use",
+          "sessionID" => "ses-utf8",
+          "timestamp" => 1_728_490_000,
+          "part" => %{
+            "tool" => "bash",
+            "callID" => "call-utf8",
+            "messageID" => "m-utf8",
+            "state" => %{"status" => "completed", "output" => output}
+          }
+        })
+
+      update = WorkerEvent.to_update(event)
+      bounded = update.payload.output
+
+      assert String.valid?(bounded)
+      assert byte_size(bounded) <= 4_096
+      assert bounded =~ "[truncated]"
+      refute bounded =~ secret
+      refute inspect(update) =~ secret
+      assert is_binary(Jason.encode!(update))
+    end
+
+    test "callback accumulator is linked to its creator and stops once the recipient dies" do
+      parent = self()
+
+      recipient =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          after
+            5_000 -> :ok
+          end
+        end)
+
+      creator =
+        spawn(fn ->
+          callback = WorkerEvent.callback(recipient, "ISS-800")
+          {:links, links} = Process.info(self(), :links)
+          send(parent, {:accumulator, self(), links, callback})
+
+          receive do
+            {:event, raw} -> send(parent, {:dispatch, callback.(raw)})
+          after
+            5_000 -> :ok
+          end
+        end)
+
+      on_exit(fn ->
+        if Process.alive?(creator), do: Process.exit(creator, :kill)
+        if Process.alive?(recipient), do: Process.exit(recipient, :kill)
+      end)
+
+      assert_receive {:accumulator, ^creator, links, _callback}
+      assert [accumulator] = links
+      assert Process.alive?(accumulator)
+
+      # The accumulator is linked to its creator, so creator teardown is bounded.
+      Process.exit(creator, :kill)
+      refute alive_after?(accumulator)
+    end
+
+    test "callback stops accumulating for a recipient that can no longer receive events" do
+      parent = self()
+
+      recipient =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          after
+            5_000 -> :ok
+          end
+        end)
+
+      creator =
+        spawn(fn ->
+          callback = WorkerEvent.callback(recipient, "ISS-801")
+          {:links, [accumulator]} = Process.info(self(), :links)
+          send(parent, {:accumulator, self(), accumulator, callback})
+
+          receive do
+            {:event, raw} -> send(parent, {:dispatch, callback.(raw)})
+          after
+            5_000 -> :ok
+          end
+        end)
+
+      on_exit(fn ->
+        if Process.alive?(creator), do: Process.exit(creator, :kill)
+        if Process.alive?(recipient), do: Process.exit(recipient, :kill)
+      end)
+
+      assert_receive {:accumulator, ^creator, accumulator, _callback}
+      assert Process.alive?(accumulator)
+
+      Process.exit(recipient, :kill)
+      refute alive_after?(recipient)
+
+      send(creator, {:event, step_line("m-cleanup", "stop", 1, 1)})
+      assert_receive {:dispatch, :ok}
+      refute alive_after?(accumulator)
+    end
+
     test "malformed issue ids, dead recipients, and session changes do not dispatch" do
       line = step_line("m-1", "tool-calls", 5, 5)
 
@@ -472,6 +583,19 @@ defmodule SymphonyElixir.WorkerEventTest do
       "sessionID" => "ses-reason",
       "part" => part
     })
+  end
+
+  defp alive_after?(pid, attempts \\ 20)
+
+  defp alive_after?(_pid, 0), do: true
+
+  defp alive_after?(pid, attempts) do
+    if Process.alive?(pid) do
+      Process.sleep(10)
+      alive_after?(pid, attempts - 1)
+    else
+      false
+    end
   end
 
   defp step_line(message_id, reason, input, output, session_id \\ "ses-acc") do

@@ -3988,7 +3988,6 @@ defmodule SymphonyElixir.Orchestrator do
     updated =
       running_entry
       |> Map.merge(%{
-        last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         model: model_for_update(Map.get(running_entry, :model), update),
         reasoning_effort: reasoning_effort_for_update(Map.get(running_entry, :reasoning_effort), update),
@@ -4002,7 +4001,7 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       })
-      |> Map.merge(activity_fields(running_entry, event, timestamp))
+      |> Map.merge(activity_fields(running_entry, event, timestamp, update))
       |> Map.merge(event_id_fields(running_entry, update))
 
     {updated, token_delta}
@@ -4027,7 +4026,10 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp activity_fields(running_entry, event, timestamp) do
+  # The last operational message is part of the accepted liveness snapshot. A
+  # stale event still contributes its token accounting, but it must not replace
+  # the message that arrived with the newest accepted activity timestamp.
+  defp activity_fields(running_entry, event, timestamp, update) do
     previous =
       Map.get(running_entry, :last_activity_at) || Map.get(running_entry, :last_codex_timestamp)
 
@@ -4037,11 +4039,16 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: dt,
           last_activity_at: dt,
           last_codex_event: event,
-          last_event: event
+          last_event: event,
+          last_codex_message: summarize_codex_update(update)
         }
 
       :invalid ->
-        %{last_codex_event: event, last_event: event}
+        %{
+          last_codex_event: event,
+          last_event: event,
+          last_codex_message: summarize_codex_update(update)
+        }
 
       :stale ->
         %{}

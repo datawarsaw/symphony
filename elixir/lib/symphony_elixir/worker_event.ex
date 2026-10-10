@@ -71,6 +71,7 @@ defmodule SymphonyElixir.WorkerEvent do
   @terminal_step_reasons ~w(stop length content-filter unknown)
   @max_evidence_bytes 4_096
   @truncated "…[truncated]"
+  @truncation_budget @max_evidence_bytes - byte_size(@truncated)
   @redacted "[redacted]"
   @identifier_pattern ~r/^[A-Za-z0-9][A-Za-z0-9._:-]*$/
   @channels [:codex_worker_update, :worker_update]
@@ -638,6 +639,12 @@ defmodule SymphonyElixir.WorkerEvent do
   Malformed issue ids, dead recipients, unexpected session changes, and duplicate
   step events are dropped. The callback cannot reintroduce raw evidence that
   redaction removed, and it cannot mark an OpenCode execution successful.
+
+  The accumulator is started with `Agent.start_link/1`, so it shares the lifetime
+  of the process that builds the callback and is torn down with it. It also stops
+  itself once the recipient is no longer alive, so a long-lived creator cannot
+  keep accumulating per-issue state for a consumer that can no longer receive
+  events. Events are dropped only after the recipient is gone.
   """
   @spec callback(pid() | nil, term(), keyword()) :: (term() -> :ok)
   def callback(recipient, issue_or_id, opts \\ []) do
@@ -648,7 +655,7 @@ defmodule SymphonyElixir.WorkerEvent do
     if not valid_recipient?(recipient) or not valid_identifier?(issue_id) do
       fn _raw_event -> :ok end
     else
-      {:ok, agent} =
+      {:ok, accumulator} =
         Agent.start_link(fn ->
           init_accumulator(%{
             session_id: if(valid_identifier?(bound_session), do: bound_session, else: nil)
@@ -656,29 +663,50 @@ defmodule SymphonyElixir.WorkerEvent do
         end)
 
       fn raw_event ->
-        if valid_recipient?(recipient) do
-          result =
-            Agent.get_and_update(agent, fn state ->
-              case accumulate(state, raw_event) do
-                {:ok, new_state, event} -> {{:ok, event}, new_state}
-                {:duplicate, new_state} -> {:duplicate, new_state}
-                {:rejected, new_state} -> {:rejected, new_state}
-              end
-            end)
-
-          case result do
-            {:ok, event} ->
-              send(recipient, {channel, issue_id, to_update(event)})
-              :ok
-
-            _ ->
-              :ok
-          end
-        else
-          :ok
-        end
+        dispatch_event(accumulator, recipient, issue_id, channel, raw_event)
       end
     end
+  end
+
+  defp dispatch_event(accumulator, recipient, issue_id, channel, raw_event) do
+    with true <- Process.alive?(accumulator),
+         true <- valid_recipient?(recipient) do
+      deliver_event(accumulator, recipient, issue_id, channel, raw_event)
+    else
+      false ->
+        stop_accumulator(accumulator)
+        :ok
+    end
+  end
+
+  defp deliver_event(accumulator, recipient, issue_id, channel, raw_event) do
+    case accumulate_into(accumulator, raw_event) do
+      {:ok, event} ->
+        send(recipient, {channel, issue_id, to_update(event)})
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp accumulate_into(accumulator, raw_event) do
+    Agent.get_and_update(accumulator, fn state ->
+      case accumulate(state, raw_event) do
+        {:ok, new_state, event} -> {{:ok, event}, new_state}
+        {:duplicate, new_state} -> {:duplicate, new_state}
+        {:rejected, new_state} -> {:rejected, new_state}
+      end
+    end)
+  end
+
+  # Idempotent and race-safe: a concurrent caller may have stopped the
+  # accumulator or let the link tear it down already.
+  defp stop_accumulator(accumulator) do
+    if Process.alive?(accumulator), do: Agent.stop(accumulator, :normal, 5_000)
+    :ok
+  catch
+    :exit, _reason -> :ok
   end
 
   @doc """
@@ -1102,32 +1130,22 @@ defmodule SymphonyElixir.WorkerEvent do
 
   defp bound(value) do
     value
-    |> binary_part(0, @max_evidence_bytes)
-    |> drop_partial_codepoint()
+    |> binary_part(0, @truncation_budget)
+    |> trim_partial_codepoint()
     |> Kernel.<>(@truncated)
   end
 
-  defp drop_partial_codepoint(binary) do
-    size = byte_size(binary)
-
-    if String.valid?(binary) or size == 0 do
-      binary
-    else
-      dangling = count_dangling_bytes(binary, min(size, 4), 0)
-      binary_part(binary, 0, size - dangling)
-    end
+  # The byte limit can cut a multibyte codepoint. Drop the incomplete tail so the
+  # truncated text is always valid UTF-8 and can still be encoded and inspected.
+  defp trim_partial_codepoint(binary) do
+    if String.valid?(binary), do: binary, else: drop_trailing_byte(binary)
   end
 
-  defp count_dangling_bytes(_binary, 0, count), do: count
+  defp drop_trailing_byte(<<>>), do: <<>>
 
-  defp count_dangling_bytes(binary, left, count) do
-    size = byte_size(binary)
-    <<byte>> = binary_part(binary, size - 1, 1)
+  defp drop_trailing_byte(binary) do
+    trimmed = binary_part(binary, 0, byte_size(binary) - 1)
 
-    if byte >= 0x80 do
-      count_dangling_bytes(binary_part(binary, 0, size - 1), left - 1, count + 1)
-    else
-      count
-    end
+    if String.valid?(trimmed), do: trimmed, else: drop_trailing_byte(trimmed)
   end
 end

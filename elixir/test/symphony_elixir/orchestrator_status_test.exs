@@ -2332,6 +2332,53 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       assert entry.codex_total_tokens == 100
     end
 
+    test "stale events do not overwrite the last operational message" do
+      %{pid: pid, issue_id: issue_id} =
+        start_observed_worker("issue-oc-stale-msg", "MT-OC-STALE-MSG", "thread-oc-stale-msg")
+
+      newer = DateTime.utc_now()
+      older = DateTime.add(newer, -30, :second)
+
+      send(
+        pid,
+        {:worker_update, issue_id,
+         %{
+           event: :step_finish,
+           timestamp: newer,
+           session_id: "thread-oc-stale-msg",
+           harness: :opencode,
+           usage_accounting: :step,
+           event_id: "stale-msg-fresh",
+           payload: %{marker: "fresh-message"},
+           usage: %{input_tokens: 10, output_tokens: 10, total_tokens: 20}
+         }}
+      )
+
+      state = :sys.get_state(pid)
+      assert state.running[issue_id].last_codex_message.message == %{marker: "fresh-message"}
+
+      send(
+        pid,
+        {:worker_update, issue_id,
+         %{
+           event: :step_finish,
+           timestamp: older,
+           session_id: "thread-oc-stale-msg",
+           harness: :opencode,
+           usage_accounting: :step,
+           event_id: "stale-msg-old",
+           payload: %{marker: "stale-message"},
+           usage: %{input_tokens: 10, output_tokens: 10, total_tokens: 20}
+         }}
+      )
+
+      state = :sys.get_state(pid)
+      entry = state.running[issue_id]
+      assert entry.last_codex_message.message == %{marker: "fresh-message"}
+      assert entry.last_activity_at == newer
+      assert entry.codex_total_tokens == 40
+    end
+
     test "missing timestamp is not fresh liveness proof" do
       %{pid: pid, issue_id: issue_id, worker_pid: worker_pid} =
         start_observed_worker("issue-oc-invalid-ts", "MT-OC-TS", "thread-oc-ts",
