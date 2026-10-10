@@ -10,7 +10,8 @@ defmodule SymphonyElixir.WorkerEventTest do
 
       assert event.event == :activity
       assert event.harness == :generic
-      assert %DateTime{} = event.timestamp
+      assert event.timestamp == nil
+      refute WorkerEvent.activity?(event)
       assert event.terminal? == false
       assert event.payload == %{}
     end
@@ -167,7 +168,7 @@ defmodule SymphonyElixir.WorkerEventTest do
       assert reasoning_event.payload.text == "thinking..."
     end
 
-    test "normalizes session.status idle as terminal completion" do
+    test "does not treat session.status idle as CLI completion" do
       raw = ~s({
         "type": "session.status",
         "timestamp": 1728490010,
@@ -179,10 +180,31 @@ defmodule SymphonyElixir.WorkerEventTest do
 
       event = WorkerEvent.from_opencode(raw)
 
-      assert event.event == :turn_completed
-      assert event.terminal? == true
-      assert WorkerEvent.terminal?(event)
+      assert event.event == :session_status
+      refute event.event == :turn_completed
+      assert event.terminal? == false
+      assert event.metadata.successful_completion? == false
       assert event.session_id == "ses-opencode-1"
+    end
+
+    test "step_finish reasons follow the OpenCode CLI contract" do
+      for reason <- ["stop", "length", "content-filter", "unknown"] do
+        event = step_finish(reason)
+        assert event.event == :step_finish
+        assert event.terminal?
+        assert event.metadata.finish_reason == reason
+        assert event.metadata.successful_completion? == false
+      end
+
+      for reason <- ["tool-calls", "error"] do
+        event = step_finish(reason)
+        refute event.terminal?
+        assert event.metadata.successful_completion? == false
+      end
+
+      missing = step_finish(nil)
+      refute missing.terminal?
+      assert missing.metadata.successful_completion? == false
     end
 
     test "normalizes session.status error as terminal failure" do
@@ -247,9 +269,15 @@ defmodule SymphonyElixir.WorkerEventTest do
       assert DateTime.to_iso8601(dt) == iso
     end
 
-    test "falls back safely for invalid timestamp" do
-      assert %DateTime{} = WorkerEvent.normalize_timestamp(nil)
-      assert %DateTime{} = WorkerEvent.normalize_timestamp("not-a-date")
+    test "does not treat missing or invalid timestamps as fresh liveness" do
+      assert WorkerEvent.normalize_timestamp(nil) == nil
+      assert WorkerEvent.normalize_timestamp("not-a-date") == nil
+      assert WorkerEvent.normalize_timestamp(0) == nil
+
+      event = WorkerEvent.new(timestamp: "not-a-date")
+      assert event.timestamp == nil
+      refute WorkerEvent.activity?(event)
+      assert WorkerEvent.classify_activity_timestamp(nil, "not-a-date") == :invalid
     end
   end
 
@@ -260,6 +288,7 @@ defmodule SymphonyElixir.WorkerEventTest do
           event: :step_finish,
           session_id: "ses-up-1",
           harness: :opencode,
+          timestamp: ~U[2026-10-09 18:30:00Z],
           usage: %{input_tokens: 100, output_tokens: 200, total_tokens: 300}
         )
 
@@ -315,9 +344,147 @@ defmodule SymphonyElixir.WorkerEventTest do
 
       assert event[:event] == :step_start
       assert event[:session_id] == "ses-acc"
-      assert %DateTime{} = event[:timestamp]
+      assert event[:timestamp] == nil
       assert event["event"] == :step_start
       assert event["session_id"] == "ses-acc"
     end
+  end
+
+  describe "OpenCode step accounting, redaction, and callback identity" do
+    test "two different steps with identical token counts both accumulate" do
+      first = step_line("m-a", "stop", 40, 40)
+      second = step_line("m-b", "stop", 40, 40)
+
+      assert {:ok, state, event_a} = WorkerEvent.accumulate(nil, first)
+      assert event_a.usage.input_tokens == 40
+      assert event_a.usage.output_tokens == 40
+      assert event_a.metadata.usage_accounting == :cumulative
+
+      assert {:ok, _state, event_b} = WorkerEvent.accumulate(state, second)
+      assert event_b.usage.input_tokens == 80
+      assert event_b.usage.output_tokens == 80
+      assert event_b.usage.total_tokens == 160
+    end
+
+    test "a repeated step identity is not counted twice" do
+      line = step_line("m-same", "stop", 40, 40)
+      assert {:ok, state, _} = WorkerEvent.accumulate(nil, line)
+      assert {:duplicate, _state} = WorkerEvent.accumulate(state, line)
+    end
+
+    test "malformed JSON keeps no decoder data and no secret" do
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      linear = "lin_api_parentsecretvalue"
+      line = ~s({"type":"tool_use","broken":"#{secret}","token":"LINEAR_API_KEY=#{linear}")
+
+      event = WorkerEvent.from_opencode(line)
+
+      refute inspect(event) =~ secret
+      refute inspect(event) =~ linear
+      refute inspect(event) =~ "DecodeError"
+      assert event.payload.error == :json_decode_error
+      assert Map.keys(event.payload.detail) |> Enum.sort() == [:position, :token]
+      assert event.timestamp == nil
+      refute WorkerEvent.activity?(event)
+    end
+
+    test "tool output is redacted and bounded before it can reach a callback" do
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      output = secret <> " " <> String.duplicate("x", 5_000)
+
+      raw =
+        Jason.encode!(%{
+          "type" => "tool_use",
+          "sessionID" => "ses-secret",
+          "timestamp" => 1_728_490_000,
+          "part" => %{
+            "tool" => "bash",
+            "callID" => "call-1",
+            "messageID" => "m-tool",
+            "state" => %{"status" => "completed", "output" => output}
+          }
+        })
+
+      event = WorkerEvent.from_opencode(raw)
+      assert event.payload.output =~ "[redacted]"
+      refute event.payload.output =~ secret
+      assert byte_size(event.payload.output) < 4_200
+      refute inspect(event.raw) =~ secret
+
+      smuggled = %{event | raw: secret}
+      recipient = self()
+      callback = WorkerEvent.callback(recipient, "ISS-701")
+      assert :ok = callback.(smuggled)
+
+      assert_receive {:codex_worker_update, "ISS-701", update}
+      refute inspect(update) =~ secret
+      assert update.successful_completion? == false
+    end
+
+    test "malformed issue ids, dead recipients, and session changes do not dispatch" do
+      line = step_line("m-1", "tool-calls", 5, 5)
+
+      assert :ok = WorkerEvent.callback(self(), "").(line)
+      assert :ok = WorkerEvent.callback(self(), "bad id").(line)
+      refute_receive {:codex_worker_update, _, _}, 50
+
+      dead =
+        spawn(fn ->
+          :ok
+        end)
+
+      Process.sleep(20)
+      assert :ok = WorkerEvent.callback(dead, "ISS-702").(line)
+      refute_receive _, 50
+
+      callback = WorkerEvent.callback(self(), "ISS-703")
+      assert :ok = callback.(step_line("m-1", "tool-calls", 5, 5, "ses-a"))
+      assert_receive {:codex_worker_update, "ISS-703", first}
+      assert first.session_id == "ses-a"
+      assert first.usage.input_tokens == 5
+
+      assert :ok = callback.(step_line("m-2", "stop", 9, 9, "ses-b"))
+      refute_receive {:codex_worker_update, "ISS-703", _}, 50
+
+      assert :ok = callback.(step_line("m-3", "stop", 1, 1, "ses-a"))
+      assert_receive {:codex_worker_update, "ISS-703", third}
+      assert third.session_id == "ses-a"
+      assert third.usage.input_tokens == 6
+    end
+
+    test "out-of-order timestamps are classified without moving the accepted clock backward" do
+      newer = ~U[2026-10-09 18:31:00Z]
+      older = ~U[2026-10-09 18:30:00Z]
+
+      assert {:fresh, ^newer} = WorkerEvent.classify_activity_timestamp(nil, newer)
+      assert :stale = WorkerEvent.classify_activity_timestamp(newer, older)
+      assert {:fresh, ^newer} = WorkerEvent.classify_activity_timestamp(older, newer)
+    end
+  end
+
+  defp step_finish(reason) do
+    part = %{"messageID" => "msg-reason", "tokens" => %{"input" => 1, "output" => 1}}
+    part = if is_binary(reason), do: Map.put(part, "reason", reason), else: part
+
+    WorkerEvent.from_opencode(%{
+      "type" => "step_finish",
+      "timestamp" => 1_728_490_010,
+      "sessionID" => "ses-reason",
+      "part" => part
+    })
+  end
+
+  defp step_line(message_id, reason, input, output, session_id \\ "ses-acc") do
+    Jason.encode!(%{
+      "type" => "step_finish",
+      "timestamp" => 1_728_490_010,
+      "sessionID" => session_id,
+      "part" => %{
+        "id" => "part-" <> message_id,
+        "messageID" => message_id,
+        "reason" => reason,
+        "tokens" => %{"input" => input, "output" => output}
+      }
+    })
   end
 end

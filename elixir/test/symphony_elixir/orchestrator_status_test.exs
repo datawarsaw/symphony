@@ -2087,9 +2087,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
       assert Map.has_key?(state.running, issue_id)
 
+      fresh_idle = DateTime.utc_now() |> DateTime.add(5, :second) |> DateTime.to_unix()
+
       idle_line = ~s({
         "type": "session.status",
-        "timestamp": 1728490015,
+        "timestamp": #{fresh_idle},
         "sessionID": "thread-oc-1",
         "status": {"type": "idle"}
       })
@@ -2098,7 +2100,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       state = :sys.get_state(pid)
 
       terminal_entry = state.running[issue_id]
-      assert terminal_entry.last_codex_event == :turn_completed
+      assert terminal_entry.last_codex_event == :session_status
+      refute terminal_entry.last_codex_event == :turn_completed
+      assert Map.has_key?(state.running, issue_id)
+      assert Orchestrator.operational_statuses_for_test(state)[issue_id] == :running
+      refute Map.has_key?(terminal_entry, :completion)
+      refute Map.has_key?(terminal_entry, :outcome)
     end
 
     test "preserves unchanged legacy Codex update behavior and token delta extraction" do
@@ -2170,5 +2177,271 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       assert updated.codex_output_tokens == 70
       assert updated.codex_total_tokens == 100
     end
+
+    test "terminal OpenCode step_finish does not mark the worker successful" do
+      %{pid: pid, issue_id: issue_id, worker_pid: worker_pid} =
+        start_observed_worker("issue-oc-terminal", "MT-OC-TERM", "thread-oc-term")
+
+      callback = SymphonyElixir.WorkerEvent.callback(pid, issue_id)
+      now_unix = DateTime.utc_now() |> DateTime.to_unix()
+
+      callback.(~s({
+        "type": "step_finish",
+        "timestamp": #{now_unix},
+        "sessionID": "thread-oc-term",
+        "part": {"messageID": "m-stop", "reason": "stop", "tokens": {"input": 10, "output": 10}}
+      }))
+
+      state = :sys.get_state(pid)
+      entry = state.running[issue_id]
+      assert entry.last_codex_event == :step_finish
+      assert entry.codex_total_tokens == 20
+      assert Orchestrator.operational_statuses_for_test(state)[issue_id] == :running
+      assert Process.alive?(worker_pid)
+      refute Map.has_key?(entry, :completion)
+      refute Map.get(entry, :outcome) == :success
+    end
+
+    test "identical per-step token counts accumulate and duplicate steps do not" do
+      %{pid: pid, issue_id: issue_id} =
+        start_observed_worker("issue-oc-steps", "MT-OC-STEPS", "thread-oc-steps")
+
+      now_unix = DateTime.utc_now() |> DateTime.to_unix()
+
+      send_step = fn message_id ->
+        send(
+          pid,
+          {:worker_update, issue_id,
+           %{
+             event: :step_finish,
+             timestamp: DateTime.from_unix!(now_unix),
+             session_id: "thread-oc-steps",
+             harness: :opencode,
+             usage_accounting: :step,
+             event_id: "opencode:step_finish:thread-oc-steps:" <> message_id <> ":part:stop",
+             usage: %{input_tokens: 40, output_tokens: 40, total_tokens: 80},
+             successful_completion?: true,
+             terminal?: true
+           }}
+        )
+      end
+
+      send_step.("m-1")
+      send_step.("m-2")
+      state = :sys.get_state(pid)
+      assert state.running[issue_id].codex_input_tokens == 80
+      assert state.running[issue_id].codex_output_tokens == 80
+      assert state.running[issue_id].codex_total_tokens == 160
+      assert Orchestrator.operational_statuses_for_test(state)[issue_id] == :running
+
+      send_step.("m-1")
+      state = :sys.get_state(pid)
+      assert state.running[issue_id].codex_total_tokens == 160
+    end
+
+    test "callback multi-step totals are cumulative snapshots and ignore a conflicting session" do
+      %{pid: pid, issue_id: issue_id} =
+        start_observed_worker("issue-oc-callback-steps", "MT-OC-CB", "thread-oc-cb")
+
+      callback = SymphonyElixir.WorkerEvent.callback(pid, issue_id)
+      now_unix = DateTime.utc_now() |> DateTime.to_unix()
+
+      for {message_id, stamp} <- [{"m-a", now_unix}, {"m-b", now_unix + 1}] do
+        callback.(~s({
+          "type": "step_finish",
+          "timestamp": #{stamp},
+          "sessionID": "thread-oc-cb",
+          "part": {"messageID": "#{message_id}", "reason": "stop", "tokens": {"input": 25, "output": 25}}
+        }))
+      end
+
+      state = :sys.get_state(pid)
+      assert state.running[issue_id].codex_input_tokens == 50
+      assert state.running[issue_id].codex_total_tokens == 100
+      assert state.running[issue_id].session_id == "thread-oc-cb"
+
+      callback.(~s({
+        "type": "step_finish",
+        "timestamp": #{now_unix + 2},
+        "sessionID": "other-session",
+        "part": {"messageID": "m-c", "reason": "stop", "tokens": {"input": 80, "output": 80}}
+      }))
+
+      send(
+        pid,
+        {:worker_update, issue_id,
+         %{
+           event: :step_finish,
+           timestamp: DateTime.from_unix!(now_unix + 3),
+           session_id: "other-session",
+           harness: :opencode,
+           usage_accounting: :step,
+           event_id: "opencode:step_finish:other-session:m-d:part:stop",
+           usage: %{input_tokens: 80, output_tokens: 80, total_tokens: 160},
+           successful_completion?: true
+         }}
+      )
+
+      state = :sys.get_state(pid)
+      entry = state.running[issue_id]
+      assert entry.codex_total_tokens == 100
+      assert entry.session_id == "thread-oc-cb"
+      assert Orchestrator.operational_statuses_for_test(state)[issue_id] == :running
+    end
+
+    test "stale activity does not move the liveness clock backward" do
+      %{pid: pid, issue_id: issue_id} =
+        start_observed_worker("issue-oc-order", "MT-OC-ORDER", "thread-oc-order")
+
+      newer = DateTime.utc_now()
+      older = DateTime.add(newer, -30, :second)
+
+      send(
+        pid,
+        {:worker_update, issue_id,
+         %{
+           event: :step_finish,
+           timestamp: newer,
+           session_id: "thread-oc-order",
+           harness: :opencode,
+           usage_accounting: :step,
+           event_id: "step-newer",
+           usage: %{input_tokens: 40, output_tokens: 10, total_tokens: 50}
+         }}
+      )
+
+      send(
+        pid,
+        {:worker_update, issue_id,
+         %{
+           event: :step_finish,
+           timestamp: older,
+           session_id: "thread-oc-order",
+           harness: :opencode,
+           usage_accounting: :step,
+           event_id: "step-older",
+           usage: %{input_tokens: 40, output_tokens: 10, total_tokens: 50}
+         }}
+      )
+
+      state = :sys.get_state(pid)
+      entry = state.running[issue_id]
+      assert entry.last_activity_at == newer
+      assert entry.last_codex_event == :step_finish
+      assert entry.codex_input_tokens == 80
+      assert entry.codex_total_tokens == 100
+    end
+
+    test "missing timestamp is not fresh liveness proof" do
+      %{pid: pid, issue_id: issue_id, worker_pid: worker_pid} =
+        start_observed_worker("issue-oc-invalid-ts", "MT-OC-TS", "thread-oc-ts",
+          stale_seconds: 5,
+          stall_timeout_ms: 1_000
+        )
+
+      callback = SymphonyElixir.WorkerEvent.callback(pid, issue_id)
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      callback.(~s({"type":"tool_use","broken":"#{secret}"))
+
+      state = :sys.get_state(pid)
+      refute inspect(state.running[issue_id]) =~ secret
+
+      send(pid, :tick)
+      Process.sleep(100)
+      state = :sys.get_state(pid)
+
+      refute Process.alive?(worker_pid)
+      refute Map.has_key?(state.running, issue_id)
+      assert %{error: "stalled for " <> _} = state.retry_attempts[issue_id]
+    end
+
+    test "preserves Codex cumulative token snapshots across repeated updates" do
+      %{pid: pid, issue_id: issue_id} =
+        start_observed_worker("issue-codex-snapshot", "MT-CODEX-SNAP", "thread-codex-snap")
+
+      now = DateTime.utc_now()
+
+      send_snapshot = fn input, output, total ->
+        send(
+          pid,
+          {:codex_worker_update, issue_id,
+           %{
+             event: :turn_completed,
+             timestamp: now,
+             payload: %{
+               method: "turn/completed",
+               usage: %{"input_tokens" => input, "output_tokens" => output, "total_tokens" => total}
+             }
+           }}
+        )
+      end
+
+      send_snapshot.(30, 70, 100)
+      send_snapshot.(50, 90, 140)
+      state = :sys.get_state(pid)
+      updated = state.running[issue_id]
+      assert updated.codex_input_tokens == 50
+      assert updated.codex_output_tokens == 90
+      assert updated.codex_total_tokens == 140
+      assert updated.last_codex_event == :turn_completed
+
+      send_snapshot.(50, 90, 140)
+      state = :sys.get_state(pid)
+      assert state.running[issue_id].codex_total_tokens == 140
+    end
+  end
+
+  defp start_observed_worker(issue_id, identifier, session_id, opts \\ []) do
+    stale_seconds = Keyword.get(opts, :stale_seconds, 0)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: Keyword.get(opts, :stall_timeout_ms, 60_000)
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, String.to_atom("Obs" <> issue_id))
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    now = DateTime.add(DateTime.utc_now(), -max(stale_seconds, 30), :second)
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: identifier,
+      issue: %Issue{
+        id: issue_id,
+        identifier: identifier,
+        state: "In Progress",
+        url: "https://example.org/issues/" <> identifier
+      },
+      session_id: session_id,
+      last_codex_message: nil,
+      last_codex_timestamp: now,
+      last_activity_at: now,
+      last_codex_event: :notification,
+      started_at: now
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    %{pid: pid, issue_id: issue_id, worker_pid: worker_pid}
   end
 end

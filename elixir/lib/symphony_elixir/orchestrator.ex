@@ -3959,8 +3959,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
-    timestamp = SymphonyElixir.WorkerEvent.normalize_timestamp(timestamp)
-    token_delta = extract_token_delta(running_entry, update)
+    cond do
+      opencode_session_conflict?(running_entry, update) ->
+        {running_entry, empty_token_delta()}
+
+      duplicate_worker_event?(running_entry, update) ->
+        {running_entry, empty_token_delta()}
+
+      true ->
+        apply_worker_update(running_entry, event, timestamp, update)
+    end
+  end
+
+  # Worker telemetry is observational. OpenCode terminal events must not grant
+  # completion authority, replace an established session, or refresh liveness
+  # from a stale or missing timestamp.
+  defp apply_worker_update(running_entry, event, timestamp, update) do
+    token_delta = token_delta_for_worker_update(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
@@ -3970,17 +3985,14 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    {
-      Map.merge(running_entry, %{
-        last_codex_timestamp: timestamp,
-        last_activity_at: timestamp,
+    updated =
+      running_entry
+      |> Map.merge(%{
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         model: model_for_update(Map.get(running_entry, :model), update),
         reasoning_effort: reasoning_effort_for_update(Map.get(running_entry, :reasoning_effort), update),
         route_source: route_source_for_update(Map.get(running_entry, :route_source), update),
-        last_codex_event: event,
-        last_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
@@ -3989,10 +4001,112 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
-      token_delta
+      })
+      |> Map.merge(activity_fields(running_entry, event, timestamp))
+      |> Map.merge(event_id_fields(running_entry, update))
+
+    {updated, token_delta}
+  end
+
+  defp opencode_session_conflict?(running_entry, update) do
+    harness = update[:harness] || Map.get(update, "harness")
+    existing = Map.get(running_entry, :session_id)
+    incoming = update[:session_id] || Map.get(update, "session_id")
+
+    harness == :opencode and is_binary(existing) and existing != "" and is_binary(incoming) and
+      incoming != "" and existing != incoming
+  end
+
+  defp duplicate_worker_event?(running_entry, update) do
+    case update[:event_id] || Map.get(update, "event_id") do
+      id when is_binary(id) and id != "" ->
+        MapSet.member?(Map.get(running_entry, :worker_event_ids, MapSet.new()), id)
+
+      _ ->
+        false
+    end
+  end
+
+  defp activity_fields(running_entry, event, timestamp) do
+    previous =
+      Map.get(running_entry, :last_activity_at) || Map.get(running_entry, :last_codex_timestamp)
+
+    case SymphonyElixir.WorkerEvent.classify_activity_timestamp(previous, timestamp) do
+      {:fresh, dt} ->
+        %{
+          last_codex_timestamp: dt,
+          last_activity_at: dt,
+          last_codex_event: event,
+          last_event: event
+        }
+
+      :invalid ->
+        %{last_codex_event: event, last_event: event}
+
+      :stale ->
+        %{}
+    end
+  end
+
+  defp event_id_fields(running_entry, update) do
+    case update[:event_id] || Map.get(update, "event_id") do
+      id when is_binary(id) and id != "" ->
+        seen = Map.get(running_entry, :worker_event_ids, MapSet.new())
+        %{worker_event_ids: MapSet.put(seen, id)}
+
+      _ ->
+        %{}
+    end
+  end
+
+  defp empty_token_delta do
+    %{
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      input_reported: 0,
+      output_reported: 0,
+      total_reported: 0
     }
   end
+
+  defp token_delta_for_worker_update(running_entry, update) do
+    accounting = update[:usage_accounting] || Map.get(update, "usage_accounting")
+
+    if accounting in [:step, "step"] do
+      step_token_delta(running_entry, update)
+    else
+      extract_token_delta(running_entry, update)
+    end
+  end
+
+  defp step_token_delta(running_entry, update) do
+    usage = update[:usage] || Map.get(update, "usage") || %{}
+    input = non_negative_token(usage[:input_tokens] || Map.get(usage, "input_tokens"))
+    output = non_negative_token(usage[:output_tokens] || Map.get(usage, "output_tokens"))
+
+    total =
+      case usage[:total_tokens] || Map.get(usage, "total_tokens") do
+        value when is_integer(value) and value >= 0 -> value
+        _ -> input + output
+      end
+
+    prev_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
+    prev_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
+    prev_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
+
+    %{
+      input_tokens: input,
+      output_tokens: output,
+      total_tokens: total,
+      input_reported: prev_input + input,
+      output_reported: prev_output + output,
+      total_reported: prev_total + total
+    }
+  end
+
+  defp non_negative_token(value) when is_integer(value) and value >= 0, do: value
+  defp non_negative_token(_), do: 0
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),
@@ -4006,6 +4120,24 @@ defmodule SymphonyElixir.Orchestrator do
     do: to_string(pid)
 
   defp codex_app_server_pid_for_update(existing, _update), do: existing
+
+  defp session_id_for_update(existing, %{harness: :opencode} = update) do
+    incoming = update[:session_id] || Map.get(update, "session_id")
+
+    cond do
+      not is_binary(incoming) or incoming == "" ->
+        existing
+
+      not Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9._:-]*$/, incoming) ->
+        existing
+
+      existing in [nil, ""] ->
+        incoming
+
+      true ->
+        existing
+    end
+  end
 
   defp session_id_for_update(_existing, %{session_id: session_id}) when is_binary(session_id),
     do: session_id
