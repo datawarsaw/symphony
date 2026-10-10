@@ -9,12 +9,16 @@ defmodule SymphonyElixir.OpenCode.Adapter do
   - Credential boundary: the child environment is an allowlist limited to the selected provider.
   - State isolation: session, cache, and config dirs are isolated from the user's global ~/.local or ~/.config dirs.
   - Windows Job Object containment: integrated with jobrun wrapper (KILL_ON_JOB_CLOSE, positive death receipts).
+  - Recoverable launch identity: a durable LaunchMarker is recorded before the OpenCode child process exists;
+    it is cleared only on conclusive never-spawned or TERMINATED_CONFIRMED evidence, and unconfirmed
+    termination keeps the marker so workspace reuse and cleanup fail closed.
   - Positive completion: exit status 0 is not success without a completion event, clean JSONL, and confirmed termination.
   - Clean lifecycle: stdin EOF is delivered to OpenCode without closing the containment stop pipe, and stop is idempotent.
   """
 
   require Logger
 
+  alias SymphonyElixir.LaunchMarker
   alias SymphonyElixir.OpenCode.{Config, Environment, Failure, Parser}
   alias SymphonyElixir.OpenCode.{Redactor, StdioHost}
   alias SymphonyElixir.PathSafety
@@ -78,7 +82,8 @@ defmodule SymphonyElixir.OpenCode.Adapter do
   @doc """
   Starts an OpenCode process session.
   Validates model/provider selection, prepares isolated environment,
-  writes deny-by-default config, and opens the contained Port.
+  writes deny-by-default config, records the durable launch marker, and opens
+  the contained Port.
   """
   @spec start_session(Path.t(), String.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, prompt, opts \\ []) do
@@ -113,24 +118,38 @@ defmodule SymphonyElixir.OpenCode.Adapter do
       opencode_args = build_opencode_args(provider, model, canonical_workspace, prompt, opts)
       port_args = ["--stderr", stderr_path, "--", executable | opencode_args]
 
-      case start_port(canonical_workspace, host, port_args, port_env, identity) do
-        {:ok, port} ->
-          session = %{
-            port: port,
-            identity: attach_wrapper_pid(identity, port),
-            workspace: canonical_workspace,
-            dirs: dirs,
-            executable: executable,
-            provider: provider,
-            model: model,
-            launch_id: launch_id,
-            stderr_path: stderr_path,
-            parser: Parser.new()
-          }
+      # M1-G1: the durable launch marker must be on disk BEFORE the worker
+      # becomes materially active — no contained OpenCode launch may start
+      # unless its fenceable identity is already recoverable after a BEAM
+      # restart. A marker write failure for an issue-keyed launch refuses
+      # the launch (fail closed).
+      with :ok <- record_launch_marker(identity, opts),
+           {:ok, port} <- start_port(canonical_workspace, host, port_args, port_env, identity) do
+        identity = attach_wrapper_pid(identity, port)
+        record_launch_wrapper_identity(identity)
 
-          {:ok, session}
+        session = %{
+          port: port,
+          identity: identity,
+          workspace: canonical_workspace,
+          dirs: dirs,
+          executable: executable,
+          provider: provider,
+          model: model,
+          launch_id: launch_id,
+          stderr_path: stderr_path,
+          parser: Parser.new()
+        }
 
+        {:ok, session}
+      else
         {:error, reason} ->
+          # Pre-port failure (helper resolution or Port.open itself): no
+          # process was ever created, so the pre-launch marker is cleared on
+          # conclusive never-spawned evidence instead of stranding the issue
+          # behind an eternally-unprovable fence.
+          clear_launch_marker(identity)
+
           {:error, reason}
       end
     end
@@ -147,6 +166,7 @@ defmodule SymphonyElixir.OpenCode.Adapter do
     case :ets.insert_new(table, {launch_id, :pending}) do
       true ->
         confirmation = safe_stop(port, identity)
+        maybe_clear_confirmed_launch_marker(identity, confirmation)
         :ets.insert(table, {launch_id, confirmation})
         confirmation
 
@@ -309,6 +329,62 @@ defmodule SymphonyElixir.OpenCode.Adapter do
       _ -> identity
     end
   end
+
+  # M1-G1 LaunchMarker lifecycle, mirroring the Codex AppServer contract: the
+  # marker is issue-keyed because every orchestrator reuse/cleanup decision is
+  # issue-keyed. A contained OpenCode launch that cannot name its issue can
+  # never be fenced at those decision points; direct API use without an issue
+  # keeps legacy behavior with a visible warning. A marker write failure for a
+  # keyed launch refuses the launch (fail closed). Mutation-root pinning: the
+  # marker is written into the store under the launch's authority root
+  # (`:root`), so a later `workspace.root` reload can never strand the fence's
+  # memory in a store the gates no longer read.
+  defp record_launch_marker(nil, _opts), do: :ok
+
+  defp record_launch_marker(identity, opts) when is_map(identity) do
+    case Map.get(identity, "issue_id") do
+      issue_id when is_binary(issue_id) and issue_id != "" ->
+        LaunchMarker.record(identity,
+          identifier: Keyword.get(opts, :identifier),
+          attempt_id: Keyword.get(opts, :attempt_id),
+          root: Keyword.get(opts, :authority_root)
+        )
+
+      _unkeyed ->
+        Logger.warning("Contained OpenCode launch without an issue id cannot be fenced by a launch marker; proceeding unfenced")
+
+        :ok
+    end
+  end
+
+  defp record_launch_wrapper_identity(nil), do: :ok
+
+  defp record_launch_wrapper_identity(identity),
+    do: LaunchMarker.record_wrapper_identity(identity, launch_marker_identity_opts(identity))
+
+  defp clear_launch_marker(nil), do: :ok
+
+  defp clear_launch_marker(identity),
+    do: LaunchMarker.clear(identity, launch_marker_identity_opts(identity))
+
+  # The marker store root carried by the launch's own identity: the
+  # authority root recorded at creation. Identity-derived operations (wrapper
+  # identity refresh, confirmed clear, never-spawned clear) mutate exactly
+  # the store the launch was fenced with.
+  defp launch_marker_identity_opts(%{"authority_root" => root}) when is_binary(root) and root != "",
+    do: [root: root]
+
+  defp launch_marker_identity_opts(_identity), do: []
+
+  # Marker clearing is fence-accepted-only: TERMINATED_CONFIRMED means the
+  # wrapper receipt durably proves the tree drained, so the marker cannot be
+  # deleted while a worker may still be alive. Any other status keeps the
+  # marker as evidence for the resume/cleanup gates.
+  defp maybe_clear_confirmed_launch_marker(%{"issue_id" => _issue_id} = identity, %{status: :TERMINATED_CONFIRMED}) do
+    LaunchMarker.clear(identity, launch_marker_identity_opts(identity))
+  end
+
+  defp maybe_clear_confirmed_launch_marker(_identity, _confirmation), do: :ok
 
   defp safe_stop(port, identity) do
     if is_map(identity) and is_port(port) do

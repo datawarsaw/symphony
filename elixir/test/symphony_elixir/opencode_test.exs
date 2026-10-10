@@ -4,6 +4,7 @@ defmodule SymphonyElixir.OpenCodeTest do
   Code.require_file("../support/mock_opencode.exs", __DIR__)
 
   alias SymphonyElixir.FailureClass
+  alias SymphonyElixir.LaunchMarker
   alias SymphonyElixir.OpenCode
   alias SymphonyElixir.OpenCode.{Adapter, Config, Environment, Failure, Parser}
   alias SymphonyElixir.PathSafety
@@ -565,6 +566,238 @@ defmodule SymphonyElixir.OpenCodeTest do
     end
   end
 
+  # ===========================================================================
+  # 7. M1-G1 LaunchMarker Safety Gate
+  # ===========================================================================
+
+  describe "M1-G1 LaunchMarker Safety Gate" do
+    setup %{workspace: workspace} do
+      state_root = SymphonyElixir.TestSupport.create_temp_fixture_root!("opencode-launchmarker")
+
+      Application.put_env(:symphony_elixir, :launch_marker_root, Path.join(state_root, "launches"))
+      Application.put_env(:symphony_elixir, :worker_termination_receipt_root, Path.join(state_root, "receipts"))
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :launch_marker_root)
+        Application.delete_env(:symphony_elixir, :worker_termination_receipt_root)
+        SymphonyElixir.TestSupport.remove_temp_fixture_root!(state_root)
+      end)
+
+      {:ok, state_root: state_root, workspace: workspace}
+    end
+
+    @tag :windows_only
+    test "contained launch records the durable marker before the worker can run, bound to issue, attempt, workspace and containment identity", %{workspace: workspace} do
+      mock_exe = MockOpenCode.ensure_built!()
+      issue_id = "issue-opencode-marker-bind"
+      {:ok, canonical} = PathSafety.canonicalize(workspace)
+      receipts = Application.fetch_env!(:symphony_elixir, :worker_termination_receipt_root)
+
+      assert {:ok, session} =
+               Adapter.start_session(workspace, "--mock-mode=hang",
+                 provider: "anthropic",
+                 model: "claude-3-5-sonnet",
+                 executable: mock_exe,
+                 issue_id: issue_id,
+                 attempt_id: 7,
+                 identifier: "MT-OP-1"
+               )
+
+      # The marker is already durable when the session exists: it was written
+      # before the port could spawn the worker.
+      assert {:ok, marker} = LaunchMarker.read(issue_id)
+      assert marker["schema_version"] == 1
+      assert marker["issue_id"] == issue_id
+      assert marker["identifier"] == "MT-OP-1"
+      assert marker["attempt_id"] == 7
+      assert marker["workspace"] == canonical
+      assert marker["workspace_key"] == Path.basename(canonical)
+      assert marker["launch_id"] == session.identity["launch_id"]
+      assert marker["worker_identity"]["launch_id"] == session.identity["launch_id"]
+      assert marker["worker_identity"]["receipt_path"] == session.identity["receipt_path"]
+
+      assert marker["worker_identity"]["receipt_path"] ==
+               Path.join(receipts, session.identity["launch_id"] <> ".json")
+
+      assert marker["worker_identity"]["wrapper_pid"] == session.identity["wrapper_pid"]
+      assert is_binary(marker["worker_identity"]["wrapper_pid"])
+      assert is_nil(marker["worker_host"])
+
+      # While the worker is alive there is no termination receipt, so the
+      # reuse and cleanup fences must fail closed on the marker.
+      assert {:blocked, :worker_termination_unproven} = LaunchMarker.reuse_gate(issue_id)
+      assert {:blocked, :worker_termination_unproven} = LaunchMarker.cleanup_gate(issue_id)
+
+      assert %{status: :TERMINATED_CONFIRMED} = Adapter.stop_session(session)
+    end
+
+    @tag :windows_only
+    test "marker write failure refuses the launch before any process is spawned", %{workspace: workspace} do
+      mock_exe = MockOpenCode.ensure_built!()
+
+      blocked_root = Path.join(workspace, "marker-root-not-a-directory")
+      File.write!(blocked_root, "x")
+      Application.put_env(:symphony_elixir, :launch_marker_root, Path.join(blocked_root, "launches"))
+
+      assert {:error, {:launch_marker_write_failed, _detail}} =
+               Adapter.start_session(workspace, "--mock-mode=hang",
+                 provider: "anthropic",
+                 model: "claude-3-5-sonnet",
+                 executable: mock_exe,
+                 issue_id: "issue-opencode-marker-refused",
+                 attempt_id: 1
+               )
+
+      # Nothing was spawned: no wrapper ever ran, so no receipt store exists.
+      receipts = Application.fetch_env!(:symphony_elixir, :worker_termination_receipt_root)
+      assert {:error, :enoent} = File.ls(receipts)
+    end
+
+    @tag :windows_only
+    test "pre-launch port failure clears the marker on conclusive never-spawned evidence", %{workspace: workspace} do
+      mock_exe = MockOpenCode.ensure_built!()
+      issue_id = "issue-opencode-never-spawned"
+
+      Application.put_env(:symphony_elixir, :jobrun_helper_path, Path.join(workspace, "missing-jobrun.exe"))
+      on_exit(fn -> Application.delete_env(:symphony_elixir, :jobrun_helper_path) end)
+
+      assert {:error, {:jobrun_helper_missing, _path}} =
+               Adapter.start_session(workspace, "Test prompt",
+                 provider: "anthropic",
+                 model: "claude-3-5-sonnet",
+                 executable: mock_exe,
+                 issue_id: issue_id,
+                 attempt_id: 1
+               )
+
+      # Port.open never succeeded, so the pre-launch marker must not strand
+      # the issue behind an unprovable fence.
+      assert {:error, :not_found} = LaunchMarker.read(issue_id)
+      assert :allowed = LaunchMarker.reuse_gate(issue_id)
+      assert :allowed = LaunchMarker.cleanup_gate(issue_id)
+    end
+
+    @tag :windows_only
+    test "confirmed termination clears the marker so the workspace stays reusable", %{workspace: workspace} do
+      issue_id = "issue-opencode-confirmed-clear"
+
+      assert {:ok, _result} =
+               run_mock(workspace, "Test prompt", issue_id: issue_id, attempt_id: 2, identifier: "MT-OP-2")
+
+      # A successful run required TERMINATED_CONFIRMED termination evidence,
+      # which is exactly the fence-accepted bar for clearing the marker.
+      assert {:error, :not_found} = LaunchMarker.read(issue_id)
+      assert :allowed = LaunchMarker.reuse_gate(issue_id)
+      assert :allowed = LaunchMarker.cleanup_gate(issue_id)
+    end
+
+    @tag :windows_only
+    test "unconfirmed termination keeps the marker and fails the reuse and cleanup gates closed", %{workspace: workspace} do
+      issue_id = "issue-opencode-unconfirmed"
+      receipts = Application.fetch_env!(:symphony_elixir, :worker_termination_receipt_root)
+
+      # Break the receipt store before the launch: the wrapper's best-effort
+      # receipt write fails, so worker death can never be positively proven.
+      File.write!(receipts, "x")
+
+      assert {:error, {:termination_unconfirmed, result}} =
+               run_mock(workspace, "Test prompt", issue_id: issue_id, attempt_id: 3, identifier: "MT-OP-3")
+
+      assert result.termination.status == :TERMINATION_UNCONFIRMED
+
+      # The marker survives as the durable fence: unknown termination must
+      # block workspace reuse and destructive cleanup.
+      assert {:ok, marker} = LaunchMarker.read(issue_id)
+      assert marker["issue_id"] == issue_id
+      assert {:blocked, :worker_termination_unproven} = LaunchMarker.reuse_gate(issue_id)
+      assert {:blocked, :worker_termination_unproven} = LaunchMarker.cleanup_gate(issue_id)
+    end
+
+    @tag :windows_only
+    test "BEAM interruption leaves a recoverable marker: fail closed until the wrapper receipt proves drain", %{workspace: workspace} do
+      mock_exe = MockOpenCode.ensure_built!()
+      issue_id = "issue-opencode-beam-interrupted"
+
+      assert {:ok, session} =
+               Adapter.start_session(workspace, "--mock-mode=hang",
+                 provider: "anthropic",
+                 model: "claude-3-5-sonnet",
+                 executable: mock_exe,
+                 issue_id: issue_id,
+                 attempt_id: 4,
+                 identifier: "MT-OP-4"
+               )
+
+      assert {:ok, _marker} = LaunchMarker.read(issue_id)
+
+      # Simulated BEAM death before the wrapper could prove termination: no
+      # receipt exists yet, so the next boot must fail closed on the marker.
+      assert {:blocked, :worker_termination_unproven} = LaunchMarker.reuse_gate(issue_id)
+      assert {:error, :unknown} = LaunchMarker.fence_verdict(issue_id)
+
+      # BEAM death tears the port down (stdin EOF) exactly like a restart:
+      # the wrapper drains the Job on its own and writes the receipt.
+      Port.close(session.port)
+      identity = session.identity
+      wait_until(fn -> File.exists?(identity["receipt_path"]) end, 15_000)
+
+      # The durable marker plus the wrapper receipt positively prove death,
+      # so the next boot may reuse the workspace.
+      assert {:ok, :dead} = LaunchMarker.fence_verdict(issue_id)
+      assert :allowed = LaunchMarker.reuse_gate(issue_id)
+
+      # The marker itself survives the interruption; a later confirmed stop
+      # clears it exactly once (idempotent cleanup).
+      assert {:ok, _survivor} = LaunchMarker.read(issue_id)
+      assert %{status: :TERMINATED_CONFIRMED} = Adapter.stop_session(session)
+      assert Adapter.stop_session(session).status == :TERMINATED_CONFIRMED
+      assert {:error, :not_found} = LaunchMarker.read(issue_id)
+    end
+
+    @tag :windows_only
+    test "contained launch without an issue id proceeds unfenced with a visible warning", %{workspace: workspace} do
+      mock_exe = MockOpenCode.ensure_built!()
+
+      {{:ok, session}, capture} =
+        with_log(fn ->
+          Adapter.start_session(workspace, "--mock-mode=hang",
+            provider: "anthropic",
+            model: "claude-3-5-sonnet",
+            executable: mock_exe
+          )
+        end)
+
+      assert capture =~ "cannot be fenced by a launch marker"
+
+      # No marker exists for the unfenced launch.
+      launches = Application.fetch_env!(:symphony_elixir, :launch_marker_root)
+      assert {:error, :enoent} = File.ls(launches)
+
+      assert %{status: :TERMINATED_CONFIRMED} = Adapter.stop_session(session)
+    end
+
+    test "remote-worker launch is not contained and writes no marker", %{workspace: workspace} do
+      mock_exe = MockOpenCode.ensure_built!()
+
+      assert {:ok, session} =
+               Adapter.start_session(workspace, "--mock-mode=hang",
+                 provider: "anthropic",
+                 model: "claude-3-5-sonnet",
+                 executable: mock_exe,
+                 worker_host: "worker-1"
+               )
+
+      refute WorkerContainment.contained_launch?("worker-1")
+      assert is_nil(session.identity)
+
+      # No marker exists for a launch outside the containment boundary.
+      launches = Application.fetch_env!(:symphony_elixir, :launch_marker_root)
+      assert {:error, :enoent} = File.ls(launches)
+
+      assert %{status: :NOT_APPLICABLE} = Adapter.stop_session(session)
+    end
+  end
+
   describe "OpenCode 1.18.28 completion contract" do
     test "successful single-step turn completes on terminal step_finish without session.status" do
       stream =
@@ -1121,6 +1354,24 @@ defmodule SymphonyElixir.OpenCodeTest do
         extra
       )
     )
+  end
+
+  defp wait_until(fun, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_until(fun, deadline, timeout_ms)
+  end
+
+  defp do_wait_until(fun, deadline, timeout_ms) do
+    if fun.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("condition was not met within #{timeout_ms}ms")
+      else
+        Process.sleep(50)
+        do_wait_until(fun, deadline, timeout_ms)
+      end
+    end
   end
 
   defp with_restored_env(keys, fun) do
