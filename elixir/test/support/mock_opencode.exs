@@ -1,5 +1,8 @@
 defmodule SymphonyElixir.TestSupport.MockOpenCode do
-  @moduledoc false
+  @moduledoc """
+  Deterministic mock OpenCode worker compiler and executable resolver.
+  Compiles test/support/windows/mock_opencode.cs via Microsoft csc.exe.
+  """
 
   @source "test/support/windows/mock_opencode.cs"
   @bin_dir "test/support/windows/bin"
@@ -52,3 +55,4 @@ defmodule SymphonyElixir.TestSupport.MockOpenCode do
     Enum.find(candidates, &File.exists?/1) || raise "csc.exe not found on host"
   end
 end
+
