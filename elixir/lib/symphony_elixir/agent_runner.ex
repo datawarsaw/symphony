@@ -125,6 +125,15 @@ defmodule SymphonyElixir.AgentRunner do
     ]
   end
 
+  @doc """
+  Builds a harness-neutral worker event callback for an issue and recipient.
+  Suitable for worker adapters (such as OpenCode) to report streaming activity and events.
+  """
+  @spec worker_event_callback(pid() | nil, Issue.t() | map() | String.t(), keyword()) :: (term() -> :ok)
+  def worker_event_callback(recipient, issue, opts \\ []) do
+    SymphonyElixir.WorkerEvent.callback(recipient, issue, opts)
+  end
+
   defp codex_message_handler(recipient, issue) do
     fn message ->
       send_codex_update(recipient, issue, message)

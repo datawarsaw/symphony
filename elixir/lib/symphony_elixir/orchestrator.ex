@@ -286,9 +286,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
-        {:codex_worker_update, issue_id, %{event: _, timestamp: _} = update},
+        {channel, issue_id, %{event: _, timestamp: _} = update},
         %{running: running} = state
-      ) do
+      )
+      when channel in [:codex_worker_update, :worker_update] do
     case Map.get(running, issue_id) do
       nil ->
         {:noreply, state}
@@ -306,7 +307,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
+  def handle_info({channel, _issue_id, _update}, state)
+      when channel in [:codex_worker_update, :worker_update],
+      do: {:noreply, state}
 
   def handle_info({:discovery_completed, issue_id, verdict}, %{running: running} = state) do
     case Map.fetch(running, issue_id) do
@@ -1036,13 +1039,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_activity_timestamp(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_timestamp) || Map.get(running_entry, :started_at)
+    Map.get(running_entry, :last_activity_at) ||
+      Map.get(running_entry, :last_codex_timestamp) ||
+      Map.get(running_entry, :started_at)
   end
 
   defp last_activity_timestamp(_running_entry), do: nil
 
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
     Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
+      Map.get(running_entry, :last_event) in [:turn_input_required, :approval_required, :input_required] or
       not is_nil(input_required_completion_outcome(Map.get(running_entry, :completion))) or
       codex_message_method(Map.get(running_entry, :last_codex_message)) ==
         "mcpServer/elicitation/request"
@@ -1083,6 +1089,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp codex_event_blocker_error(:turn_input_required), do: "codex turn requires operator input"
   defp codex_event_blocker_error(:approval_required), do: "codex turn requires approval"
+  defp codex_event_blocker_error(:input_required), do: "worker requires operator input"
   defp codex_event_blocker_error(_event), do: nil
 
   defp completion_blocker_error(completion) do
@@ -3947,8 +3954,28 @@ defmodule SymphonyElixir.Orchestrator do
   @spec operational_statuses_for_test(term()) :: %{String.t() => operational_status()}
   def operational_statuses_for_test(%State{} = state), do: operational_statuses(state)
 
+  defp integrate_codex_update(running_entry, %SymphonyElixir.WorkerEvent{} = event) do
+    integrate_codex_update(running_entry, SymphonyElixir.WorkerEvent.to_update(event))
+  end
+
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
-    token_delta = extract_token_delta(running_entry, update)
+    cond do
+      opencode_session_conflict?(running_entry, update) ->
+        {running_entry, empty_token_delta()}
+
+      duplicate_worker_event?(running_entry, update) ->
+        {running_entry, empty_token_delta()}
+
+      true ->
+        apply_worker_update(running_entry, event, timestamp, update)
+    end
+  end
+
+  # Worker telemetry is observational. OpenCode terminal events must not grant
+  # completion authority, replace an established session, or refresh liveness
+  # from a stale or missing timestamp.
+  defp apply_worker_update(running_entry, event, timestamp, update) do
+    token_delta = token_delta_for_worker_update(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
@@ -3958,15 +3985,13 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    {
-      Map.merge(running_entry, %{
-        last_codex_timestamp: timestamp,
-        last_codex_message: summarize_codex_update(update),
+    updated =
+      running_entry
+      |> Map.merge(%{
         session_id: session_id_for_update(running_entry.session_id, update),
         model: model_for_update(Map.get(running_entry, :model), update),
         reasoning_effort: reasoning_effort_for_update(Map.get(running_entry, :reasoning_effort), update),
         route_source: route_source_for_update(Map.get(running_entry, :route_source), update),
-        last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
@@ -3975,10 +4000,120 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
-      token_delta
+      })
+      |> Map.merge(activity_fields(running_entry, event, timestamp, update))
+      |> Map.merge(event_id_fields(running_entry, update))
+
+    {updated, token_delta}
+  end
+
+  defp opencode_session_conflict?(running_entry, update) do
+    harness = update[:harness] || Map.get(update, "harness")
+    existing = Map.get(running_entry, :session_id)
+    incoming = update[:session_id] || Map.get(update, "session_id")
+
+    harness == :opencode and is_binary(existing) and existing != "" and is_binary(incoming) and
+      incoming != "" and existing != incoming
+  end
+
+  defp duplicate_worker_event?(running_entry, update) do
+    case update[:event_id] || Map.get(update, "event_id") do
+      id when is_binary(id) and id != "" ->
+        MapSet.member?(Map.get(running_entry, :worker_event_ids, MapSet.new()), id)
+
+      _ ->
+        false
+    end
+  end
+
+  # The last operational message is part of the accepted liveness snapshot. A
+  # stale event still contributes its token accounting, but it must not replace
+  # the message that arrived with the newest accepted activity timestamp.
+  defp activity_fields(running_entry, event, timestamp, update) do
+    previous =
+      Map.get(running_entry, :last_activity_at) || Map.get(running_entry, :last_codex_timestamp)
+
+    case SymphonyElixir.WorkerEvent.classify_activity_timestamp(previous, timestamp) do
+      {:fresh, dt} ->
+        %{
+          last_codex_timestamp: dt,
+          last_activity_at: dt,
+          last_codex_event: event,
+          last_event: event,
+          last_codex_message: summarize_codex_update(update)
+        }
+
+      :invalid ->
+        %{
+          last_codex_event: event,
+          last_event: event,
+          last_codex_message: summarize_codex_update(update)
+        }
+
+      :stale ->
+        %{}
+    end
+  end
+
+  defp event_id_fields(running_entry, update) do
+    case update[:event_id] || Map.get(update, "event_id") do
+      id when is_binary(id) and id != "" ->
+        seen = Map.get(running_entry, :worker_event_ids, MapSet.new())
+        %{worker_event_ids: MapSet.put(seen, id)}
+
+      _ ->
+        %{}
+    end
+  end
+
+  defp empty_token_delta do
+    %{
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      input_reported: 0,
+      output_reported: 0,
+      total_reported: 0
     }
   end
+
+  defp token_delta_for_worker_update(running_entry, update) do
+    accounting = update[:usage_accounting] || Map.get(update, "usage_accounting")
+
+    if accounting in [:step, "step"] do
+      step_token_delta(running_entry, update)
+    else
+      extract_token_delta(running_entry, update)
+    end
+  end
+
+  defp step_token_delta(running_entry, update) do
+    usage = update[:usage] || Map.get(update, "usage") || %{}
+    input = non_negative_token(usage[:input_tokens] || Map.get(usage, "input_tokens"))
+    output = non_negative_token(usage[:output_tokens] || Map.get(usage, "output_tokens"))
+
+    total =
+      case usage[:total_tokens] || Map.get(usage, "total_tokens") do
+        value when is_integer(value) and value >= 0 -> value
+        _ -> input + output
+      end
+
+    prev_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
+    prev_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
+    prev_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
+
+    %{
+      input_tokens: input,
+      output_tokens: output,
+      total_tokens: total,
+      input_reported: prev_input + input,
+      output_reported: prev_output + output,
+      total_reported: prev_total + total
+    }
+  end
+
+  defp non_negative_token(value) when is_integer(value) and value >= 0, do: value
+  defp non_negative_token(_), do: 0
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),
@@ -3992,6 +4127,24 @@ defmodule SymphonyElixir.Orchestrator do
     do: to_string(pid)
 
   defp codex_app_server_pid_for_update(existing, _update), do: existing
+
+  defp session_id_for_update(existing, %{harness: :opencode} = update) do
+    incoming = update[:session_id] || Map.get(update, "session_id")
+
+    cond do
+      not is_binary(incoming) or incoming == "" ->
+        existing
+
+      not Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9._:-]*$/, incoming) ->
+        existing
+
+      existing in [nil, ""] ->
+        incoming
+
+      true ->
+        existing
+    end
+  end
 
   defp session_id_for_update(_existing, %{session_id: session_id}) when is_binary(session_id),
     do: session_id
@@ -4310,9 +4463,16 @@ defmodule SymphonyElixir.Orchestrator do
     ]
 
     Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
+      Enum.find_value(payloads, &direct_token_usage_from_payload/1) ||
       Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
       %{}
   end
+
+  defp direct_token_usage_from_payload(payload) when is_map(payload) do
+    if integer_token_map?(payload), do: payload, else: nil
+  end
+
+  defp direct_token_usage_from_payload(_payload), do: nil
 
   defp extract_rate_limits(update) do
     rate_limits_from_payload(update[:rate_limits]) ||
@@ -4484,6 +4644,7 @@ defmodule SymphonyElixir.Orchestrator do
         :input_tokens,
         :prompt_tokens,
         :input,
+        "input",
         "promptTokens",
         :promptTokens,
         "inputTokens",
@@ -4498,6 +4659,7 @@ defmodule SymphonyElixir.Orchestrator do
         :output_tokens,
         :completion_tokens,
         :output,
+        "output",
         :completion,
         "outputTokens",
         :outputTokens,
