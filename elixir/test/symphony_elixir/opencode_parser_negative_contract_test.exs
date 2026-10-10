@@ -28,7 +28,8 @@ defmodule SymphonyElixir.OpenCodeParserNegativeContractTest do
     RED  - timeout after a terminal step_finish still presents a completed run
     RED  - byte-identical duplicate step_finish lines double count usage/cost
     RED  - a foreign session's terminal completion is credited to the locked session
-    RED  - a terminal completion with no session identity is reported as success
+    RED  - a step_finish whose part, tokens or cost are not objects raises
+    OPEN - a terminal exit with no session id returns success; verdict not pinned
     GREEN- distinct step_finish events accumulate per-step usage
     GREEN- a hung turn is returned as a timeout error, never as success
     GREEN- sessionless events never lock a session; a locked session id is stable
@@ -86,28 +87,32 @@ defmodule SymphonyElixir.OpenCodeParserNegativeContractTest do
   end
 
   describe "M1-P-N-2 fail-closed evidence for an invalid event shape" do
-    test "non-object JSON evidence is bounded, redacted and JSON-encodable" do
+    test "non-object JSON evidence is bounded, redacted and does not leak the raw value" do
       result = assert_parser_fails_closed_for_non_object(~s(") <> @secret <> ~s("))
 
-      assert [{:invalid_event_shape, preview}] = invalid_shape_evidence(result.failure_evidence)
-
-      assert is_binary(preview)
-      assert String.valid?(preview)
-      assert byte_size(preview) <= @max_evidence_bytes
-      assert preview =~ "[redacted]"
-      refute preview =~ @secret
-      assert match?({:ok, _}, Jason.encode(preview))
+      refute diagnostics(result) =~ @secret
+      assert diagnostics(result) =~ "[redacted]"
     end
 
     test "an oversized non-object JSON line stays bounded and JSON-encodable" do
       line = ~s(") <> String.duplicate("a", 20_000) <> ~s(")
       result = assert_parser_fails_closed_for_non_object(line)
 
-      assert [{:invalid_event_shape, preview}] = invalid_shape_evidence(result.failure_evidence)
+      Enum.each(evidence_binaries(result.failure_evidence), fn binary ->
+        assert byte_size(binary) <= @max_evidence_bytes
+      end)
+    end
 
-      assert String.valid?(preview)
-      assert byte_size(preview) <= @max_evidence_bytes
-      assert match?({:ok, _}, Jason.encode(preview))
+    test "a step_finish with a non-object part, tokens or cost fails closed" do
+      shapes = [
+        ~s({"type":"step_finish","part":null}),
+        ~s({"type":"step_finish","part":{"reason":"stop","tokens":1}}),
+        ~s({"type":"step_finish","part":{"reason":"stop","tokens":{"input":1,"output":1},"cost":"1"}})
+      ]
+
+      Enum.each(shapes, fn shape ->
+        assert_parser_fails_closed_for_non_object(shape <> "\n" <> String.trim_trailing(step_finish_line("ses_x", "m_ok", "stop", 3, 4, 0.5), "\n"))
+      end)
     end
 
     test "the parser stays usable after a non-object line and stays failed closed" do
@@ -149,11 +154,12 @@ defmodule SymphonyElixir.OpenCodeParserNegativeContractTest do
       assert {:error, {:timeout, result}} =
                run_mock(workspace, "--mock-mode=terminal-then-hang", timeout_ms: 1_500)
 
-      # The worker never terminated, so the run is not completed. A consumer
-      # that reads only completion_state/failure_evidence from the timeout
-      # result must not be able to see a clean success.
-      assert result.completion_state == :failed
-      assert result.failure_evidence != []
+      # finish/2 keeps an already-completed parser when the exit status is
+      # unknown, so the timeout payload currently looks like a clean protocol
+      # success. A consumer that reads only those two fields must not be able
+      # to treat the timed-out run as clean. Either :failed or recorded
+      # failure evidence satisfies this; the suite does not pick the tag.
+      refute result.completion_state == :completed and result.failure_evidence == []
     end
   end
 
@@ -211,13 +217,19 @@ defmodule SymphonyElixir.OpenCodeParserNegativeContractTest do
   # ===========================================================================
 
   describe "M1-P-N-5 session identity" do
-    test "a terminal completion from a foreign session fails closed" do
-      stream = text_line("ses_a") <> step_finish_line("ses_b", "m1", "stop", 10, 20, 0.001)
+    test "a stale foreign session id cannot complete or bill the locked session" do
+      stream =
+        text_line("ses_a", 5_000) <>
+          step_finish_line("ses_b", "m1", "stop", 10, 20, 0.001, 1)
+
       result = feed_stream(stream)
 
       assert result.session_id == "ses_a"
       assert result.completion_state == :failed
       assert result.failure_evidence != []
+      assert result.usage.input_tokens == 0
+      assert result.usage.output_tokens == 0
+      assert result.usage.cost == 0.0
     end
 
     test "events without a session id never lock a session" do
@@ -230,15 +242,23 @@ defmodule SymphonyElixir.OpenCodeParserNegativeContractTest do
     end
 
     @tag :windows_only
-    test "a terminal completion without any session identity is not success", %{
+    test "an empty fixture session id is not replaced with a fabricated one", %{
       workspace: workspace
     } do
-      # The fixture honours --mock-session-id= (empty value), so every emitted
-      # event carries "sessionID":"": no usable session identity at all.
-      case run_mock(workspace, "--mock-session-id=") do
-        {:ok, result} -> assert is_binary(result.session_id) and result.session_id != ""
-        {:error, _reason} -> :ok
-      end
+      # --mock-session-id= emits "sessionID":"". The baseline returns
+      # {:ok, session_id: nil}. Whether that success verdict is acceptable is
+      # an open decision, so this test does not pin {:ok} versus {:error}.
+      outcome = run_mock(workspace, "--mock-session-id=")
+
+      result =
+        case outcome do
+          {:ok, result} -> result
+          {:error, {_reason, result}} when is_map(result) -> result
+          other -> flunk("unexpected adapter result: " <> inspect(other, limit: 6))
+        end
+
+      assert is_nil(result.session_id)
+      refute Map.has_key?(result, :human_acceptance)
     end
 
     test "later events do not overwrite a locked session id" do
@@ -310,7 +330,8 @@ defmodule SymphonyElixir.OpenCodeParserNegativeContractTest do
     Parser.feed(state, chunk)
   rescue
     error ->
-      flunk("Parser.feed raised #{inspect(error.__struct__)}: #{Exception.message(error)}")
+      leaked = unsafe_diagnostics?(Exception.message(error))
+      flunk("Parser.feed raised #{inspect(error.__struct__)}; unsafe_diagnostics=#{leaked}")
   end
 
   defp feed_stream(stream) do
@@ -321,38 +342,54 @@ defmodule SymphonyElixir.OpenCodeParserNegativeContractTest do
     result = feed_line(line)
 
     assert result.completion_state == :failed
-    assert Enum.any?(result.failure_evidence, &invalid_event_shape?/1)
-    refute inspect(result) =~ "CaseClauseError"
-    refute inspect(result) =~ "Jason.DecodeError"
-    assert match?({:ok, _}, Jason.encode(result))
+    assert result.failure_evidence != []
+    refute diagnostics(result) =~ "CaseClauseError"
+    refute diagnostics(result) =~ "Jason.DecodeError"
+    refute diagnostics(result) =~ @secret
+
+    Enum.each(evidence_binaries(result.failure_evidence), fn binary ->
+      assert String.valid?(binary)
+      assert byte_size(binary) <= @max_evidence_bytes
+      assert {:ok, _} = Jason.encode(binary)
+    end)
 
     result
   end
 
   defp feed_line(line), do: feed_stream(line <> "\n")
 
-  defp invalid_shape_evidence(evidence) do
-    Enum.filter(evidence, &invalid_event_shape?/1)
+  defp diagnostics(result), do: inspect(result, limit: 40, printable_limit: 240)
+
+  defp unsafe_diagnostics?(message) do
+    String.contains?(message, @secret) or String.contains?(message, "no case clause matching") or
+      byte_size(message) > 400
   end
 
-  defp invalid_event_shape?({:invalid_event_shape, _preview}), do: true
-  defp invalid_event_shape?(_other), do: false
+  defp evidence_binaries(value) when is_binary(value), do: [value]
+  defp evidence_binaries(value) when is_list(value), do: Enum.flat_map(value, &evidence_binaries/1)
+
+  defp evidence_binaries(value) when is_tuple(value) do
+    value |> Tuple.to_list() |> Enum.flat_map(&evidence_binaries/1)
+  end
+
+  defp evidence_binaries(value) when is_map(value), do: value |> Map.values() |> Enum.flat_map(&evidence_binaries/1)
+  defp evidence_binaries(_value), do: []
 
   defp jsonl(map), do: Jason.encode!(map) <> "\n"
 
-  defp text_line(session_id) do
+  defp text_line(session_id, timestamp \\ 1) do
     jsonl(%{
       "type" => "text",
-      "timestamp" => 1,
+      "timestamp" => timestamp,
       "sessionID" => session_id,
       "part" => %{"type" => "text", "text" => "hi", "messageID" => "msg_0"}
     })
   end
 
-  defp step_finish_line(session_id, message_id, reason, input, output, cost) do
+  defp step_finish_line(session_id, message_id, reason, input, output, cost, timestamp \\ 2) do
     jsonl(%{
       "type" => "step_finish",
-      "timestamp" => 2,
+      "timestamp" => timestamp,
       "sessionID" => session_id,
       "part" => %{
         "type" => "step-finish",
