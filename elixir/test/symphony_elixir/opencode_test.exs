@@ -6,7 +6,7 @@ defmodule SymphonyElixir.OpenCodeTest do
   alias SymphonyElixir.FailureClass
   alias SymphonyElixir.LaunchMarker
   alias SymphonyElixir.OpenCode
-  alias SymphonyElixir.OpenCode.{Adapter, Config, Environment, Failure, Parser}
+  alias SymphonyElixir.OpenCode.{Adapter, Config, Environment, Failure, Parser, Redactor}
   alias SymphonyElixir.PathSafety
   alias SymphonyElixir.TestSupport.MockOpenCode
   alias SymphonyElixir.WorkerContainment
@@ -997,7 +997,131 @@ defmodule SymphonyElixir.OpenCodeTest do
       rendered = hd(result.tool_events).output
       refute rendered =~ secret
       assert String.ends_with?(rendered, "…[truncated]")
-      assert byte_size(rendered) <= 4_096 + byte_size("…[truncated]")
+      assert byte_size(rendered) <= 4_096
+    end
+
+    test "truncation across multibyte UTF-8 codepoint boundaries stays valid UTF-8 within byte budget" do
+      # Test 2-byte characters (e.g. "ą" = 2 bytes)
+      for prefix_len <- 0..3 do
+        prefix = String.duplicate("x", prefix_len)
+        input = prefix <> String.duplicate("ą", 2_500)
+        bounded = Redactor.redact(input)
+
+        assert String.valid?(bounded)
+        assert String.ends_with?(bounded, "…[truncated]")
+        assert byte_size(bounded) <= 4_096
+        assert match?({:ok, _}, Jason.encode(bounded))
+      end
+
+      # Test 3-byte characters (e.g. "€" = 3 bytes)
+      for prefix_len <- 0..4 do
+        prefix = String.duplicate("x", prefix_len)
+        input = prefix <> String.duplicate("€", 1_800)
+        bounded = Redactor.redact(input)
+
+        assert String.valid?(bounded)
+        assert String.ends_with?(bounded, "…[truncated]")
+        assert byte_size(bounded) <= 4_096
+        assert match?({:ok, _}, Jason.encode(bounded))
+      end
+
+      # Test 4-byte characters (e.g. "🎉" = 4 bytes)
+      for prefix_len <- 0..5 do
+        prefix = String.duplicate("x", prefix_len)
+        input = prefix <> String.duplicate("🎉", 1_500)
+        bounded = Redactor.redact(input)
+
+        assert String.valid?(bounded)
+        assert String.ends_with?(bounded, "…[truncated]")
+        assert byte_size(bounded) <= 4_096
+        assert match?({:ok, _}, Jason.encode(bounded))
+      end
+    end
+
+    test "malformed non-UTF-8 input is sanitized to valid UTF-8 and JSON-encodable without leaking secrets" do
+      secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      bearer = "Bearer my-secret-auth-token-12345"
+
+      cases = [
+        <<0xFF, 0xFE>> <> secret <> <<0x80>>,
+        <<0x80, 0x81, 0x82>> <> bearer <> <<0x83>>,
+        <<0xC0, 0xAF>> <> secret <> <<0xFF>>,
+        <<0xED, 0xA0, 0x80>> <> " some data " <> bearer
+      ]
+
+      for malformed <- cases do
+        redacted = Redactor.redact(malformed)
+
+        assert String.valid?(redacted)
+        assert match?({:ok, _}, Jason.encode(redacted))
+        assert byte_size(redacted) <= 4_096
+        refute redacted =~ secret
+        refute redacted =~ "my-secret-auth-token"
+        assert redacted =~ "[redacted]"
+      end
+    end
+
+    test "oversized output and boundary-spanning secrets are scrubbed and bounded within 4096 bytes" do
+      secret1 = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+      secret2 = "lin_api_abcdefghijklmnopqrstuvwxyz"
+      secret3 = "ghp_12345678901234567890"
+
+      prefix = String.duplicate("🚀", 1_000)
+      input = prefix <> secret1 <> " " <> secret2 <> " " <> String.duplicate("語", 2_000) <> secret3
+
+      redacted = Redactor.redact(input)
+
+      assert String.valid?(redacted)
+      assert String.ends_with?(redacted, "…[truncated]")
+      assert byte_size(redacted) <= 4_096
+      assert match?({:ok, _}, Jason.encode(redacted))
+      refute redacted =~ secret1
+      refute redacted =~ secret2
+      refute redacted =~ secret3
+    end
+
+    test "parser malformed lines with non-UTF-8 bytes and secrets fail closed with sanitized JSON-encodable evidence" do
+      secret = "sk-ant-api03-malformed-line-secret-xyz"
+      malformed_chunk = ~s({"type": ") <> <<0xFF, 0xFE>> <> secret <> "\n"
+
+      result =
+        Parser.new()
+        |> Parser.feed(malformed_chunk)
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :failed
+      assert [{:malformed_json_line, line, detail}] = result.failure_evidence
+
+      assert is_binary(line)
+      assert String.valid?(line)
+      assert match?({:ok, _}, Jason.encode(line))
+      refute line =~ secret
+      assert line =~ "[redacted]"
+
+      assert is_map(detail)
+      assert match?({:ok, _}, Jason.encode(detail))
+    end
+
+    test "failure classification sanitizes malformed multibyte error messages and secrets" do
+      secret = "sk-ant-api03-failure-info-secret-12345"
+      reason = "connection error: " <> <<0xFF, 0xFE>> <> secret <> " " <> String.duplicate("€", 2_000)
+
+      info = Failure.failure_info(reason)
+
+      assert is_binary(info.message)
+      assert String.valid?(info.message)
+      assert byte_size(info.message) <= 4_096
+      assert match?({:ok, _}, Jason.encode(info.message))
+      refute info.message =~ secret
+
+      assert is_binary(info.raw)
+      assert String.valid?(info.raw)
+      assert byte_size(info.raw) <= 4_096
+      assert match?({:ok, _}, Jason.encode(info.raw))
+      refute info.raw =~ secret
+
+      assert match?({:ok, _}, Jason.encode(info))
     end
   end
 

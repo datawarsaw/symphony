@@ -11,6 +11,7 @@ defmodule SymphonyElixir.OpenCode.Redactor do
   @max_bytes 4_096
   @truncated "…[truncated]"
   @redacted "[redacted]"
+  @budget @max_bytes - byte_size(@truncated)
 
   @patterns [
     ~r/(?i)\bauthorization\s*:\s*bearer\s+\S+/,
@@ -28,9 +29,11 @@ defmodule SymphonyElixir.OpenCode.Redactor do
   @spec redact(term()) :: term()
   def redact(value) when is_binary(value) do
     value
+    |> ensure_valid_utf8()
     |> scrub()
     |> bound()
     |> scrub()
+    |> ensure_within_budget()
   end
 
   def redact(value) when is_list(value), do: Enum.map(value, &redact/1)
@@ -60,34 +63,54 @@ defmodule SymphonyElixir.OpenCode.Redactor do
 
   defp bound(value) do
     value
-    |> binary_part(0, @max_bytes)
+    |> binary_part(0, @budget)
     |> drop_partial_codepoint()
     |> Kernel.<>(@truncated)
   end
 
-  # binary_part/3 can split a multi-byte codepoint at the bound. Drop the
-  # dangling bytes so bounded evidence stays valid UTF-8.
-  defp drop_partial_codepoint(binary) do
-    size = byte_size(binary)
+  defp ensure_within_budget(value) when byte_size(value) <= @max_bytes, do: value
+  defp ensure_within_budget(value), do: bound(value)
 
-    if String.valid?(binary) or size == 0 do
-      binary
-    else
-      dangling = count_dangling_bytes(binary, min(size, 4), 0)
-      binary_part(binary, 0, size - dangling)
+  # Ensures bounded binary ends at a complete UTF-8 codepoint boundary so
+  # truncated evidence is valid UTF-8.
+  defp drop_partial_codepoint(binary) do
+    case :unicode.characters_to_binary(binary, :utf8, :utf8) do
+      valid when is_binary(valid) ->
+        valid
+
+      {:incomplete, valid, _rest} ->
+        valid
+
+      {:error, valid, _rest} ->
+        valid
     end
   end
 
-  defp count_dangling_bytes(_binary, 0, count), do: count
-
-  defp count_dangling_bytes(binary, left, count) do
-    size = byte_size(binary)
-    <<byte>> = binary_part(binary, size - 1, 1)
-
-    if byte >= 0x80 do
-      count_dangling_bytes(binary_part(binary, 0, size - 1), left - 1, count + 1)
+  # Replaces malformed or non-UTF-8 byte sequences with the Unicode replacement
+  # character so sanitized evidence is always valid UTF-8 and JSON-encodable.
+  defp ensure_valid_utf8(binary) when is_binary(binary) do
+    if String.valid?(binary) do
+      binary
     else
-      count
+      binary |> sanitize_utf8([]) |> IO.iodata_to_binary()
+    end
+  end
+
+  defp sanitize_utf8(<<>>, acc), do: Enum.reverse(acc)
+
+  defp sanitize_utf8(binary, acc) do
+    case :unicode.characters_to_binary(binary, :utf8, :utf8) do
+      valid when is_binary(valid) ->
+        Enum.reverse([valid | acc])
+
+      {:error, valid, <<_invalid, rest::binary>>} ->
+        sanitize_utf8(rest, ["", valid | acc])
+
+      {:error, valid, <<>>} ->
+        Enum.reverse([valid | acc])
+
+      {:incomplete, valid, rest} ->
+        Enum.reverse([String.duplicate("", byte_size(rest)), valid | acc])
     end
   end
 end
