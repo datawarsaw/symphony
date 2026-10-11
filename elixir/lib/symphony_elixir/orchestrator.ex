@@ -2640,6 +2640,9 @@ defmodule SymphonyElixir.Orchestrator do
   def dispatch_harness_for_test(%Issue{} = issue), do: dispatch_harness(issue)
 
   @doc false
+  @spec decide_harness_for_test(State.t(), Issue.t()) ::
+          {{:park, atom(), term()}, State.t()}
+          | {{:dispatch, :opencode | :codex, term()}, State.t()}
   def decide_harness_for_test(%State{} = state, %Issue{} = issue) do
     case resolve_attempt_harness(state, issue) do
       {:park, reason, evidence} ->
@@ -2651,6 +2654,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec continue_running_issue_for_test(State.t(), String.t(), map()) :: term()
   def continue_running_issue_for_test(%State{} = state, issue_id, running_entry)
       when is_binary(issue_id) and is_map(running_entry) do
     handle_agent_down(:normal, state, issue_id, running_entry, "continuation-test")
