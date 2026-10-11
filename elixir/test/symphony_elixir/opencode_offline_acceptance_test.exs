@@ -365,9 +365,12 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
 
       invalid_map = %{"enabled" => "not_a_boolean"}
 
-      assert {:codex, :opencode_incomplete} = HarnessSelection.select(issue, no_provider)
-      assert {:codex, :opencode_incomplete} = HarnessSelection.select(issue, no_model)
-      assert {:codex, :opencode_incomplete} = HarnessSelection.select(issue, empty_tools)
+      # M1-C/M1-C-F2 hardening (accepted): an invalid section that still lists
+      # the issue returns an explicit validation error instead of silently
+      # substituting Codex; the caller parks or fails closed on it.
+      assert {:error, :invalid_opencode_config} = HarnessSelection.select(issue, no_provider)
+      assert {:error, :invalid_opencode_config} = HarnessSelection.select(issue, no_model)
+      assert {:error, :invalid_opencode_config} = HarnessSelection.select(issue, empty_tools)
       assert {:codex, :invalid_opencode_config} = HarnessSelection.select(issue, invalid_map)
       assert {:codex, :invalid_opencode_config} = HarnessSelection.select(issue, :invalid_term)
     end
@@ -796,7 +799,9 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
       final = List.last(updates)
       assert final.terminal? == true
       assert final.usage_accounting == :cumulative
-      assert get_in(final, [:tokenUsage, :total, :totalTokens]) == 300
+      # M1-U-F additive wire contract: the mock turn's cumulative total sums
+      # every category (input + output + reasoning + cache read + cache write).
+      assert get_in(final, [:tokenUsage, :total, :totalTokens]) == 385
 
       # The authoritative completion decision required containment evidence:
       # the adapter's TERMINATED_CONFIRMED confirmation reached the recipient
@@ -1295,9 +1300,14 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
         allowed_issues: ["MIC-NULL-ENABLED"]
       }
 
-      # On the committed baseline a null enabled flag never selects OpenCode
-      assert {:codex, :opencode_disabled} = HarnessSelection.select(issue, null_enabled_struct)
-      assert {:codex, :opencode_disabled} = HarnessSelection.select(issue, %{"enabled" => nil})
+      # M1-C-F2 null-bypass remediation (accepted): an explicit null enabled is
+      # rejected as an invalid section — neither consent nor refusal authorizes
+      # selection, and it never silently substitutes Codex for an allowlisted
+      # issue. A validated disabled section keeps {:codex, :opencode_disabled}.
+      assert {:error, :invalid_opencode_config} = HarnessSelection.select(issue, null_enabled_struct)
+      # The same invalid section WITHOUT the issue allowlisted keeps the Codex
+      # tuple (this issue is not authorized, so selection fails closed to Codex).
+      assert {:codex, :invalid_opencode_config} = HarnessSelection.select(issue, %{"enabled" => nil})
     end
 
     test "launch boundary rejects an unbounded pilot snapshot fail-closed", context do

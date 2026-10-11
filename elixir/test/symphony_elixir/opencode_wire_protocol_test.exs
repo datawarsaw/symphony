@@ -83,8 +83,9 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
       assert result.usage.cache_write_tokens == 0
       assert result.usage.cost == 0.00312
 
-      # Parser accounting: total_tokens is input plus output and ignores any explicit tokens.total.
-      assert result.usage.total_tokens == 963
+      # M1-U-F additive wire contract: total is the five-category sum
+      # (954 input + 9 output + 0 reasoning + 7680 cache read + 0 cache write).
+      assert result.usage.total_tokens == 8643
 
       # This fixture carries no tokens.total (removed in remediation; see the provenance document).
       raw_last_event =
@@ -149,8 +150,8 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
       assert result.usage.reasoning_tokens == 600
       assert result.usage.cost == 0.005
 
-      # Parser fallback sums input and output only (1500 + 150 = 1650); reasoning tokens are reported separately.
-      assert result.usage.total_tokens == 1650
+      # M1-U-F additive wire contract: 1500 input + 150 output + 600 reasoning.
+      assert result.usage.total_tokens == 2250
     end
   end
 
@@ -164,11 +165,11 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
         |> Parser.finish(0)
         |> Parser.to_result()
 
-      # Current Symphony behavior (Gap A3):
-      # process_tool_use latches completion_state: :failed on status == "error",
-      # and apply_step_finish_reason only completes when state is :running.
-      # Therefore, even with exit code 0 and final step_finish reason "stop", the turn fails closed.
-      assert result.completion_state == :failed
+      # M1-SEM-F (accepted): a recovered tool error no longer latches the
+      # protocol stream failed — the turn that concludes with "stop" completes
+      # at the protocol level while the tool error stays recorded as evidence
+      # and blocks clean worker success downstream.
+      assert result.completion_state == :completed
       assert length(result.tool_events) == 1
 
       [tool] = result.tool_events
@@ -176,13 +177,14 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
       assert tool.status == "error"
       assert tool.error =~ "ENOENT"
 
-      assert Enum.any?(result.failure_evidence, fn
+      # M1-SEM-F: tool errors are recorded separately in tool_failures and stay
+      # disqualifying for clean worker success even though the protocol turn
+      # completes on the concluding "stop".
+      assert Enum.any?(result.tool_failures, fn
                {:tool_error, "read_file", err} -> err =~ "ENOENT"
                _ -> false
              end)
-
-      # Whether upstream exits 0 after a recovered tool error was not traced in this remediation.
-      # This assertion characterizes Symphony's current fail-closed policy only.
+      assert result.completion_state == :completed
     end
 
     test "terminal_reason_other.jsonl documents rejection of 'other' finishReason" do
@@ -194,16 +196,13 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
         |> Parser.finish(0)
         |> Parser.to_result()
 
-      # Current Symphony behavior (Gap A1):
-      # @terminal_step_reasons is ~w(stop length content-filter unknown).
-      # "other" is not in this list, so apply_step_finish_reason does not transition
-      # to :completed, and finish/2 records {:incomplete_stream, :missing_completion_event}.
-      assert result.completion_state == :failed
-
-      assert Enum.any?(result.failure_evidence, fn
-               {:incomplete_stream, :missing_completion_event} -> true
-               _ -> false
-             end)
+      # M1-TERM-F (accepted): "other" is observational terminal — the protocol
+      # turn concludes, so the stream completes — but it never authorizes clean
+      # worker success (only an explicit "stop" is eligible).
+      assert result.completion_state == :completed
+      assert result.failure_evidence == []
+      refute Parser.eligible_finish_reason?("other")
+      assert Parser.terminal_finish_reason?("other")
 
       # Synthetic input: "other" is not in the v1.18.28 FinishReason union (packages/llm/src/schema/ids.ts line 39).
       # The AI SDK bridge maps unrecognized finish reasons to "unknown" (packages/opencode/src/session/llm/ai-sdk.ts lines 22-23).
@@ -247,18 +246,10 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
       assert data["statusCode"] == 403
       assert data["isRetryable"] == false
 
-      # Current Failure classification (Gap A5):
-      # In Failure.classify_error_map, status is read from "status" instead of "statusCode".
-      # For a 403 where message doesn't contain explicit permission strings,
-      # classification fails to match HTTP 403 (:persistent_worker_failure)
-      # and falls back to :transient_worker_failure.
+      # M1-API-F (accepted): classification reads the upstream statusCode
+      # field, so an explicit HTTP 403 is persistent, never retried as transient.
       current_class = Failure.classify(event["error"])
-      assert current_class == :transient_worker_failure
-
-      # Document desired behavior:
-      # If data["statusCode"] == 403 were read, this would be classified as :persistent_worker_failure.
-      desired_class = :persistent_worker_failure
-      assert current_class != desired_class
+      assert current_class == :persistent_worker_failure
     end
 
     test "provider_auth_error.jsonl classifies ProviderAuthError" do
@@ -334,12 +325,12 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
         |> Parser.to_result()
 
       assert result.completion_state == :completed
-      assert result.usage.total_tokens == 963
+      assert result.usage.total_tokens == 8643
     end
   end
 
   describe "synthetic schema-optional tokens.total contract" do
-    test "explicit tokens.total leaves input-plus-output accounting unchanged" do
+    test "explicit tokens.total is honored as the authoritative per-step total" do
       content = read_fixture!("synthetic_explicit_total.jsonl")
 
       result =
@@ -353,7 +344,10 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
       assert result.usage.input_tokens == 954
       assert result.usage.output_tokens == 9
       assert result.usage.cache_read_tokens == 7680
-      assert result.usage.total_tokens == 963
+
+      # M1-U-F: an explicit wire total is the source of truth and is never
+      # summed on top of the categories (here it also equals the additive sum).
+      assert result.usage.total_tokens == 8643
     end
 
     test "explicit zero tokens.total parses as a zero-usage terminal turn" do
