@@ -900,10 +900,13 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert %{status: :TERMINATED_CONFIRMED} = Adapter.stop_session(session)
     end
 
-    test "remote-worker launch is not contained and writes no marker", %{workspace: workspace} do
+    test "remote-worker launch is refused before containment, marker, or process", %{workspace: workspace} do
       mock_exe = MockOpenCode.ensure_built!()
 
-      assert {:ok, session} =
+      # M1-H-F: the adapter has no SSH execution path, so a launch naming a
+      # remote worker host is refused outright instead of silently running
+      # the child locally and uncontained under a remote host's slot.
+      assert {:error, {:opencode_remote_host_ineligible, "worker-1"}} =
                Adapter.start_session(workspace, "--mock-mode=hang",
                  provider: "anthropic",
                  model: "claude-3-5-sonnet",
@@ -912,13 +915,10 @@ defmodule SymphonyElixir.OpenCodeTest do
                )
 
       refute WorkerContainment.contained_launch?("worker-1")
-      assert is_nil(session.identity)
 
-      # No marker exists for a launch outside the containment boundary.
+      # No marker exists for a refused launch.
       launches = Application.fetch_env!(:symphony_elixir, :launch_marker_root)
       assert {:error, :enoent} = File.ls(launches)
-
-      assert %{status: :NOT_APPLICABLE} = Adapter.stop_session(session)
     end
   end
 

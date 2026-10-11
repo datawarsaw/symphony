@@ -68,7 +68,7 @@ defmodule SymphonyElixir.AgentRunner do
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    case dispatch_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
       :ok ->
         :ok
 
@@ -82,6 +82,22 @@ defmodule SymphonyElixir.AgentRunner do
           failure_class: class,
           failure_info: info,
           reason: reason
+    end
+  end
+
+  # M1-H-F host eligibility, defense in depth: the OpenCode harness has no SSH
+  # execution path, so an OpenCode dispatch carrying a non-nil worker host is
+  # refused here — before workspace creation, hooks, provenance capture, or
+  # any adapter call — instead of letting the adapter substitute a local,
+  # uncontained launch for the selected remote host. The orchestrator parks
+  # such dispatches at its boundary; this gate preserves the invariant for any
+  # direct AgentRunner caller and classifies through the OpenCode taxonomy,
+  # so the attempt never degrades into a Codex worker.
+  defp dispatch_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    if opencode_dispatch?(opts) and worker_host != nil do
+      {:error, {:opencode_remote_host_ineligible, worker_host}}
+    else
+      run_on_worker_host(issue, codex_update_recipient, opts, worker_host)
     end
   end
 

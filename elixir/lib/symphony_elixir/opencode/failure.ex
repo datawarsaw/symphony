@@ -45,6 +45,7 @@ defmodule SymphonyElixir.OpenCode.Failure do
   def classify(:invalid_model_selection), do: :persistent_worker_failure
   def classify({:invalid_model_selection, _}), do: :persistent_worker_failure
   def classify({:permission_denied, _}), do: :persistent_worker_failure
+  def classify({:opencode_remote_host_ineligible, _}), do: :persistent_worker_failure
 
   def classify({:workspace_not_a_directory, _}), do: :probe_environment_error
   def classify({:outside_workspace, _, _}), do: :probe_environment_error
@@ -287,6 +288,9 @@ defmodule SymphonyElixir.OpenCode.Failure do
   defp extract_message({:tool_error, tool, err}), do: "Tool #{tool} failed: #{inspect(err)}"
   defp extract_message({:malformed_json_line, line, _}), do: "Malformed JSON line: #{line}"
   defp extract_message({:process_exit, status}), do: "OpenCode exited with status #{status}"
+
+  defp extract_message({:opencode_remote_host_ineligible, worker_host}),
+    do: "OpenCode harness is not eligible on remote worker host #{worker_host}; refused before launch"
 
   defp extract_message(%{} = map) do
     get_in(map, ["data", "message"]) ||

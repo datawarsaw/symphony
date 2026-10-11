@@ -1437,26 +1437,62 @@ defmodule SymphonyElixir.Orchestrator do
     # silently replaced by Codex mid-flight.
     case dispatch_harness(issue) do
       {:opencode, pilot} ->
-        Logger.info(
-          "Dispatch harness selected for #{issue_context(issue)} harness=opencode " <>
-            "provider=#{pilot.provider} model=#{pilot.model} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
-        )
+        if worker_host != nil do
+          park_opencode_remote_host(state, issue, worker_host)
+        else
+          Logger.info(
+            "Dispatch harness selected for #{issue_context(issue)} harness=opencode " <>
+              "provider=#{pilot.provider} model=#{pilot.model} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
+          )
 
-        spawn_with_selection(
-          state,
-          issue,
-          attempt,
-          recipient,
-          worker_host,
-          resumed?,
-          route,
-          :opencode,
-          dispatch_opts ++ [harness: :opencode, opencode: pilot]
-        )
+          spawn_with_selection(
+            state,
+            issue,
+            attempt,
+            recipient,
+            worker_host,
+            resumed?,
+            route,
+            :opencode,
+            dispatch_opts ++ [harness: :opencode, opencode: pilot]
+          )
+        end
 
       {:codex, harness_reason} ->
         dispatch_codex_issue(state, issue, attempt, recipient, worker_host, resumed?, route, dispatch_opts, harness_reason)
     end
+  end
+
+  # M1-H-F host eligibility: the OpenCode harness has no SSH execution path,
+  # so an OpenCode-authorized dispatch that selected a remote worker host must
+  # never reach AgentRunner — the adapter would substitute a local, uncontained
+  # OpenCode launch while the orchestrator accounts for a remote slot. The
+  # dispatch is refused at the boundary: parked with claim, no retry timer, no
+  # spawn, and no workspace mutation. It never degrades to the Codex harness,
+  # because the pilot explicitly authorized OpenCode for this issue and host
+  # capacity cannot reinterpret that decision; retrying cannot fix the
+  # mismatch either (every configured SSH host is equally ineligible), so
+  # re-admission requires operator action on the pilot allowlist or the SSH
+  # host pool.
+  defp park_opencode_remote_host(%State{} = state, %Issue{} = issue, worker_host) do
+    Logger.error(
+      "Dispatch failed closed for #{issue_context(issue)}: OpenCode harness is not eligible on remote worker host " <>
+        "#{worker_host}; parking with claim, no spawn, no retry timer"
+    )
+
+    state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
+
+    state =
+      observe_wake(state, :opencode_remote_host_ineligible, issue.id, evidence: "harness:host:#{worker_host}")
+
+    park_issue(state, issue.id, nil, %{
+      identifier: issue.identifier,
+      issue_url: issue.url,
+      error: "OpenCode dispatch refused: harness not eligible on remote worker host #{worker_host}",
+      stop_reason: :opencode_remote_host_ineligible,
+      failure_class: "PERSISTENT_WORKER_FAILURE",
+      worker_host: worker_host
+    })
   end
 
   # One harness decision per dispatch attempt. HarnessSelection is the pure

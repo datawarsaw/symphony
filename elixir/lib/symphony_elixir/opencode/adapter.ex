@@ -3,6 +3,8 @@ defmodule SymphonyElixir.OpenCode.Adapter do
   Standalone non-interactive OpenCode process adapter for Symphony workers.
 
   Security and reliability invariants:
+  - Local-host eligibility: a launch naming a remote worker_host is refused before any artifact exists;
+    the adapter has no SSH execution path and never substitutes a local run for a remote one.
   - Explicit provider and model routing: rejects bare models and forbids automatic provider fallback.
   - Deny-by-default tool permissions: configuration is generated per launch with tools denied by default.
   - Effective config isolation: project config is disabled and inherited OpenCode config, permission, and home lookup are pinned to the launch directory.
@@ -91,7 +93,8 @@ defmodule SymphonyElixir.OpenCode.Adapter do
       Keyword.get(opts, :launch_id) ||
         "#{System.system_time(:millisecond)}-#{:erlang.unique_integer([:positive])}"
 
-    with {:ok, {provider, model}} <- validate_model_selection(opts),
+    with :ok <- validate_host_eligibility(opts),
+         {:ok, {provider, model}} <- validate_model_selection(opts),
          {:ok, canonical_workspace} <- validate_workspace(workspace),
          {:ok, executable} <- resolve_executable(opts),
          {:ok, dirs} <- Environment.prepare_directories(canonical_workspace, launch_id),
@@ -606,6 +609,20 @@ defmodule SymphonyElixir.OpenCode.Adapter do
     with {:ok, canonical} <- PathSafety.canonicalize(workspace),
          true <- File.dir?(canonical) || {:error, {:workspace_not_a_directory, canonical}} do
       {:ok, canonical}
+    end
+  end
+
+  # M1-H-F host eligibility: this adapter executes OpenCode only through the
+  # local containment path, and a non-nil worker_host means the orchestrator
+  # selected a remote SSH host for this launch. Running the child locally
+  # instead would escape Job containment (contained_launch?/1 is false for
+  # every remote host) while the orchestrator accounts for a remote slot, so
+  # the launch is refused before any directory, config, marker, or process
+  # exists. Only nil (local) is eligible.
+  defp validate_host_eligibility(opts) do
+    case Keyword.get(opts, :worker_host) do
+      nil -> :ok
+      worker_host -> {:error, {:opencode_remote_host_ineligible, worker_host}}
     end
   end
 end
