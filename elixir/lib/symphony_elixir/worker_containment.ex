@@ -10,7 +10,7 @@ defmodule SymphonyElixir.WorkerContainment do
   ```
 
   One worker launch maps to one anonymous Job Object (`KILL_ON_JOB_CLOSE`,
-  breakaway denied, child assigned before first instruction) owned by the
+  breakaway denied, child created inside the Job atomically) owned by the
   `jobrun` wrapper under `priv/windows/jobrun`. `Port.close` only breaks the
   wrapper's stdin; the wrapper grants a bounded cooperative grace interval and
   then hard-terminates the Job, and positively verifies `ActiveProcesses == 0`
