@@ -30,9 +30,10 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
      session identity.
   10. Credentials are redacted in observable failure evidence.
   11. Containment leaves zero orphaned processes, proven by OS process evidence.
-  12. Fail-closed configuration contract: what the committed baseline already
-     enforces is asserted; the null-rejection hardening from the pending M1-C
-     remediation (4f1dc51) is recorded as explicitly pending tests.
+  12. Fail-closed configuration contract: the dispatch boundary rejects an
+     invalid or null-enabled section fail-closed. The explicit-null schema
+     rejection itself lives behind OpenCode.validate/1 and is asserted as
+     active tests in opencode_config_test.exs, not duplicated here.
 
   Categorization & tagging:
   - Default (untagged / runnable): tests exercising committed production
@@ -1283,11 +1284,16 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
   # 12. Fail-Closed Configuration Contract (M1-C hardening)
   # ===========================================================================
 
-  # What the committed baseline already enforces is asserted below. The
-  # explicit-null schema rejection comes from the pending M1-C remediation
-  # (4f1dc51: "Fail closed on explicit null OpenCode enabled and timeout
-  # values") and is recorded as explicitly skipped tests with concrete
-  # assertions until that revision is reviewed and integrated.
+  # What the committed baseline enforces is asserted below. The explicit-null
+  # rejection (integrated from 4f1dc51 as 91a434c + 6298a4b) is implemented in
+  # OpenCode.validate/1, which re-casts map and struct input through the
+  # changeset so a hand-built struct cannot skip validation. Its map/struct
+  # null-rejection cases are active tests in opencode_config_test.exs
+  # ("opencode explicit null validation"); the dispatch-boundary consequence
+  # is the first test below. The three tests this suite previously carried as
+  # "pending 4f1dc51" asserted the never-implemented raw changeset/2 shape and
+  # were removed in the M1-CLOSEOUT-F cleanup as exact duplicates of the
+  # active validate/1 coverage.
   describe "12. Fail-Closed Configuration Contract" do
     test "selection fails closed on a null or disabled enabled flag" do
       issue = %Issue{id: "issue_null_enabled", identifier: "MIC-NULL-ENABLED"}
@@ -1330,66 +1336,6 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
       messages = drain_worker_mailbox()
       {:termination, _issue_id, %{termination_expectation: :NEVER_STARTED}} = termination_evidence(messages)
       refute File.exists?(LaunchMarker.marker_path(issue.id, root: state_root))
-    end
-
-    # Pending 4f1dc51 contract: OpenCode.changeset/2 rejects an explicit null
-    # `enabled` ("must not be null: explicit true or false required") and an
-    # explicit null `timeout_ms` ("must not be null") for map and struct
-    # inputs alike. On this baseline the changeset still accepts the null, so
-    # the tests below are explicitly skipped until that revision is reviewed
-    # and integrated — remove the skip tags then. (4f1dc51 surfaces the same
-    # rejection through OpenCode.validate/1, which does not exist here.)
-    @null_base %{
-      "provider" => "mockprovider",
-      "model" => "mock-model",
-      "timeout_ms" => 600_000,
-      "allowed_tools" => ["read"],
-      "allowed_issues" => ["MIC-NULL-1"]
-    }
-    @null_base_struct %OpenCodeSchema{
-      provider: "mockprovider",
-      model: "mock-model",
-      timeout_ms: 600_000,
-      allowed_tools: ["read"],
-      allowed_issues: ["MIC-NULL-1"]
-    }
-
-    @tag skip: "pending 4f1dc51: explicit-null schema rejection is not on this baseline"
-    test "schema rejects an explicit null enabled for map and struct input (pending 4f1dc51)" do
-      for section <- [Map.put(@null_base, "enabled", nil), %{@null_base_struct | enabled: nil}] do
-        changeset = OpenCodeSchema.changeset(section, %{})
-        refute changeset.valid?
-        assert null_errors(changeset)[:enabled] == ["must not be null: explicit true or false required"]
-      end
-    end
-
-    @tag skip: "pending 4f1dc51: explicit-null schema rejection is not on this baseline"
-    test "schema rejects an explicit null timeout_ms for map and struct input (pending 4f1dc51)" do
-      for section <- [
-            Map.merge(@null_base, %{"enabled" => true, "timeout_ms" => nil}),
-            %{@null_base_struct | enabled: true, timeout_ms: nil}
-          ] do
-        changeset = OpenCodeSchema.changeset(section, %{})
-        refute changeset.valid?
-        assert null_errors(changeset)[:timeout_ms] == ["must not be null"]
-      end
-    end
-
-    @tag skip: "pending 4f1dc51: explicit-null schema rejection is not on this baseline"
-    test "a null-only section reports both fields instead of falling back to defaults (pending 4f1dc51)" do
-      changeset = OpenCodeSchema.changeset(%OpenCodeSchema{}, %{"enabled" => nil, "timeout_ms" => nil})
-      refute changeset.valid?
-
-      assert null_errors(changeset) == %{
-               enabled: ["must not be null: explicit true or false required"],
-               timeout_ms: ["must not be null"]
-             }
-    end
-
-    defp null_errors(changeset) do
-      Enum.reduce(changeset.errors, %{}, fn {field, {message, _}}, acc ->
-        Map.update(acc, field, [message], &[message | &1])
-      end)
     end
   end
 end
