@@ -108,4 +108,119 @@ defmodule SymphonyElixir.RetryStoreTest do
     assert RetryStore.read_record(root, "ISS-X") == {:error, :not_found}
     assert :ok = RetryStore.delete_record(root, "ISS-X")
   end
+
+  test "a record without harness keys and without OpenCode identity is legacy Codex", %{root: root} do
+    record =
+      RetryStore.build_record(%{
+        issue_id: "ISS-LEGACY",
+        status: "retrying",
+        failure_class: "PROVIDER_OUTAGE",
+        worker_identity: "never_spawned"
+      })
+
+    refute Map.has_key?(record, "harness")
+    refute Map.has_key?(record, "harness_authority")
+    refute Map.has_key?(record, "harness_evidence")
+    assert record["schema_version"] == 1
+
+    :ok = RetryStore.write_record(root, record)
+    assert {:ok, saved} = RetryStore.read_record(root, "ISS-LEGACY")
+
+    assert RetryStore.harness_authority(saved) ==
+             {:ok, :codex, :legacy_codex, "legacy_codex:absent_harness_authority"}
+
+    explicit =
+      saved
+      |> Map.put("harness", "codex")
+      |> Map.put("harness_authority", "legacy_codex")
+      |> Map.put("harness_evidence", "legacy_codex")
+
+    assert RetryStore.harness_authority(explicit) == {:ok, :codex, :legacy_codex, "legacy_codex"}
+  end
+
+  test "a validated harness pin round-trips without a schema bump", %{root: root} do
+    :ok =
+      RetryStore.write_lifecycle_pin(root, %{
+        issue_id: "ISS-PIN",
+        identifier: "MT-PIN",
+        status: "active",
+        harness: :opencode,
+        harness_evidence: "dispatch:opencode_selected",
+        route: :primary
+      })
+
+    assert {:ok, saved} = RetryStore.read_record(root, "ISS-PIN")
+    assert saved["schema_version"] == 1
+    assert saved["status"] == "active"
+    assert saved["harness"] == "opencode"
+    assert saved["harness_authority"] == "pinned"
+    assert saved["harness_evidence"] == "dispatch:opencode_selected"
+    assert RetryStore.harness_authority(saved) == {:ok, :opencode, :pinned, "dispatch:opencode_selected"}
+
+    :ok =
+      RetryStore.merge_harness_pin(root, "ISS-PIN", %{
+        harness: :opencode,
+        authority: :pinned,
+        evidence: "continuation:opencode"
+      })
+
+    assert {:ok, merged} = RetryStore.read_record(root, "ISS-PIN")
+    assert merged["status"] == "active"
+    assert merged["harness"] == "opencode"
+    assert merged["harness_authority"] == "pinned"
+    assert merged["harness_evidence"] == "continuation:opencode"
+    assert merged["schema_version"] == 1
+  end
+
+  test "OpenCode worker identity without a pin is not read as Codex", %{root: root} do
+    record =
+      RetryStore.build_record(%{
+        issue_id: "ISS-OC-BARE",
+        status: "retrying",
+        failure_class: "PROVIDER_OUTAGE",
+        worker_identity: %{"launch_id" => "launch-oc", "harness" => "opencode"}
+      })
+
+    refute Map.has_key?(record, "harness")
+    assert {:error, :harness_authority_missing, evidence} = RetryStore.harness_authority(record)
+    assert evidence =~ "worker_identity.harness=opencode"
+    refute evidence =~ "legacy_codex"
+
+    :ok = RetryStore.write_record(root, record)
+    :ok = RetryStore.record_authority_failure(root, record, :harness_authority_missing, evidence)
+
+    assert {:ok, saved} = RetryStore.read_record(root, "ISS-OC-BARE")
+    assert saved["status"] == "parked"
+    assert saved["harness_authority"] == "missing"
+    assert saved["stop_reason"] == "harness_authority_missing"
+    assert saved["harness_evidence"] == evidence
+    refute Map.has_key?(saved, "harness")
+  end
+
+  test "a contradictory pin parks with both sides and is not rewritten", %{root: root} do
+    record =
+      RetryStore.build_record(%{
+        issue_id: "ISS-MISMATCH",
+        status: "retrying",
+        failure_class: "PROVIDER_OUTAGE",
+        harness: :codex,
+        harness_evidence: "dispatch:default_harness",
+        worker_identity: %{"harness" => "opencode", "launch_id" => "l-mismatch"}
+      })
+
+    assert {:error, :harness_authority_mismatch, evidence} = RetryStore.harness_authority(record)
+    assert evidence =~ "pinned_harness=codex"
+    assert evidence =~ "worker_identity.harness=opencode"
+
+    :ok = RetryStore.write_record(root, record)
+    :ok = RetryStore.record_authority_failure(root, record, :harness_authority_mismatch, evidence)
+
+    assert {:ok, saved} = RetryStore.read_record(root, "ISS-MISMATCH")
+    assert saved["status"] == "parked"
+    assert saved["harness"] == "codex"
+    assert saved["harness_authority"] == "mismatch"
+    assert saved["stop_reason"] == "harness_authority_mismatch"
+    assert saved["harness_evidence"] == evidence
+    refute saved["harness"] == "opencode"
+  end
 end

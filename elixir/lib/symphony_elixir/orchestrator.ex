@@ -64,6 +64,10 @@ defmodule SymphonyElixir.Orchestrator do
       retry_attempts: %{},
       parked: %{},
       retry_history: %{},
+      # Validated harness pin for the current issue/workspace lifecycle.
+      # Attempt dispatch reads this instead of re-running HarnessSelection,
+      # so a config reload cannot substitute Codex for OpenCode or the reverse.
+      harness_pins: %{},
       resumed_issues: MapSet.new(),
       orphaned_workspaces: [],
       startup_reconciled: false,
@@ -355,16 +359,11 @@ defmodule SymphonyElixir.Orchestrator do
     else
       Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
+      state = remember_running_harness(state, issue_id, running_entry)
+
       state
       |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        issue_url: running_entry.issue.url,
-        delay_type: :continuation,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path),
-        workspace_root: Map.get(running_entry, :workspace_root)
-      })
+      |> schedule_issue_retry(issue_id, 1, continuation_metadata(running_entry))
     end
   end
 
@@ -387,6 +386,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
+    state = remember_running_harness(state, issue_id, running_entry)
     {decision, class, history, state} = note_failure(state, issue_id, reason)
     {decision, history, state} = apply_fallback_decision(state, issue_id, class, history, decision, running_entry)
     error = "agent exited: #{inspect(reason)}"
@@ -1428,21 +1428,32 @@ defmodule SymphonyElixir.Orchestrator do
 
     route = current_dispatch_route(state, issue.id)
 
-    # M1-D: the harness is selected ONCE per dispatch attempt, from the same
-    # already-refreshed issue the route intent was decided for, and the
-    # decision (including the pinned OpenCode pilot identity it selected on)
-    # is carried immutably through dispatch opts. AgentRunner never
-    # re-resolves it, so no later configuration change can swap the harness
-    # under a running attempt, and a selected OpenCode worker is never
-    # silently replaced by Codex mid-flight.
-    case dispatch_harness(issue) do
-      {:opencode, pilot} ->
+    # M1-HARNESS-F: the first attempt still selects through HarnessSelection.
+    # Every later attempt in the same issue/workspace lifecycle reuses the
+    # durable pin. A revoked or invalid OpenCode authorization parks; it does
+    # not launch Codex. A Codex pin stays on Codex even if OpenCode later
+    # becomes eligible. Provider/model fallback remains the route latch inside
+    # the pinned harness. AgentRunner still receives the decision immutably
+    # and never re-resolves it.
+    #
+    # M1-H-F preserved inside the pinned branch: an OpenCode dispatch that
+    # selected a remote worker host is refused at the boundary whether or not
+    # a pin exists — the harness pin never re-authorizes a remote OpenCode
+    # launch this adapter cannot contain.
+    case resolve_attempt_harness(state, issue) do
+      {:park, stop_reason, evidence} ->
+        park_for_harness_authority(state, issue, attempt, worker_host, stop_reason, evidence)
+
+      {:dispatch, :opencode, pilot, pin} ->
         if worker_host != nil do
           park_opencode_remote_host(state, issue, worker_host)
         else
+          state = commit_harness_pin(state, issue, pin)
+
           Logger.info(
             "Dispatch harness selected for #{issue_context(issue)} harness=opencode " <>
-              "provider=#{pilot.provider} model=#{pilot.model} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}"
+              "provider=#{pilot.provider} model=#{pilot.model} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"} " <>
+              "harness_authority=#{pin.authority}"
           )
 
           spawn_with_selection(
@@ -1458,7 +1469,8 @@ defmodule SymphonyElixir.Orchestrator do
           )
         end
 
-      {:codex, harness_reason} ->
+      {:dispatch, :codex, harness_reason, pin} ->
+        state = commit_harness_pin(state, issue, pin)
         dispatch_codex_issue(state, issue, attempt, recipient, worker_host, resumed?, route, dispatch_opts, harness_reason)
     end
   end
@@ -1496,9 +1508,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   # One harness decision per dispatch attempt. HarnessSelection is the pure
-  # production selector: OpenCode only for an explicitly enabled, complete,
-  # issue-authorized pilot section; every disabled, incomplete, unauthorized,
-  # or unreadable configuration fails closed to the default Codex harness.
+  # production selector for an unpinned lifecycle: OpenCode only for an
+  # explicitly enabled, complete, issue-authorized pilot section; every
+  # disabled, incomplete, unauthorized, or unreadable configuration fails
+  # closed to the default Codex harness. A later attempt does not call this
+  # directly; resolve_attempt_harness/2 owns the pin.
   # The returned pilot struct is the dispatch-time snapshot AgentRunner pins
   # the launch to (provider, model, tool allowlist, timeout) so a WORKFLOW.md
   # reload between dispatch and launch cannot change the selected identity.
@@ -1516,6 +1530,177 @@ defmodule SymphonyElixir.Orchestrator do
   rescue
     _error -> {:codex, :opencode_settings_unreadable}
   end
+
+  # Cross-attempt harness authority. The pin, once validated, outlives config
+  # reloads, continuation, failure retries, and restart recovery. OpenCode
+  # that can no longer be authorized parks before any other harness is
+  # launched. Codex stays Codex.
+  defp resolve_attempt_harness(%State{} = state, %Issue{} = issue) do
+    case Map.get(state.harness_pins, issue.id) do
+      %{harness: :opencode} = pin ->
+        case authorize_pinned_opencode(issue) do
+          {:ok, pilot} -> {:dispatch, :opencode, pilot, pin}
+          {:error, reason} -> {:park, :harness_authorization_revoked, authorization_evidence(pin, reason)}
+        end
+
+      %{harness: :codex} = pin ->
+        {:dispatch, :codex, codex_pin_reason(pin), pin}
+
+      _unpinned ->
+        case dispatch_harness(issue) do
+          {:opencode, pilot} ->
+            {:dispatch, :opencode, pilot, new_harness_pin(:opencode, "dispatch:opencode_selected")}
+
+          {:codex, reason} ->
+            {:dispatch, :codex, reason, new_harness_pin(:codex, "dispatch:" <> Atom.to_string(reason))}
+        end
+    end
+  end
+
+  defp authorize_pinned_opencode(%Issue{} = issue) do
+    case Config.settings() do
+      {:ok, %{opencode: opencode}} ->
+        case SymphonyElixir.HarnessSelection.select(issue, opencode) do
+          {:opencode, :opencode_selected} -> {:ok, opencode}
+          {:codex, reason} -> {:error, reason}
+        end
+
+      _unavailable ->
+        {:error, :settings_unavailable}
+    end
+  rescue
+    _error -> {:error, :opencode_settings_unreadable}
+  end
+
+  defp new_harness_pin(harness, evidence) when harness in [:codex, :opencode] do
+    %{harness: harness, authority: :pinned, evidence: evidence}
+  end
+
+  defp codex_pin_reason(%{authority: :legacy_codex, evidence: evidence}) when is_binary(evidence), do: evidence
+  defp codex_pin_reason(%{evidence: evidence}) when is_binary(evidence), do: evidence
+  defp codex_pin_reason(_pin), do: :pinned_codex
+
+  defp authorization_evidence(pin, reason) do
+    "pinned_harness=opencode authorization=#{inspect(reason)} prior_evidence=#{Map.get(pin, :evidence) || "none"}"
+  end
+
+  defp commit_harness_pin(%State{} = state, %Issue{} = issue, pin) do
+    state = put_harness_pin(state, issue.id, pin)
+    persist_harness_pin(state, issue, pin)
+    state
+  end
+
+  defp put_harness_pin(%State{} = state, issue_id, %{harness: harness} = pin) when harness in [:codex, :opencode] do
+    normalized = %{
+      harness: harness,
+      authority: if(Map.get(pin, :authority) in [:pinned, :legacy_codex], do: pin.authority, else: :pinned),
+      evidence: pin_evidence(pin)
+    }
+
+    %{state | harness_pins: Map.put(state.harness_pins, issue_id, normalized)}
+  end
+
+  defp put_harness_pin(%State{} = state, _issue_id, _pin), do: state
+
+  defp pin_evidence(%{evidence: evidence}) when is_binary(evidence) and evidence != "", do: evidence
+  defp pin_evidence(%{harness: harness}), do: "pinned:" <> Atom.to_string(harness)
+
+  defp persist_harness_pin(%State{} = state, %Issue{} = issue, pin) do
+    case retry_store_root(state) do
+      {:ok, root} ->
+        stored = Map.merge(pin, %{identifier: issue.identifier, evidence: pin_evidence(pin)})
+
+        try do
+          RetryStore.merge_harness_pin(root, issue.id, stored)
+        rescue
+          _ -> :ok
+        catch
+          _, _ -> :ok
+        end
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp park_for_harness_authority(%State{} = state, %Issue{} = issue, attempt, worker_host, stop_reason, evidence) do
+    Logger.error(
+      "Dispatch failed closed for #{issue_context(issue)}: harness authority withheld " <>
+        "stop_reason=#{stop_reason} evidence=#{evidence}; parking with claim, preserving workspace, no retry timer"
+    )
+
+    pin = Map.get(state.harness_pins, issue.id, %{})
+    history = Map.get(state.retry_history, issue.id, %{})
+
+    park_issue(state, issue.id, nil, %{
+      identifier: issue.identifier,
+      issue_url: issue.url,
+      error: evidence,
+      stop_reason: stop_reason,
+      failure_class: "AUTH_UNAVAILABLE",
+      attempt_count: attempt || Map.get(history, :attempt_count, 1),
+      identical_failure_count: Map.get(history, :identical_failure_count, 1),
+      first_failure_at: Map.get(history, :first_failure_at_dt),
+      worker_host: worker_host,
+      route: current_dispatch_route(state, issue.id),
+      primary_failure_count: Map.get(history, :primary_failure_count, 0),
+      harness: Map.get(pin, :harness),
+      harness_authority: Map.get(pin, :authority, :pinned),
+      harness_evidence: evidence
+    })
+  end
+
+  defp remember_running_harness(%State{} = state, issue_id, running_entry) when is_map(running_entry) do
+    attempted = Map.get(running_entry, :harness)
+
+    case {Map.get(state.harness_pins, issue_id), attempted} do
+      {%{harness: pinned}, other} when other in [:codex, :opencode] and other != pinned ->
+        put_harness_pin(state, issue_id, %{
+          harness: pinned,
+          authority: :pinned,
+          evidence: "pinned_harness=#{pinned} attempted_harness=#{other}"
+        })
+
+      {nil, harness} when harness in [:codex, :opencode] ->
+        put_harness_pin(state, issue_id, new_harness_pin(harness, "attempt:" <> Atom.to_string(harness)))
+
+      _already_consistent ->
+        state
+    end
+  end
+
+  defp remember_running_harness(%State{} = state, _issue_id, _running_entry), do: state
+
+  defp remember_metadata_harness(%State{} = state, issue_id, metadata) when is_map(metadata) do
+    case {Map.get(state.harness_pins, issue_id), metadata[:harness]} do
+      {nil, harness} when harness in [:codex, :opencode] ->
+        put_harness_pin(state, issue_id, %{
+          harness: harness,
+          authority: metadata[:harness_authority] || :pinned,
+          evidence: metadata[:harness_evidence] || "metadata:" <> Atom.to_string(harness)
+        })
+
+      _present_or_absent ->
+        state
+    end
+  end
+
+  defp continuation_metadata(running_entry) do
+    %{
+      identifier: running_entry.identifier,
+      issue_url: running_entry.issue.url,
+      delay_type: :continuation,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      workspace_root: Map.get(running_entry, :workspace_root),
+      harness: Map.get(running_entry, :harness),
+      harness_authority: :pinned,
+      harness_evidence: continuation_evidence(Map.get(running_entry, :harness))
+    }
+  end
+
+  defp continuation_evidence(harness) when harness in [:codex, :opencode], do: "continuation:" <> Atom.to_string(harness)
+  defp continuation_evidence(_harness), do: nil
 
   defp dispatch_codex_issue(%State{} = state, issue, attempt, recipient, worker_host, resumed?, route, dispatch_opts, harness_reason) do
     case DispatchRouter.materialize(route, issue, dispatch_opts) do
@@ -1729,6 +1914,8 @@ defmodule SymphonyElixir.Orchestrator do
         history_primary_failure_count(Map.get(state.retry_history, issue_id)) || 0
 
     metadata = Map.merge(metadata, %{route: route, primary_failure_count: primary_failure_count})
+    state = remember_metadata_harness(state, issue_id, metadata)
+    metadata = put_pinned_harness(metadata, state, issue_id)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1755,11 +1942,19 @@ defmodule SymphonyElixir.Orchestrator do
             workspace_path: workspace_path,
             workspace_root: workspace_root,
             route: route,
-            primary_failure_count: primary_failure_count
+            primary_failure_count: primary_failure_count,
+            harness: metadata[:harness],
+            harness_authority: metadata[:harness_authority],
+            harness_evidence: metadata[:harness_evidence]
           })
     }
 
-    persist_failure_retry_record(new_state, issue_id, next_attempt, delay_ms, metadata)
+    if metadata[:delay_type] == :continuation do
+      persist_continuation_pin(new_state, issue_id, metadata)
+    else
+      persist_failure_retry_record(new_state, issue_id, next_attempt, delay_ms, metadata)
+    end
+
     new_state
   end
 
@@ -1774,7 +1969,10 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(retry_entry, :workspace_path),
           workspace_root: Map.get(retry_entry, :workspace_root),
           route: Map.get(retry_entry, :route, :primary),
-          primary_failure_count: Map.get(retry_entry, :primary_failure_count, 0)
+          primary_failure_count: Map.get(retry_entry, :primary_failure_count, 0),
+          harness: Map.get(retry_entry, :harness),
+          harness_authority: Map.get(retry_entry, :harness_authority),
+          harness_evidence: Map.get(retry_entry, :harness_evidence)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -2375,7 +2573,8 @@ defmodule SymphonyElixir.Orchestrator do
         resumed_issues: MapSet.delete(state.resumed_issues, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
         parked: Map.delete(state.parked, issue_id),
-        retry_history: Map.delete(state.retry_history, issue_id)
+        retry_history: Map.delete(state.retry_history, issue_id),
+        harness_pins: Map.delete(state.harness_pins, issue_id)
     }
   end
 
@@ -2439,6 +2638,23 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec dispatch_harness_for_test(Issue.t()) :: {:opencode, term()} | {:codex, atom()}
   def dispatch_harness_for_test(%Issue{} = issue), do: dispatch_harness(issue)
+
+  @doc false
+  def decide_harness_for_test(%State{} = state, %Issue{} = issue) do
+    case resolve_attempt_harness(state, issue) do
+      {:park, reason, evidence} ->
+        {{:park, reason, evidence}, park_for_harness_authority(state, issue, nil, nil, reason, evidence)}
+
+      {:dispatch, harness, detail, pin} ->
+        {{:dispatch, harness, detail}, commit_harness_pin(state, issue, pin)}
+    end
+  end
+
+  @doc false
+  def continue_running_issue_for_test(%State{} = state, issue_id, running_entry)
+      when is_binary(issue_id) and is_map(running_entry) do
+    handle_agent_down(:normal, state, issue_id, running_entry, "continuation-test")
+  end
 
   @spec note_failure(term(), String.t(), term()) ::
           {:retry | {:park, atom()}, atom(), map(), term()}
@@ -2544,6 +2760,9 @@ defmodule SymphonyElixir.Orchestrator do
       primary_failure_count: metadata[:primary_failure_count] || Map.get(history, :primary_failure_count, 0),
       worker_identity: metadata[:worker_identity] || Map.get(runtime, :worker_identity),
       termination_expectation: metadata[:termination_expectation] || Map.get(runtime, :termination_expectation),
+      harness: metadata[:harness] || harness_pin_field(state, issue_id, :harness),
+      harness_authority: metadata[:harness_authority] || harness_pin_field(state, issue_id, :authority),
+      harness_evidence: metadata[:harness_evidence] || harness_pin_field(state, issue_id, :evidence),
       parked_at: DateTime.to_iso8601(now_dt)
     }
 
@@ -2586,6 +2805,9 @@ defmodule SymphonyElixir.Orchestrator do
         primary_failure_count: metadata[:primary_failure_count] || 0,
         worker_identity: metadata[:worker_identity],
         termination_expectation: metadata[:termination_expectation],
+        harness: metadata[:harness],
+        harness_authority: metadata[:harness_authority],
+        harness_evidence: metadata[:harness_evidence],
         next_retry_in_ms: delay_ms
       }
 
@@ -2629,7 +2851,10 @@ defmodule SymphonyElixir.Orchestrator do
         workspace_path: entry.workspace_path || "",
         workspace_root: entry.workspace_root || root,
         route: Map.get(entry, :route, :primary),
-        primary_failure_count: Map.get(entry, :primary_failure_count, 0)
+        primary_failure_count: Map.get(entry, :primary_failure_count, 0),
+        harness: Map.get(entry, :harness),
+        harness_authority: Map.get(entry, :harness_authority),
+        harness_evidence: Map.get(entry, :harness_evidence)
       })
 
     # MIC-223: the pre-launch termination expectation is persisted only when
@@ -2656,6 +2881,58 @@ defmodule SymphonyElixir.Orchestrator do
       _ -> :ok
     catch
       _, _ -> :ok
+    end
+  end
+
+  defp put_pinned_harness(metadata, %State{} = state, issue_id) when is_map(metadata) do
+    case Map.get(state.harness_pins, issue_id) do
+      %{harness: harness} = pin when harness in [:codex, :opencode] ->
+        metadata
+        |> Map.put_new(:harness, harness)
+        |> Map.put_new(:harness_authority, Map.get(pin, :authority, :pinned))
+        |> Map.put_new(:harness_evidence, pin_evidence(pin))
+
+      _missing ->
+        metadata
+    end
+  end
+
+  defp harness_pin_field(%State{} = state, issue_id, key) do
+    state.harness_pins |> Map.get(issue_id, %{}) |> Map.get(key)
+  end
+
+  defp persist_continuation_pin(%State{} = state, issue_id, metadata) do
+    case Map.get(state.harness_pins, issue_id) do
+      %{harness: harness} = pin when harness in [:codex, :opencode] ->
+        case retry_store_root(state) do
+          {:ok, root} ->
+            try do
+              RetryStore.write_lifecycle_pin(root, %{
+                issue_id: issue_id,
+                identifier: metadata[:identifier] || issue_id,
+                status: "continuing",
+                harness: harness,
+                harness_authority: Map.get(pin, :authority, :pinned),
+                harness_evidence: metadata[:harness_evidence] || pin_evidence(pin),
+                worker_host: metadata[:worker_host],
+                workspace_path: metadata[:workspace_path],
+                workspace_root: metadata[:workspace_root] || root,
+                route: metadata[:route] || :primary,
+                primary_failure_count: metadata[:primary_failure_count] || 0
+              })
+            rescue
+              _ -> :ok
+            catch
+              _, _ -> :ok
+            end
+
+          {:error, reason} ->
+            Logger.warning("Skipping continuation harness pin issue_id=#{issue_id}; no durable record root: #{inspect(reason)}")
+            :ok
+        end
+
+      _unpinned ->
+        :ok
     end
   end
 
@@ -2735,6 +3012,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec recover_retry_record(term(), map(), String.t()) :: term()
   defp recover_retry_record(%State{} = state, record, root) do
+    issue_id = Map.get(record, "issue_id")
+    status = Map.get(record, "status")
+
+    cond do
+      is_binary(issue_id) and status in ["active", "continuing"] ->
+        recover_harness_lifecycle_record(state, record, root, issue_id, status)
+
+      true ->
+        recover_failure_retry_record(state, record, root)
+    end
+  end
+
+  defp recover_failure_retry_record(%State{} = state, record, root) do
     with issue_id when is_binary(issue_id) <- Map.get(record, "issue_id"),
          status when status in ["retrying", "parked"] <- Map.get(record, "status"),
          class_name when is_binary(class_name) <- Map.get(record, "failure_class"),
@@ -2747,13 +3037,140 @@ defmodule SymphonyElixir.Orchestrator do
          route_name when route_name in ["primary", "fallback"] <- Map.get(record, "route", "primary"),
          pfc when is_integer(pfc) and pfc >= 0 <- Map.get(record, "primary_failure_count", 0) do
       route = if route_name == "fallback", do: :fallback, else: :primary
-      recover_valid_retry_record(state, record, root, issue_id, status, class, count, first_dt, route, pfc)
+
+      case classify_recovered_harness(state, issue_id, record) do
+        {:ok, harness, authority, evidence} ->
+          state = put_harness_pin(state, issue_id, %{harness: harness, authority: authority, evidence: evidence})
+          recover_valid_retry_record(state, record, root, issue_id, status, class, count, first_dt, route, pfc)
+
+        {:error, reason, evidence} ->
+          fail_closed_harness_record(state, record, root, issue_id, reason, evidence)
+      end
     else
       _ ->
         issue_id = Map.get(record, "issue_id")
         Logger.warning("Ambiguous retry record #{inspect(issue_id)}; failing closed with claim and no timer")
         if is_binary(issue_id), do: %{state | claimed: MapSet.put(state.claimed, issue_id)}, else: state
     end
+  end
+
+  defp recover_harness_lifecycle_record(%State{} = state, record, root, issue_id, status) do
+    case classify_recovered_harness(state, issue_id, record) do
+      {:ok, harness, authority, evidence} ->
+        state = put_harness_pin(state, issue_id, %{harness: harness, authority: authority, evidence: evidence})
+
+        case status do
+          "active" ->
+            state
+
+          "continuing" ->
+            metadata = %{
+              identifier: Map.get(record, "identifier", issue_id),
+              delay_type: :continuation,
+              worker_host: recovery_blank_to_nil(Map.get(record, "worker_host")),
+              workspace_path: recovery_blank_to_nil(Map.get(record, "workspace_path")),
+              workspace_root: recovery_blank_to_nil(Map.get(record, "workspace_root")) || root,
+              route: recovery_route(Map.get(record, "route")),
+              primary_failure_count: Map.get(record, "primary_failure_count", 0),
+              harness: harness,
+              harness_authority: authority,
+              harness_evidence: evidence
+            }
+
+            state = %{state | claimed: MapSet.put(state.claimed, issue_id)}
+            schedule_issue_retry(state, issue_id, 1, metadata)
+        end
+
+      {:error, reason, evidence} ->
+        fail_closed_harness_record(state, record, root, issue_id, reason, evidence)
+    end
+  end
+
+  defp classify_recovered_harness(%State{} = state, issue_id, record) do
+    case RetryStore.harness_authority(record) do
+      {:ok, :codex, :legacy_codex, _evidence} = legacy ->
+        case external_harness_evidence(state, issue_id) do
+          :none ->
+            legacy
+
+          {:conflict, detail} ->
+            {:error, :harness_authority_missing, detail}
+
+          {:unreadable, detail} ->
+            {:error, :harness_authority_missing, "launch_marker_unreadable:" <> detail}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  # A legacy retry record with no harness keys is Codex only when no surviving
+  # launch marker names another harness. An unreadable marker is missing
+  # evidence, not permission to launch Codex. Tests and direct API calls with
+  # no boot-pinned root keep the record-only classification.
+  defp external_harness_evidence(%State{authority_root: root}, issue_id) when is_binary(root) and root != "" do
+    case LaunchMarker.read(issue_id, root: root) do
+      {:ok, marker} ->
+        case marker_identity_harness(marker) do
+          nil -> :none
+          "codex" -> :none
+          harness when is_binary(harness) -> {:conflict, "launch_marker.harness=#{harness} without validated retry harness pin"}
+        end
+
+      {:error, :not_found} ->
+        :none
+
+      {:error, reason} ->
+        {:unreadable, inspect(reason)}
+    end
+  end
+
+  defp external_harness_evidence(_state, _issue_id), do: :none
+
+  defp marker_identity_harness(marker) when is_map(marker) do
+    case Map.get(marker, "worker_identity") do
+      %{"harness" => harness} when is_binary(harness) and harness != "" -> harness
+      _ -> nil
+    end
+  end
+
+  defp fail_closed_harness_record(%State{} = state, record, root, issue_id, reason, evidence) do
+    Logger.warning("Harness authority withheld for issue_id=#{issue_id} reason=#{reason} evidence=#{evidence}; parking with claim and no timer")
+
+    try do
+      RetryStore.record_authority_failure(root, record, reason, evidence)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+
+    now_dt = DateTime.utc_now()
+
+    entry = %{
+      issue_id: issue_id,
+      identifier: Map.get(record, "identifier", issue_id),
+      issue_url: nil,
+      failure_class: Map.get(record, "failure_class") || "AUTH_UNAVAILABLE",
+      stop_reason: reason,
+      attempt_count: Map.get(record, "attempt_count") || 1,
+      identical_failure_count: Map.get(record, "identical_failure_count") || 1,
+      error: evidence,
+      worker_host: recovery_blank_to_nil(Map.get(record, "worker_host")),
+      workspace_path: recovery_blank_to_nil(Map.get(record, "workspace_path")),
+      workspace_root: recovery_blank_to_nil(Map.get(record, "workspace_root")) || root,
+      parked_at: DateTime.to_iso8601(now_dt)
+    }
+
+    state = observe_wake(state, :parked, issue_id, stop_reason: reason, evidence: evidence)
+
+    %{
+      state
+      | parked: Map.put(state.parked, issue_id, entry),
+        claimed: MapSet.put(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
   end
 
   @spec parse_record_time(term()) :: {:ok, DateTime.t()} | :error
@@ -3769,23 +4186,36 @@ defmodule SymphonyElixir.Orchestrator do
   # the durable record transitions "parked" -> "retrying", and the error field
   # durably records who recovered the issue and why release was allowed.
   defp recovery_retry_metadata(record, issue_id, receipt) do
-    %{
-      identifier: Map.get(record, "identifier") || issue_id,
-      issue_url: nil,
-      error: "recovered from PARKED by operator control (control_id=#{receipt.control_id}): fence verdict dead",
-      worker_host: recovery_blank_to_nil(Map.get(record, "worker_host")),
-      workspace_path: recovery_blank_to_nil(Map.get(record, "workspace_path")),
-      workspace_root: recovery_blank_to_nil(Map.get(record, "workspace_root")),
-      worker_identity: Map.get(record, "worker_identity"),
-      termination_expectation: expectation_from_record(Map.get(record, "termination_expectation")),
-      failure_class: Map.get(record, "failure_class"),
-      attempt_count: Map.get(record, "attempt_count"),
-      identical_failure_count: Map.get(record, "identical_failure_count", 1),
-      first_failure_at: Map.get(record, "first_failure_at"),
-      reset_in_ms: nil,
-      route: recovery_route(Map.get(record, "route")),
-      primary_failure_count: Map.get(record, "primary_failure_count", 0)
-    }
+    Map.merge(
+      %{
+        identifier: Map.get(record, "identifier") || issue_id,
+        issue_url: nil,
+        error: "recovered from PARKED by operator control (control_id=#{receipt.control_id}): fence verdict dead",
+        worker_host: recovery_blank_to_nil(Map.get(record, "worker_host")),
+        workspace_path: recovery_blank_to_nil(Map.get(record, "workspace_path")),
+        workspace_root: recovery_blank_to_nil(Map.get(record, "workspace_root")),
+        worker_identity: Map.get(record, "worker_identity"),
+        termination_expectation: expectation_from_record(Map.get(record, "termination_expectation")),
+        failure_class: Map.get(record, "failure_class"),
+        attempt_count: Map.get(record, "attempt_count"),
+        identical_failure_count: Map.get(record, "identical_failure_count", 1),
+        first_failure_at: Map.get(record, "first_failure_at"),
+        reset_in_ms: nil,
+        route: recovery_route(Map.get(record, "route")),
+        primary_failure_count: Map.get(record, "primary_failure_count", 0)
+      },
+      recovery_harness_metadata(record)
+    )
+  end
+
+  defp recovery_harness_metadata(record) when is_map(record) do
+    case RetryStore.harness_authority(record) do
+      {:ok, harness, authority, evidence} ->
+        %{harness: harness, harness_authority: authority, harness_evidence: evidence}
+
+      {:error, _reason, _evidence} ->
+        %{}
+    end
   end
 
   defp recovery_route("fallback"), do: :fallback
