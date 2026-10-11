@@ -17,7 +17,14 @@ defmodule SymphonyElixir.OpenCodeTest do
 
     File.mkdir_p!(workspace)
 
+    # PILOT-AUTH-F: launches in this suite pass through the production
+    # credential presence preflight; a synthetic placeholder satisfies it
+    # offline without authenticating or contacting any provider.
+    saved_credential = System.get_env("ANTHROPIC_API_KEY")
+    System.put_env("ANTHROPIC_API_KEY", "sk-ant-synthetic-test-placeholder")
+
     on_exit(fn ->
+      restore_env("ANTHROPIC_API_KEY", saved_credential)
       File.rm_rf(workspace)
     end)
 

@@ -63,6 +63,9 @@ defmodule SymphonyElixir.OpenCode.Failure do
   def classify(:csc_not_found), do: :probe_infrastructure_error
   def classify({:unknown_tool_permission, _}), do: :persistent_worker_failure
   def classify({:unauthorized_credential, _}), do: :persistent_worker_failure
+  def classify({:unsupported_provider, _}), do: :persistent_worker_failure
+  def classify({:missing_provider_credential, _}), do: :persistent_worker_failure
+  def classify({:unexpected_endpoint_override, _}), do: :persistent_worker_failure
   def classify({:incomplete_stream, _}), do: :persistent_worker_failure
   def classify({:malformed_json_line, _, _}), do: :persistent_worker_failure
   def classify(:termination_unconfirmed), do: :persistent_worker_failure
@@ -365,6 +368,17 @@ defmodule SymphonyElixir.OpenCode.Failure do
 
   defp extract_message({:opencode_remote_host_ineligible, worker_host}),
     do: "OpenCode harness is not eligible on remote worker host #{worker_host}; refused before launch"
+
+  # Presence-only preflight rejections: provider and variable names only,
+  # never credential values.
+  defp extract_message({:unsupported_provider, provider}),
+    do: "OpenCode provider #{provider} has no supported credential mapping; launch refused"
+
+  defp extract_message({:missing_provider_credential, provider}),
+    do: "OpenCode provider #{provider} has no supported nonempty credential environment variable; launch refused before worker creation"
+
+  defp extract_message({:unexpected_endpoint_override, key}),
+    do: "OpenCode endpoint override #{key} would be inherited from the environment and redirect the provider credential; supply it explicitly via provider_auth or unset it"
 
   defp extract_message(%{} = map) do
     data = Map.get(map, "data") || Map.get(map, :data)

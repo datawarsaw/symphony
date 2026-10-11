@@ -78,7 +78,15 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
     mock_exe = MockOpenCode.ensure_built!()
     Application.put_env(:symphony_elixir, :opencode_executable, mock_exe)
 
+    # PILOT-AUTH-F: the pinned pilot provider is a mapped allowlist identity
+    # ("anthropic") so every launch in this suite passes the production
+    # credential presence preflight with a synthetic placeholder credential —
+    # offline, never authenticated, never sent anywhere.
+    saved_credential = System.get_env("ANTHROPIC_API_KEY")
+    System.put_env("ANTHROPIC_API_KEY", "sk-ant-synthetic-test-placeholder")
+
     on_exit(fn ->
+      restore_env("ANTHROPIC_API_KEY", saved_credential)
       Application.delete_env(:symphony_elixir, :opencode_executable)
       remove_temp_fixture_root!(root)
     end)
@@ -101,7 +109,7 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
   defp pilot(identifier, overrides \\ []) do
     %OpenCodeSchema{
       enabled: true,
-      provider: "mockprovider",
+      provider: "anthropic",
       model: "mock-model",
       timeout_ms: 15_000,
       allowed_tools: ["read", "glob"],
@@ -116,7 +124,7 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
       Keyword.merge(
         [
           opencode_enabled: true,
-          opencode_provider: "mockprovider",
+          opencode_provider: "anthropic",
           opencode_model: "mock-model",
           opencode_allowed_tools: ["read", "glob"],
           opencode_allowed_issues: [issue.identifier]
@@ -234,7 +242,7 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
       # pinned pilot snapshot for the authorized issue.
       assert {:opencode, snapshot} = Orchestrator.dispatch_harness_for_test(issue)
       assert %OpenCodeSchema{} = snapshot
-      assert snapshot.provider == "mockprovider"
+      assert snapshot.provider == "anthropic"
       assert snapshot.model == "mock-model"
       assert snapshot.allowed_tools == ["read", "glob"]
       assert snapshot.timeout_ms > 0
@@ -508,7 +516,7 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
         issue_id: issue_id,
         identifier: "OPT-SENTINEL",
         attempt_id: 7,
-        provider: "mockprovider",
+        provider: "anthropic",
         model: "mock-model",
         allowed_tools: ["read", "glob"],
         timeout_ms: 60_000,
@@ -519,7 +527,7 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
       assert {:ok, session} = Adapter.start_session(workspace, "--mock-mode=success", opts)
 
       # `provider:` and `model:` are consumed as the pinned launch identity
-      assert session.provider == "mockprovider"
+      assert session.provider == "anthropic"
       assert session.model == "mock-model"
 
       # `allowed_tools:` materializes as the deny-by-default permission map
@@ -1300,7 +1308,7 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
 
       null_enabled_struct = %OpenCodeSchema{
         enabled: nil,
-        provider: "mockprovider",
+        provider: "anthropic",
         model: "mock-model",
         allowed_tools: ["read"],
         allowed_issues: ["MIC-NULL-ENABLED"]

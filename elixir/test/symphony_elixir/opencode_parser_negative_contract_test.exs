@@ -56,7 +56,17 @@ defmodule SymphonyElixir.OpenCodeParserNegativeContractTest do
       Path.join(System.tmp_dir!(), "m1pn-workspace-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(workspace)
-    on_exit(fn -> File.rm_rf(workspace) end)
+
+    # PILOT-AUTH-F: launches pass the production credential preflight with a
+    # synthetic placeholder credential (offline, never authenticated).
+    saved_credential = System.get_env("ANTHROPIC_API_KEY")
+    System.put_env("ANTHROPIC_API_KEY", "sk-ant-synthetic-test-placeholder")
+
+    on_exit(fn ->
+      restore_env("ANTHROPIC_API_KEY", saved_credential)
+      File.rm_rf(workspace)
+    end)
+
     {:ok, workspace: workspace}
   end
 

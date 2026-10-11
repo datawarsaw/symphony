@@ -8,6 +8,16 @@ defmodule SymphonyElixir.OpenCode.Environment do
   config, permission and home lookup variables are pinned to the launch
   directory so project files and the operator's global settings cannot widen
   permissions.
+
+  Credential presence preflight: the same provider credential allowlist is the
+  single mapping source for `preflight_provider_credentials/2`, which refuses
+  a launch when the selected provider has no credential mapping, when no
+  supported nonempty credential variable resolves for it, or when an
+  endpoint/base-URL override would be inherited silently from the ambient
+  environment instead of being supplied explicitly through `provider_auth`.
+  The check verifies variable presence only — it never authenticates and
+  never contacts a provider — and its error reasons carry provider and
+  variable names, never credential values.
   """
 
   alias SymphonyElixir.PathSafety
@@ -69,6 +79,12 @@ defmodule SymphonyElixir.OpenCode.Environment do
     "DRIVERDATA",
     "OPENCODE_GIT_BASH_PATH"
   ]
+
+  # Allowlist keys with these suffixes name where credentials are sent, not
+  # the credentials themselves: they never satisfy credential presence, and
+  # an ambient value for one is treated as an unauthorized redirect of the
+  # selected provider's credentials.
+  @endpoint_key_suffixes ["_BASE_URL", "_ENDPOINT", "_HOST"]
 
   @all_provider_secrets @provider_credentials |> Map.values() |> List.flatten() |> Enum.uniq()
 
@@ -142,14 +158,10 @@ defmodule SymphonyElixir.OpenCode.Environment do
 
   @spec build_port_env(String.t(), dirs(), keyword()) :: {:ok, [env_entry()]} | {:error, term()}
   def build_port_env(provider, dirs, opts \\ []) do
-    with {:ok, allowed_keys} <- provider_auth_keys(provider, opts) do
-      caller_auth =
-        opts
-        |> Keyword.get(:provider_auth, %{})
-        |> Map.new(fn {key, value} -> {to_string(key), to_string(value)} end)
-
+    with :ok <- preflight_provider_credentials(provider, opts),
+         {:ok, allowed_keys} <- provider_auth_keys(provider, opts) do
       parent = System.get_env()
-      parent_by_fold = Map.new(parent, fn {key, value} -> {String.downcase(key), {key, value}} end)
+      parent_by_fold = fold_parent_env()
 
       inherited =
         Enum.reduce(@inherited_keys, %{}, fn key, acc ->
@@ -163,25 +175,11 @@ defmodule SymphonyElixir.OpenCode.Environment do
         end)
 
       auth =
-        Enum.reduce(allowed_keys, %{}, fn key, acc ->
-          value =
-            case Map.get(caller_auth, key) do
-              binary when is_binary(binary) and binary != "" ->
-                binary
-
-              _ ->
-                case Map.get(parent_by_fold, String.downcase(key)) do
-                  {_original, binary} when is_binary(binary) and binary != "" -> binary
-                  _ -> nil
-                end
-            end
-
-          if is_binary(value) and value != "" do
-            Map.put(acc, env_key(parent_by_fold, key), value)
-          else
-            acc
-          end
-        end)
+        for {key, value} <- resolve_auth_values(allowed_keys, opts),
+            is_binary(value) and value != "",
+            into: %{} do
+          {env_key(parent_by_fold, key), value}
+        end
 
       values =
         inherited
@@ -198,20 +196,37 @@ defmodule SymphonyElixir.OpenCode.Environment do
     end
   end
 
+  @doc """
+  Fail-closed credential presence preflight for an armed OpenCode launch.
+
+  The provider credential allowlist that builds the child environment is the
+  single mapping source: an unmapped provider identifier is refused instead of
+  launching a child with an unknown credential contract. The launch is also
+  refused when no supported nonempty credential variable resolves for the
+  selected provider (caller `provider_auth` first, then the BEAM environment,
+  exactly like `build_port_env/3`), and when an endpoint/base-URL override
+  would be inherited silently from the ambient environment — a redirect the
+  operator never authorized for this launch.
+
+  Presence only: no authentication attempt, no provider contact. Error
+  reasons carry provider and variable names, never credential values.
+  """
+  @spec preflight_provider_credentials(String.t(), keyword()) :: :ok | {:error, term()}
+  def preflight_provider_credentials(provider, opts \\ []) do
+    with {:ok, allowed_keys} <- provider_auth_keys(provider, opts),
+         :ok <- ensure_credential_presence(provider, allowed_keys, opts),
+         :ok <- reject_unexpected_endpoint_overrides(allowed_keys, opts) do
+      :ok
+    end
+  end
+
   @spec provider_auth_keys(String.t(), keyword()) :: {:ok, [String.t()]} | {:error, term()}
   def provider_auth_keys(provider, opts \\ []) do
-    normalized = provider |> to_string() |> String.downcase() |> String.trim()
-    allowed = Map.get(@provider_credentials, normalized, [])
+    normalized = normalize_provider(provider)
 
-    requested =
-      (Keyword.get(opts, :preserve_auth_keys, []) ++
-         (opts |> Keyword.get(:provider_auth, %{}) |> Map.keys()))
-      |> Enum.map(&to_string/1)
-      |> Enum.uniq()
-
-    case Enum.find(requested, &(&1 not in allowed)) do
-      nil -> {:ok, allowed}
-      key -> {:error, {:unauthorized_credential, key}}
+    case Map.fetch(@provider_credentials, normalized) do
+      :error -> {:error, {:unsupported_provider, normalized}}
+      {:ok, allowed} -> authorize_requested_keys(allowed, opts)
     end
   end
 
@@ -261,6 +276,96 @@ defmodule SymphonyElixir.OpenCode.Environment do
     case Map.get(parent_by_fold, String.downcase(key)) do
       {original, _} -> original
       _ -> key
+    end
+  end
+
+  defp normalize_provider(provider), do: provider |> to_string() |> String.downcase() |> String.trim()
+
+  defp fold_parent_env do
+    Map.new(System.get_env(), fn {key, value} -> {String.downcase(key), {key, value}} end)
+  end
+
+  defp normalize_caller_auth(opts) do
+    opts
+    |> Keyword.get(:provider_auth, %{})
+    |> Map.new(fn {key, value} -> {to_string(key), to_string(value)} end)
+  end
+
+  # Resolves each key the way build_port_env/3 hands it to the child: an
+  # explicit nonempty caller value wins, otherwise a nonempty ambient BEAM
+  # value (case-insensitively), otherwise nothing. Returns key -> value | nil.
+  defp resolve_auth_values(keys, opts) do
+    caller_auth = normalize_caller_auth(opts)
+    parent_by_fold = fold_parent_env()
+    Map.new(keys, fn key -> {key, resolved_key(caller_auth, parent_by_fold, key)} end)
+  end
+
+  defp resolved_key(caller_auth, parent_by_fold, key) do
+    case caller_value(caller_auth, key) do
+      nil -> ambient_value(parent_by_fold, key)
+      value -> value
+    end
+  end
+
+  defp caller_value(caller_auth, key) do
+    case Map.get(caller_auth, key) do
+      binary when is_binary(binary) and binary != "" -> binary
+      _ -> nil
+    end
+  end
+
+  defp ambient_value(parent_by_fold, key) do
+    case Map.get(parent_by_fold, String.downcase(key)) do
+      {_original, binary} when is_binary(binary) and binary != "" -> binary
+      _ -> nil
+    end
+  end
+
+  defp authorize_requested_keys(allowed, opts) do
+    requested =
+      (Keyword.get(opts, :preserve_auth_keys, []) ++
+         (opts |> Keyword.get(:provider_auth, %{}) |> Map.keys()))
+      |> Enum.map(&to_string/1)
+      |> Enum.uniq()
+
+    case Enum.find(requested, &(&1 not in allowed)) do
+      nil -> {:ok, allowed}
+      key -> {:error, {:unauthorized_credential, key}}
+    end
+  end
+
+  # Endpoint-shaped keys name a destination, not a credential: only the
+  # remaining allowlist keys can satisfy presence.
+  defp endpoint_key?(key), do: String.ends_with?(key, @endpoint_key_suffixes)
+
+  defp ensure_credential_presence(provider, allowed_keys, opts) do
+    credential_keys = Enum.reject(allowed_keys, &endpoint_key?/1)
+    resolved = resolve_auth_values(credential_keys, opts)
+
+    if Enum.any?(Map.values(resolved), &is_binary/1) do
+      :ok
+    else
+      {:error, {:missing_provider_credential, normalize_provider(provider)}}
+    end
+  end
+
+  # An endpoint override is expected only when the caller supplied it
+  # explicitly through provider_auth for this launch. One that would instead
+  # be inherited from the ambient BEAM environment redirects where the
+  # selected provider's credentials are sent, so the launch is refused.
+  defp reject_unexpected_endpoint_overrides(allowed_keys, opts) do
+    caller_auth = normalize_caller_auth(opts)
+
+    endpoint_keys = Enum.filter(allowed_keys, &endpoint_key?/1)
+    resolved = resolve_auth_values(endpoint_keys, opts)
+
+    unauthorized? = fn key ->
+      is_binary(Map.get(resolved, key)) and is_nil(caller_value(caller_auth, key))
+    end
+
+    case Enum.find(endpoint_keys, unauthorized?) do
+      nil -> :ok
+      key -> {:error, {:unexpected_endpoint_override, key}}
     end
   end
 
