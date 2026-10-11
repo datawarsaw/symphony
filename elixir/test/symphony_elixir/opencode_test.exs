@@ -467,6 +467,40 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert usage.total_tokens == 2_300
     end
 
+    test "explicit total of 0 is honored and not treated as missing" do
+      stream =
+        step_finish_tokens_line(%{
+          "input" => 50,
+          "output" => 150,
+          "reasoning" => 20,
+          "cache" => %{"read" => 10, "write" => 5},
+          "total" => 0
+        })
+
+      usage = parse_step_usage(stream)
+
+      assert usage.total_tokens == 0
+      assert usage.input_tokens == 50
+      assert usage.output_tokens == 150
+      assert usage.reasoning_tokens == 20
+    end
+
+    test "malformed totals fall back to the additive category sum" do
+      for malformed <- ["240", -5, 12.5, nil] do
+        stream =
+          step_finish_tokens_line(%{
+            "input" => 50,
+            "output" => 150,
+            "reasoning" => 20,
+            "cache" => %{"read" => 10, "write" => 5},
+            "total" => malformed
+          })
+
+        usage = parse_step_usage(stream)
+        assert usage.total_tokens == 235, "expected additive fallback for total: #{inspect(malformed)}"
+      end
+    end
+
     test "multi-step cumulative total sums the per-step totals" do
       stream =
         step_finish_tokens_line(%{"input" => 40, "output" => 60, "reasoning" => 10, "cache" => %{"read" => 5, "write" => 5}},

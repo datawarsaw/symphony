@@ -54,6 +54,10 @@ defmodule SymphonyElixir.TestSupport.OpenCodeWorkerFixture do
     cache_write = Keyword.get(opts, :cache_write, 10)
     cost = Keyword.get(opts, :cost, 0.005)
 
+    # tokens below match the v1.18.28 emitted CLI field set exactly
+    # (publish-llm-event.ts builds input/output/reasoning/cache and never a
+    # total). Fixtures that add "total" exercise the optional-schema case,
+    # which the v1 schema permits but the CLI does not produce.
     [
       Jason.encode!(%{
         "type" => "step_start",

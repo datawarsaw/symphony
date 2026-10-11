@@ -71,6 +71,30 @@ defmodule SymphonyElixir.WorkerEventTest do
       assert event.terminal? == true
       assert event.usage == %{input_tokens: 40, output_tokens: 80, total_tokens: 120}
     end
+
+    test "Codex token accounting is unchanged by the OpenCode contract" do
+      # An explicit Codex total is kept, and the legacy zero-total heuristic
+      # (zero total alongside reported usage is treated as absent and
+      # recomputed) still applies to Codex-shaped usage.
+      explicit =
+        WorkerEvent.from_codex(%{
+          event: :turn_completed,
+          timestamp: DateTime.utc_now(),
+          usage: %{"input_tokens" => 40, "output_tokens" => 80, "total_tokens" => 120}
+        })
+
+      assert explicit.usage.total_tokens == 120
+      assert get_in(WorkerEvent.to_update(explicit), [:tokenUsage, :total, :totalTokens]) == 120
+
+      zero_total =
+        WorkerEvent.from_codex(%{
+          event: :turn_completed,
+          timestamp: DateTime.utc_now(),
+          usage: %{"input_tokens" => 40, "output_tokens" => 80, "total_tokens" => 0}
+        })
+
+      assert get_in(WorkerEvent.to_update(zero_total), [:tokenUsage, :total, :totalTokens]) == 120
+    end
   end
 
   describe "from_opencode/2 and OpenCode JSONL event taxonomy" do
@@ -663,6 +687,110 @@ defmodule SymphonyElixir.WorkerEventTest do
       assert event.usage.total_tokens == 120
 
       assert {:duplicate, ^state} = WorkerEvent.accumulate(state, line)
+    end
+
+    test "an explicit wire total of 0 is the per-step total, not the category sum" do
+      event =
+        step_tokens_event("m-t0", %{
+          "input" => 100,
+          "output" => 200,
+          "reasoning" => 25,
+          "cache" => %{"read" => 50, "write" => 10},
+          "total" => 0
+        })
+
+      assert event.usage.total_tokens == 0
+      assert event.usage.input_tokens == 100
+      assert event.usage.output_tokens == 200
+      assert event.usage.reasoning_tokens == 25
+      assert event.usage.cache_read_tokens == 50
+    end
+
+    test "malformed wire totals fall back to the additive category sum" do
+      for malformed <- ["390", -5, 12.5, nil] do
+        event =
+          step_tokens_event("m-tmal", %{
+            "input" => 100,
+            "output" => 200,
+            "reasoning" => 25,
+            "cache" => %{"read" => 50, "write" => 10},
+            "total" => malformed
+          })
+
+        assert event.usage.total_tokens == 385, "expected additive fallback for total: #{inspect(malformed)}"
+      end
+    end
+
+    test "to_update honors an explicit zero total for OpenCode events" do
+      line =
+        step_tokens_line("m-tu0", %{
+          "input" => 100,
+          "output" => 200,
+          "reasoning" => 25,
+          "cache" => %{"read" => 50, "write" => 10},
+          "total" => 0
+        })
+
+      {:ok, _state, event} = WorkerEvent.accumulate(nil, line)
+      update = WorkerEvent.to_update(event)
+
+      assert get_in(update, [:tokenUsage, :total, :totalTokens]) == 0
+      assert get_in(update, [:tokenUsage, :total, :inputTokens]) == 100
+      assert get_in(update, [:tokenUsage, :total, :outputTokens]) == 200
+      assert update.usage.total_tokens == 0
+    end
+
+    test "cumulative accounting sums per-step contract totals including explicit zeros" do
+      zero_total_step =
+        step_tokens_line("m-cz1", %{
+          "input" => 40,
+          "output" => 60,
+          "reasoning" => 10,
+          "cache" => %{"read" => 5, "write" => 5},
+          "total" => 0
+        })
+
+      additive_step =
+        step_tokens_line("m-cz2", %{"input" => 60, "output" => 90, "reasoning" => 15, "cache" => %{"read" => 10, "write" => 5}})
+
+      assert {:ok, state, event_a} = WorkerEvent.accumulate(nil, zero_total_step)
+      assert event_a.usage.total_tokens == 0
+
+      assert {:ok, _state, event_b} = WorkerEvent.accumulate(state, additive_step)
+      assert event_b.usage.total_tokens == 180
+      assert event_b.usage.input_tokens == 100
+    end
+
+    test "Parser and WorkerEvent agree on the per-step total for every total shape" do
+      categories = %{"input" => 50, "output" => 150, "reasoning" => 20, "cache" => %{"read" => 10, "write" => 5}}
+
+      # Unified contract: an explicit valid non-negative integer total
+      # (including 0) takes precedence; a missing or malformed total is the
+      # additive five-category sum (235 here).
+      expectations = %{
+        nil => 235,
+        0 => 0,
+        240 => 240,
+        "240" => 235,
+        -5 => 235,
+        12.5 => 235
+      }
+
+      for {total_value, expected} <- expectations do
+        line = step_tokens_line("m-consistency", Map.put(categories, "total", total_value))
+
+        parser_total =
+          SymphonyElixir.OpenCode.Parser.new()
+          |> SymphonyElixir.OpenCode.Parser.feed(line)
+          |> SymphonyElixir.OpenCode.Parser.finish(0)
+          |> SymphonyElixir.OpenCode.Parser.to_result()
+          |> get_in([:usage, :total_tokens])
+
+        worker_total = line |> WorkerEvent.from_opencode() |> get_in([:usage, :total_tokens])
+
+        assert parser_total == expected, "Parser disagreed for total: #{inspect(total_value)}"
+        assert worker_total == expected, "WorkerEvent disagreed for total: #{inspect(total_value)}"
+      end
     end
 
     test "to_update reports the contract total in tokenUsage" do
