@@ -1,0 +1,194 @@
+{
+  "version": "1.18.28",
+  "upstream_repository": "anomalyco/opencode",
+  "upstream_tag": "v1.18.28",
+  "upstream_commit_sha": "22006d97652839999596a34a48ff6be7dbb40c6e",
+  "generated_at": "2026-10-11T00:00:00Z",
+  "fixtures": [
+    {
+      "name": "single_turn_success.jsonl",
+      "label": "upstream-derived",
+      "description": "Standard single-turn prompt completion emitting step_start, text, and step_finish with stop reason and explicit prompt cache usage.",
+      "source_references": [
+        "packages/opencode/test/cli/run/run-process.test.ts ('--format json emits parseable line-delimited JSON to stdout')",
+        "packages/schema/src/v1/session.ts (StepStartPart, TextPart, StepFinishPart)",
+        "packages/opencode/src/cli/cmd/run.ts (emit logic for step_start, text, step_finish)"
+      ],
+      "wire_events": [
+        "step_start",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "authentic_ids (ses_*, msg_*, prt_*)",
+        "tokens.total",
+        "tokens.cache.read",
+        "reason: stop",
+        "cost"
+      ]
+    },
+    {
+      "name": "multi_step_tool_success.jsonl",
+      "label": "upstream-derived",
+      "description": "Two-step turn: Step 1 emits tool_use (read_file) followed by intermediate step_finish with reason 'tool-calls'; Step 2 emits text and terminal step_finish with reason 'stop'.",
+      "source_references": [
+        "packages/opencode/test/cli/run/run-process.test.ts ('--format json preserves reasoning, tool, and continuation ordering')",
+        "packages/schema/src/v1/session.ts (ToolPart, ToolStateCompleted, StepFinishPart)",
+        "packages/opencode/src/cli/cmd/run.ts (loop stream part.type == 'tool' and 'step-finish')"
+      ],
+      "wire_events": [
+        "step_start",
+        "tool_use",
+        "step_finish",
+        "step_start",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "intermediate_reason: tool-calls",
+        "terminal_reason: stop",
+        "tool_state: completed",
+        "authentic_tool_keys (callID, input, output, title, metadata, time)"
+      ]
+    },
+    {
+      "name": "tool_error_recovery.jsonl",
+      "label": "schema-derived",
+      "description": "Policy-sensitive fixture: Step 1 emits tool_use with state.status 'error' followed by step_finish with reason 'tool-calls'; Step 2 recovers, emits text alternative and terminal step_finish with reason 'stop'.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts (ToolStateError, StepFinishPart)",
+        "packages/opencode/src/cli/cmd/run.ts (part.state.status === 'error' -> emit('tool_use'), UI.error)",
+        "docs/m1-w-opencode-jsonl-protocol-audit.md (Finding A3: tool error recovery policy)"
+      ],
+      "wire_events": [
+        "step_start",
+        "tool_use",
+        "step_finish",
+        "step_start",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "tool_state: error (ENOENT)",
+        "intermediate_reason: tool-calls",
+        "terminal_recovery_reason: stop",
+        "natural_process_exit: 0"
+      ]
+    },
+    {
+      "name": "terminal_reason_other.jsonl",
+      "label": "schema-derived",
+      "description": "Single-turn prompt finish with AI SDK / provider fallback reason 'other' rather than standard 'stop'.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts (StepFinishPart.reason: Schema.String)",
+        "opencode CLI binary 1.18.28 AI SDK finishReason mapper ('default: return other')",
+        "docs/m1-w-opencode-jsonl-protocol-audit.md (Finding A1: terminal reason whitelist)"
+      ],
+      "wire_events": [
+        "step_start",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "terminal_reason: other",
+        "tokens.total"
+      ]
+    },
+    {
+      "name": "api_error_retryable_rate_limit.jsonl",
+      "label": "schema-derived",
+      "description": "Upstream APIError event with HTTP 429 status code and isRetryable: true, containing responseHeaders and responseBody.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts (APIError: { message, statusCode, isRetryable, responseHeaders, responseBody, metadata })",
+        "packages/opencode/test/provider/error.test.ts (ProviderError.parseStreamError)",
+        "packages/opencode/src/cli/cmd/run.ts (session.error event emission)",
+        "docs/m1-w-opencode-jsonl-protocol-audit.md (Finding A5: statusCode and isRetryable mapping)"
+      ],
+      "wire_events": [
+        "error"
+      ],
+      "wire_features": [
+        "error.name: APIError",
+        "error.data.statusCode: 429",
+        "error.data.isRetryable: true",
+        "error.data.responseHeaders",
+        "error.data.responseBody"
+      ]
+    },
+    {
+      "name": "api_error_non_retryable_forbidden.jsonl",
+      "label": "schema-derived",
+      "description": "Upstream APIError event with HTTP 403 status code and isRetryable: false representing tier/model authorization refusal.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts (APIError schema)",
+        "docs/m1-w-opencode-jsonl-protocol-audit.md (Finding A5: 24 observed statusCode 403 records in local SQLite store)"
+      ],
+      "wire_events": [
+        "error"
+      ],
+      "wire_features": [
+        "error.name: APIError",
+        "error.data.statusCode: 403",
+        "error.data.isRetryable: false"
+      ]
+    },
+    {
+      "name": "provider_auth_error.jsonl",
+      "label": "schema-derived",
+      "description": "Upstream ProviderAuthError event indicating credential failure or revoked key.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts (AuthError = namedError('ProviderAuthError', { providerID, message }))",
+        "packages/opencode/src/cli/cmd/run.ts"
+      ],
+      "wire_events": [
+        "error"
+      ],
+      "wire_features": [
+        "error.name: ProviderAuthError",
+        "error.data.providerID",
+        "error.data.message"
+      ]
+    },
+    {
+      "name": "reasoning_thinking_turn.jsonl",
+      "label": "upstream-derived",
+      "description": "Prompt run with --thinking flag enabled, emitting explicit reasoning part before text and recording reasoning tokens in step_finish.",
+      "source_references": [
+        "packages/opencode/test/cli/run/run-process.test.ts ('--format json preserves reasoning, tool, and continuation ordering')",
+        "packages/schema/src/v1/session.ts (ReasoningPart)",
+        "packages/opencode/src/cli/cmd/run.ts (part.type === 'reasoning' && part.time?.end && thinking)"
+      ],
+      "wire_events": [
+        "step_start",
+        "reasoning",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "part.type: reasoning",
+        "reasoning.text",
+        "reasoning.time",
+        "tokens.reasoning",
+        "tokens.total"
+      ]
+    },
+    {
+      "name": "synthetic_malformed_control.jsonl",
+      "label": "synthetic",
+      "description": "Negative control fixture containing an invalid non-JSON line sandwiched between valid protocol events, verifying fail-closed parser resilience.",
+      "source_references": [
+        "elixir/test/support/opencode_worker_fixture.exs (malformed mock mode)",
+        "elixir/lib/symphony_elixir/opencode/parser.ex (decode_error_detail / malformed_json_line)"
+      ],
+      "wire_events": [
+        "step_start",
+        "malformed_non_json_line",
+        "step_finish"
+      ],
+      "wire_features": [
+        "malformed_json_line handling",
+        "safe decoder error retention without leak"
+      ]
+    }
+  ]
+}
