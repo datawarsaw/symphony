@@ -14,6 +14,48 @@ Scope: fixtures, manifest, fixture tests, provenance document and this record. P
 - Two upstream observations are open and outside the gates: a mid-turn `unknown` step-finish is treated as terminal by the Parser, and provider failures in JSON mode appear as step-finish events rather than error records.
 - Validation: protocol suite 14 passing; gap suite 5 expected red with unchanged received values. This is not a genuine wire-trace certification. Authorized live captures remain required.
 - Constraints maintained: no provider calls, no private session stores or auth files read, no production module changes, no merge, push, PR or deployment.
+## M1-P-F1 OpenCode parser safety candidate — 2026-10-11
+
+Branch `codex/m1-p-f1-parser-safety`, exact dispatch base
+`9ce11fd3a9db817d1930e372749fd13ce4b08951`, isolated worktree
+`C:/AI/symphony-workspaces/m1-p-f1-parser-safety`. Local implementation candidate;
+no provider calls, credential operations, push, PR, merge, integration or deployment.
+
+- JSONL non-objects and invalid traversed event fields fail closed before session
+  extraction, usage updates or callback event storage. Later valid records remain
+  readable but cannot turn a failed run into success.
+- Evidence reuses `{:malformed_json_line, line, %{reason: "invalid_event_shape: <field>"}}`.
+  Invalid objects retain a fixed line, not their raw payload. String records are
+  decoded before existing Redactor sanitization and its 4,096-byte UTF-8 bound.
+  Evidence line/detail are JSON-encodable; the tuple follows existing Failure conventions.
+- Arithmetic overflow is rejected transactionally using the prior state, with
+  field marker `usage`. This covers huge integer costs and accumulated float overflow.
+- Session-ID validation, usage deduplication, timeout policy, WorkerEvent and
+  dispatch wiring remain untouched, as do the other M1 task worktrees.
+
+Validation evidence lives under `C:/AI/reviews/m1-p-f1-*.log`:
+
+- New safety suite: baseline 34 tests / 33 failures; candidate 34 / 0.
+- Read-only negative candidate `a5378cc2660c4e86492c2a475d5f825da1659c78`:
+  baseline 21 / 11 failures; candidate 21 / 3. All eight shape-safety red tests
+  turn green. Remaining failures are two duplicate-accounting tests and one
+  foreign-session test, deliberately outside this task. Timeout assertions passed
+  in both measured runs; no timeout contract decision is inferred from that.
+- Expanded OpenCode mock suites passed 150 / 0 before the final arithmetic
+  correction; the correction is covered by the final 34-test safety suite.
+  The final existing adapter/config suite passes 77 / 0, matching the exact base.
+  An earlier run had three process-boundary timeouts with no JSONL events;
+  these did not recur in the expanded or final runs.
+- Compile with warnings as errors, specs.check, changed-file formatting and
+  git diff whitespace checks pass. Whole-project formatting fails on the same
+  three baseline files. Credo has identical baseline/candidate finding counts
+  (18 warnings, 60 refactoring, 82 readability, 7 design). Dialyzer has the same
+  34 baseline findings after normalizing shifted line numbers; no new finding.
+
+Residual limits: bounds apply per diagnostic record, not to total stream memory
+or evidence count. Full JSON parsing still precedes shape validation. Independent
+candidate review is pending; this state records implementation, not acceptance.
+Closeout and exact committed revision: `C:/AI/reviews/m1-p-f1-closeout.md`.
 
 ## MIC-167 implementation candidate
 

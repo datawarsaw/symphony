@@ -162,8 +162,8 @@ defmodule SymphonyElixir.OpenCode.Parser do
       state
     else
       case Jason.decode(trimmed) do
-        {:ok, %{} = event} ->
-          process_event(state, event)
+        {:ok, value} ->
+          process_record(state, value)
 
         {:error, reason} ->
           evidence = {:malformed_json_line, Redactor.redact(trimmed), decode_error_detail(reason)}
@@ -176,6 +176,95 @@ defmodule SymphonyElixir.OpenCode.Parser do
       end
     end
   end
+
+  defp process_record(state, %{} = event) do
+    case invalid_event_field(event) do
+      nil -> process_event(state, event)
+      field -> invalid_record(state, "Invalid OpenCode event shape", "invalid_event_shape: " <> field)
+    end
+  rescue
+    # JSON integers are unbounded and even finite floats can overflow when
+    # summed. Keep arithmetic rejection transactional, including event storage.
+    ArithmeticError -> invalid_record(state, "Invalid OpenCode event shape", "invalid_event_shape: usage")
+  end
+
+  defp process_record(state, value) do
+    # Decode strings before redaction so JSON escapes cannot hide secrets.
+    # Other non-objects need no raw payload in diagnostic evidence.
+    line = if is_binary(value), do: value, else: "Non-object OpenCode JSON record"
+    invalid_record(state, line, "invalid_event_shape: record")
+  end
+
+  defp invalid_record(state, line, reason) do
+    evidence = {:malformed_json_line, Redactor.redact(line), %{reason: reason}}
+    %{state | completion_state: :failed, failure_evidence: [evidence | state.failure_evidence]}
+  end
+
+  # Check only fields that are traversed or used in arithmetic. Missing fields
+  # retain their existing defaults; unknown event types remain forward compatible.
+  # Validation precedes session extraction, redaction and callback event storage,
+  # so an invalid record has no partial effects and retains no raw containers.
+  defp invalid_event_field(event) do
+    cond do
+      not is_binary(Map.get(event, "type")) -> "type"
+      field = invalid_field(event, [["part"], ["properties"], ["properties", "info"]], &is_map/1) -> field
+      true -> invalid_payload_field(event)
+    end
+  end
+
+  defp invalid_payload_field(%{"type" => "step_finish"} = event) do
+    invalid_field(event, [["part", "tokens"], ["part", "tokens", "cache"]], &is_map/1) ||
+      invalid_field(
+        event,
+        [
+          ["part", "cost"],
+          ["part", "tokens", "input"],
+          ["part", "tokens", "output"],
+          ["part", "tokens", "reasoning"],
+          ["part", "tokens", "cache", "read"],
+          ["part", "tokens", "cache", "write"]
+        ],
+        &(is_nil(&1) or is_number(&1))
+      )
+  end
+
+  defp invalid_payload_field(%{"type" => "tool_use"} = event) do
+    invalid_field(event, [["part", "state"]], &is_map/1) ||
+      invalid_field(event, [["part", "tool"], ["part", "state", "status"], ["part", "state", "error"], ["part", "state", "output"]], &(is_nil(&1) or is_binary(&1)))
+  end
+
+  defp invalid_payload_field(%{"type" => "session.status"} = event) do
+    invalid_field(event, [["properties", "status"], ["status"]], &is_map/1)
+  end
+
+  defp invalid_payload_field(%{"type" => type} = event) when type in ["error", "session.error"] do
+    # Failure.classify/1 dereferences data when the error payload is a map.
+    invalid_field(event, [["data"], ["error", "data"], ["properties", "error", "data"]], &(is_nil(&1) or is_map(&1)))
+  end
+
+  defp invalid_payload_field(_event), do: nil
+
+  defp invalid_field(event, paths, valid?) do
+    Enum.find_value(paths, &invalid_path(event, &1, valid?))
+  end
+
+  defp invalid_path(event, path, valid?) do
+    case fetch_field(event, path) do
+      {:ok, value} -> if not valid?.(value), do: Enum.join(path, ".")
+      :error -> nil
+    end
+  end
+
+  defp fetch_field(value, []), do: {:ok, value}
+
+  defp fetch_field(%{} = value, [key | rest]) do
+    case Map.fetch(value, key) do
+      {:ok, inner} -> fetch_field(inner, rest)
+      :error -> :error
+    end
+  end
+
+  defp fetch_field(_value, _path), do: :error
 
   # Sanitizes decoder failures into bounded, redacted evidence. The raw
   # Jason.DecodeError struct is never retained: its :data field carries the

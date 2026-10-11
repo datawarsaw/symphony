@@ -293,6 +293,15 @@ hooks:
 
 ### OpenCode worker pilot profile
 
+`OpenCode.Parser` validates JSONL event shapes before session extraction and event storage.
+Non-object records and invalid traversed fields fail closed with the existing
+`{:malformed_json_line, line, %{reason: "invalid_event_shape: <field>"}}` evidence.
+Invalid objects retain a fixed diagnostic string rather than their payload; decoded string
+records pass through `OpenCode.Redactor` with its 4,096-byte UTF-8 bound. The line and detail
+are JSON-encodable; the enclosing tuple retains the existing Elixir failure convention.
+Later valid records remain readable and cannot clear the failed state. Existing optional
+usage defaults, terminal reasons and unknown event types remain supported.
+
 `opencode` is an optional extension section for the harness-selection pilot. It is
 disabled by default, and no dispatch path consumes it yet: Symphony still launches Codex for
 every issue.
