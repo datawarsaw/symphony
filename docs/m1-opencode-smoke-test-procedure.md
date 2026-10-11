@@ -21,6 +21,7 @@ The offline harness does not prove that whole list. A standalone PASS means the 
 - **Accepted Baseline:** `c90e2ad71a70310e6d71b94777f6cbaca081b6c5` (`datawarsaw/symphony` main)
 - **Reference Candidate (OpenCode Adapter):** `5df80de937816352ffaebdf125a978eb9f15c85e` / `da78cbf45cbcb0175b0e9124683b41b45e04b6fb`
 - **Reference Candidate (WorkerEvent):** `c89905c1117edc8ccf18f75ebca097b8b4a87714`
+- **Accepted Assembly Candidate (pilot target):** `cdbea16944b342f0fe7c11b4b6a8d40070903b80` (branch `integration/m1-candidate-assembly`). This is the revision the live pilot procedure below must match.
 
 ## 3. Test Harness Architecture
 
@@ -108,17 +109,25 @@ Do not execute this live test until the offline integration gates in section 8 p
 ### Prerequisites
 
 1. OpenCode CLI binary (`opencode.exe` or `opencode`) installed on the host and verified via `opencode --version`.
-2. Valid provider credentials available only in the approved live run (for example `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`).
-3. Symphony configured with `worker_containment_enabled: true` on a Windows host.
+2. A valid provider credential **present in the environment that launches Symphony**, for the exact provider named in `opencode.provider` and drawn from the adapter's credential allowlist (`SymphonyElixir.OpenCode.Environment.provider_auth_keys/2`)-for example `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, `GOOGLE_API_KEY`/`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`. Every OpenCode launch runs with an isolated per-launch home (`<workspace>/.symphony-state/opencode/<launch_id>/` with `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `XDG_*` and `TEMP/TMP` pinned), so an interactive login stored in the shared `~/.local/share/opencode/auth.json` is **not** visible to the launch and `OPENCODE_AUTH_CONTENT` is refused. An absent provider key parks the issue immediately as `auth_unavailable` with no retry.
+3. Symphony configured with `codex.worker_containment_enabled: true` on a Windows host.
+4. A dedicated, isolated `workspace.root` (and therefore a dedicated `.symphony-state`) that no already-running runtime owns.
 
 ### Execution Steps
 
-1. **Prepare a synthetic test issue.**
-   - Create an issue with label `worker:opencode` and an explicit provider/model.
-   - Description containing a simple bounded task (for example, "Write HELLO into test_smoke.txt").
-2. **Launch the worker under Symphony.**
-   - Trigger worker dispatch for the test issue.
-   - Read the production dispatch log and confirm the assembled router selected the OpenCode worker. The offline fixture route is not this check.
+1. **Prepare the test issue.**
+   - A simple bounded task (for example, "Write HELLO into test_smoke.txt").
+   - Give it exactly one `repo:<target>` label whose target exists in `routing.targets`, plus the `tracker.required_labels` label. `Issue.routable?/2` requires all of them.
+   - Add its exact identifier to `opencode.allowed_issues`.
+2. **Activate OpenCode by configuration, then launch the worker.**
+   - There is no `worker:opencode` label and no label-based worker selection anywhere on this baseline. The activation sequence is:
+     1. `opencode.enabled: true`
+     2. a non-blank `opencode.provider` and `opencode.model` (both required when enabled),
+     3. `opencode.timeout_ms` inside the schema budget (default `900000`, maximum `3600000`),
+     4. a non-empty `opencode.allowed_tools` naming only adapter-contract tools, with no `*`, `all`, `any`, `auto` or `auto_approve`,
+     5. the exact issue identifier listed in `opencode.allowed_issues` (trimmed, case-insensitive; an empty list authorizes nothing).
+   - Trigger dispatch for the test issue.
+   - Read the production dispatch log line `Starting OpenCode worker attempt ... provider=... model=... worker_host=...` and confirm `worker_host` is nil. This adapter has no SSH execution path: a non-nil `worker_host` on an OpenCode dispatch is refused fail-closed as `{:opencode_remote_host_ineligible, worker_host}`, so the pilot worker host must be the local Windows host (`worker.ssh_hosts` empty). The offline fixture route is not this check.
 3. **Verify the pre-launch fence.**
    - Verify that `<workspace_root>/.symphony-state/launches/<issue_id>.json` exists with non-empty `launch_id` and `wrapper_pid` before the task completes.
 4. **Observe streaming events.**
@@ -127,12 +136,24 @@ Do not execute this live test until the offline integration gates in section 8 p
    - This live capture is the first point at which wire compatibility can be claimed. The offline mock is not that capture.
 5. **Verify process termination and cleanup.**
    - Observe worker completion (exit code 0).
-   - Verify `<workspace_root>/.symphony-state/receipts/<launch_id>.json` contains `"tree_drained": true` and a conclusive terminal reason.
+   - Verify that the termination receipt at `<workspace_root>/.symphony-state/worker-terminations/<launch_id>.json` contains `"tree_drained": true` and a conclusive terminal reason. This is the only receipt location; there is no `.symphony-state/receipts/` directory on this baseline.
+   - Verify that only a `step_finish` whose reason is `stop` qualifies as success; `length`, `content-filter`, `unknown` and `other` are terminal but not qualifying.
    - Verify `<workspace_root>/.symphony-state/launches/<issue_id>.json` is deleted on confirmed exit.
    - Run `tasklist /FI "IMAGENAME eq opencode*"` and require a healthy no-match answer before claiming zero residual processes. A failed `tasklist` is unknown, not zero.
 6. **Verify rollback to Codex.**
-   - Remove the `worker:opencode` label or disable OpenCode in Symphony configuration.
-   - Re-dispatch the issue and verify the production router selects the Codex route. Do not use `OpenCodeWorkerFixture.resolve_worker_route/2` as that evidence.
+   - Disable OpenCode (`opencode.enabled: false`) or remove the issue from `opencode.allowed_issues`. There is no label to remove.
+   - Re-dispatch the issue and verify the production selector returns the Codex route. Do not use `OpenCodeWorkerFixture.resolve_worker_route/2` as that evidence. An issue already pinned to OpenCode whose authorization is then revoked parks as `harness_authorization_revoked` instead of silently switching to Codex.
+
+### How the harness is actually selected
+
+`SymphonyElixir.HarnessSelection.select/2` is the production selector and it is pure: it reads only the issue and the validated `opencode` section. It returns `{:opencode, :opencode_selected}` only for the literal `true` together with a valid section and an issue listed in `allowed_issues`. Every disabled, incomplete, unauthorized or unreadable configuration returns `{:codex, reason}` (fail closed to the default Codex harness), and an authorized issue whose section is invalid returns `{:error, :invalid_opencode_config}` so the caller parks instead of substituting Codex. Dispatch wiring lives in `orchestrator.ex` (`dispatch_harness/1`, `resolve_attempt_harness/2`), and the harness pin outlives a later configuration reload.
+
+### Stop, interrupt and retry limits during a live run
+
+   - **No external stop command exists.** The observability endpoint exposes only `GET /api/v1/state`, `GET /api/v1/:issue_identifier` and `POST /api/v1/refresh`; none of them stops a worker. The `Control` actions (`:terminate`, `:relaunch`, `:recover_parked`) have no CLI or HTTP entry point and are reachable only from inside the BEAM (`SymphonyElixir.Control.request/3`).
+   - `:interrupt` is recognized but rejected fail-closed as `:rejected_interrupt_not_supported`: there is no supported way to cancel a single in-flight turn without stopping the issue.
+   - The supported operational stop is a soft stop: make the issue unroutable (remove the `tracker.required_labels` label or move the issue to a terminal state), after which the orchestrator stops planning continuation.
+   - Retry is **not** bounded at one attempt and cannot be configured to one. `RetryPolicy` is a code attribute, not configuration: 10 attempts, a 2-hour envelope, 3 identical consecutive failures, 10 s base backoff, and an immediate park on `auth_unavailable`. `agent.max_turns: 1` limits turns per attempt; it is not and must not be described as `max_attempts: 1`. No hard token or cost budget is enforced; supervision is manual.
 
 ## 6. M1 Acceptance Claims
 
@@ -172,7 +193,6 @@ Run Phase B. Do not weaken these assertions to make the baseline green.
 4. `SymphonyElixir.WorkerEvent` is loaded. Candidate commit: `c89905c`. `WorkerEvent.from_opencode/1` normalizes the multi-step fixture stream, including a non-terminal `tool-calls` finish and a terminal `stop` finish.
 5. `SymphonyElixir.OpenCode.Redactor.redact/1` is loaded and applied to real output from both `--mock-mode=malformed-secret` and `--mock-mode=secret`. The redacted text must not contain the raw `sk-ant-api03-` or `lin_api_` markers. Standalone presence of those markers is not this gate.
 6. `SymphonyElixir.OpenCode.Adapter.validate_model_selection/1` rejects a bare model such as `claude-3-5-sonnet` and reports that automatic fallback is forbidden. The `error` mock's exit code 1 is not this gate.
-7. Production worker selection, not `OpenCodeWorkerFixture.resolve_worker_route/2`, chooses an OpenCode worker from an explicit label or config and returns the Codex default when OpenCode is disabled. On this baseline `DispatchRouter.materialize/3` accepts only `:primary` and `:fallback`. The current integration test fails closed with that gate text until the test calls the assembled selector.
+7. Production worker selection, not `OpenCodeWorkerFixture.resolve_worker_route/2`, chooses an OpenCode worker from the explicitly enabled, valid and issue-authorized `opencode` section (`SymphonyElixir.HarnessSelection.select/2` on the accepted candidate) and returns the Codex default when OpenCode is disabled. There is no label-based selection on this baseline. On the pre-assembly baseline `DispatchRouter.materialize/3` accepts only `:primary` and `:fallback`. The current integration test fails closed with that gate text until the test calls the assembled selector.
 
 `AgentRunner`, `DispatchRouter`, `Orchestrator`, `WorkerEvent`, the OpenCode adapter, and `Config.Schema` are not modified by this harness.
-
