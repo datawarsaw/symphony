@@ -554,3 +554,20 @@ This project is licensed under the [Apache License 2.0](../LICENSE).
 ## Dedicated Discovery lane
 
 See [configuration, safety and evidence handling](../docs/discovery-worker-lane.md). Discovery is disabled by default, runs locally, and never changes issue state. READY handoffs are consumed only on a separately scheduled implementation run.
+
+## OpenCode provider failures
+
+OpenCode 1.18.28 `APIError.data.statusCode` and `isRetryable` are classified from structured
+metadata: 401 is `auth_unavailable`; 403 and 404 are `persistent_worker_failure`. A consistent
+429 or 500–599 requires explicit boolean `isRetryable: true` to become `provider_rate_limit`
+or `provider_outage`. Missing, malformed or conflicting metadata, `UnknownError`, and
+`MessageAbortedError` fail closed as persistent failures; valid 401 evidence still parks auth
+immediately. A generic 404 does not prove model unavailability. Legacy `status` / `data.status`
+payloads without modern metadata retain their existing classifications.
+
+The shared retry policy is unchanged: auth parks immediately; persistent failures permit bounded
+retry (three identical failures, ten total attempts or two hours) and cannot trigger provider
+fallback. `isRetryable: false` therefore prevents provider retry/fallback classification, rather
+than introducing a new no-retry class. Fixtures derive from the public
+[v1.18.28 schema](https://github.com/anomalyco/opencode/blob/v1.18.28/packages/schema/src/v1/session.ts);
+they are not captured live traffic.

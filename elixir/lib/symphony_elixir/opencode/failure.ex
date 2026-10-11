@@ -149,7 +149,60 @@ defmodule SymphonyElixir.OpenCode.Failure do
 
   defp classify_error_map(map) do
     name = Map.get(map, "name") || Map.get(map, :name)
-    data = Map.get(map, "data") || Map.get(map, :data) || %{}
+    data = Map.get(map, "data", Map.get(map, :data, %{}))
+
+    if length(field_values([map], ["name", :name])) > 1 or
+         length(field_values([map], ["data", :data])) > 1 do
+      :persistent_worker_failure
+    else
+      classify_error_map(map, name, data)
+    end
+  end
+
+  defp classify_error_map(_map, _name, data) when not is_map(data), do: :persistent_worker_failure
+
+  defp classify_error_map(map, name, data) do
+    if name in ["UnknownError", "MessageAbortedError", "ProviderAuthError"] or
+         (name == "APIError" and not valid_legacy_status?(field_values([map, data], ["status", :status]))) or
+         Enum.any?(
+           [map, data],
+           &(Map.has_key?(&1, "statusCode") or Map.has_key?(&1, :statusCode) or
+               Map.has_key?(&1, "isRetryable") or Map.has_key?(&1, :isRetryable))
+         ) do
+      classify_provider_error(map, name, data)
+    else
+      classify_legacy_error(map, name, data)
+    end
+  end
+
+  # Treat HTTP status and retryability as structured evidence. Text cannot turn
+  # unknown, aborted, non-retryable or contradictory errors into provider retries.
+  defp classify_provider_error(map, name, data) do
+    statuses = field_values([map, data], ["statusCode", :statusCode, "status", :status])
+    retryable = field_values([map, data], ["isRetryable", :isRetryable])
+
+    cond do
+      name in ["UnknownError", "MessageAbortedError"] -> :persistent_worker_failure
+      name == "ProviderAuthError" or 401 in statuses -> :auth_unavailable
+      403 in statuses -> :persistent_worker_failure
+      retryable != [true] -> :persistent_worker_failure
+      true -> classify_retryable_status(statuses)
+    end
+  end
+
+  defp classify_retryable_status([429]), do: :provider_rate_limit
+  defp classify_retryable_status([status]) when is_integer(status) and status in 500..599, do: :provider_outage
+  defp classify_retryable_status(_statuses), do: :persistent_worker_failure
+
+  defp valid_legacy_status?([status]) when is_integer(status) and status in 100..599, do: true
+  defp valid_legacy_status?(_statuses), do: false
+
+  defp field_values(maps, keys) do
+    for(map <- maps, key <- keys, Map.has_key?(map, key), do: Map.fetch!(map, key))
+    |> Enum.uniq()
+  end
+
+  defp classify_legacy_error(map, name, data) do
     msg = Map.get(data, "message") || Map.get(data, :message) || Map.get(map, "message") || Map.get(map, :message)
 
     status =
@@ -314,8 +367,10 @@ defmodule SymphonyElixir.OpenCode.Failure do
     do: "OpenCode harness is not eligible on remote worker host #{worker_host}; refused before launch"
 
   defp extract_message(%{} = map) do
-    get_in(map, ["data", "message"]) ||
-      get_in(map, [:data, :message]) ||
+    data = Map.get(map, "data") || Map.get(map, :data)
+    nested_message = if is_map(data), do: Map.get(data, "message") || Map.get(data, :message)
+
+    nested_message ||
       Map.get(map, "message") ||
       Map.get(map, :message) ||
       inspect(map)

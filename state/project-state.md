@@ -419,3 +419,35 @@ Validated on this host (Windows, Elixir 1.19.5 / OTP 28):
 
 Scope remains configuration and policy only: dispatch integration, the adapter branch, `WORKFLOW.md`, and the
 deployed runtime configuration are untouched, and OpenCode remains unreachable until dispatch wiring lands.
+## M1-API-F OpenCode provider classification candidate — 2026-10-11
+
+Local candidate on `codex/m1-api-f-provider-classification`, isolated worktree
+`C:/AI/symphony-workspaces/m1-api-f-provider-classification`, exact base
+`9ce11fd3a9db817d1930e372749fd13ce4b08951`. Pending independent review and integration;
+no push, PR, merge or deployment. This entry records candidate behavior, not deployed behavior.
+
+- OpenCode 1.18.28 schema-derived `APIError` fixtures use `data.statusCode` and boolean
+  `data.isRetryable`. Baseline reproduction classified 401/403/404/429/500/501/502/503/504/599
+  with neutral messages as `transient_worker_failure`.
+- Candidate: 401 -> `auth_unavailable`; 403/404 -> `persistent_worker_failure`;
+  consistent 429 -> `provider_rate_limit`, consistent 500–599 -> `provider_outage`, both
+  requiring explicit `isRetryable: true`. Missing, malformed, false or conflicting retry
+  metadata and missing/malformed/conflicting HTTP status fail closed as persistent;
+  valid 401 evidence has auth precedence over conflicting metadata.
+- `UnknownError` and `MessageAbortedError` remain persistent even with misleading messages
+  or extra provider metadata. Real `ProviderAuthError` is auth. Legacy `status`/`data.status`
+  without modern fields retain their existing mapping, including legacy `APIError`;
+  conflicting legacy API statuses fail closed. Malformed `data` no longer crashes failure info.
+- Shared FailureClass, retry scheduling, HarnessSelection, dispatch and adapter execution
+  are unchanged. Auth parks immediately; persistent cannot trigger fallback and permits only
+  the existing bounded retry envelope (three identical failures, ten attempts / two hours).
+  `isRetryable: false` cannot mean immediate no-retry without changing global policy.
+- Focused classification, legacy taxonomy, retry/fallback policy and retry-envelope regression:
+  100 tests, 0 failures, seed 424242. Compilation with `--warnings-as-errors`, public specs and
+  formatting of changed Elixir files pass. Full static gates have pre-existing failures;
+  evidence and baseline comparison are retained in
+  `C:/AI/reviews/m1-api-f-provider-classification`.
+- Evidence: nonsecret protocol audit
+  `C:/AI/reviews/m1-w-opencode-jsonl-protocol-audit/M1-W-OPENCODE-PROTOCOL-AUDIT.md`, section A5;
+  public `anomalyco/opencode` tag `v1.18.28`, `packages/schema/src/v1/session.ts`.
+  Fixtures are schema-derived, not captured stdout; no live providers or credential reads.
