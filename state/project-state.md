@@ -1,5 +1,49 @@
 # Symphony project state
 
+## PILOT-BOOT-F safe pilot bootstrap gate — 2026-10-11
+
+Branch `pilot/pilot-boot-f`, exact base `e65d1854351880b77bffad8fff4f755d8e9ee028` (the procedure
+documentation commit on top of the Human Accepted M1 candidate
+`cdbea16944b342f0fe7c11b4b6a8d40070903b80`). Isolated worktree
+`C:/AI/symphony-workspaces/m1-integration-assembly`. Implementation commit:
+`68344ee8eac8ada4eb9bd99e9e024d8127f94c51`. The accepted
+M1 commit is unchanged and remains the pilot provenance anchor. Local implementation candidate; no
+push, PR, merge or deployment, and the pilot is not started.
+
+- New fail-closed gate `SymphonyElixir.PilotBootstrap` and the `mix symphony.pilot_bootstrap` task. A pilot
+  manifest (pilot root, source root, expected source SHA, explicit workflow path, workspace root,
+  log root, approved repository target and source path) is required; nothing is started until the
+  gate passes, and `--preflight-only` starts nothing at all.
+- Boundary checks (both modes): manifest paths absolute and inside the pilot root; source HEAD equals
+  `expected_source_sha` with a clean tracked tree (so the legacy `elixir/WORKFLOW.md` copy step now fails);
+  the workflow is inside the pilot root, is not `elixir/WORKFLOW.md` and is not byte-identical to it; the
+  declared `workspace.root` equals the manifest workspace root and stays inside the pilot root; the log
+  root is inside the pilot root and outside protected checkouts; `worker.ssh_hosts` is empty,
+  `codex.worker_containment_enabled` is `true`, `agent.max_concurrent_agents` and `agent.max_turns` are `1`,
+  `discovery.enabled` is `false`; every existing routing target resolves to the approved source path.
+- Arming checks (`:armed` only): tracker project slug and required labels set; OpenCode enabled with
+  non-placeholder provider and model and non-empty tool and issue lists; exactly one routing target
+  equal to `approved_repo_target`; the labelled issue resolves while the unlabelled issue is refused as
+  `{:error, :missing_repository_target}`; every authorized issue selects OpenCode through the production
+  `HarnessSelection.select/2`.
+- `start/2` applies the workflow path and the log file to the application environment before starting the
+  client, so the disk log is `<logs_root>/log/symphony.log` inside the pilot directory and cannot fall
+  back to the default runtime location. A refusal returns before either is applied.
+- Deliberately unchanged: `RepositoryRouter.resolve/2` semantics (an empty `targets` map still returns
+  `{:ok, nil}` and still resolves to the default workspace - the gate, not the router, requires one
+  approved target), `RetryPolicy`, `HarnessSelection`, dispatch wiring, `CLI`, `Application` and the
+  deployed `WORKFLOW.md`. Every change is additive; no existing module was modified.
+- Validation: new pilot bootstrap suite 20 tests / 0 failures; focused suites `cli`, `log_file`,
+  `workspace_and_config`, `harness_selection`, `dispatch_router` and the new suite total 137 tests with one
+  failure, the pre-existing host failure `config resolves $VAR references for env-backed secret and path
+  values` (`Path.expand("/tmp/...")` vs the configured `/tmp/...`), reproduced with the new files removed.
+  `mix compile --warnings-as-errors`, `mix specs.check` and `mix format --check-formatted` pass. Evidence:
+  `C:/AI/reviews/pilot-boot-f/`.
+- Known residual: an armed pilot still reaches Codex for a labelled issue that is not listed in
+  `opencode.allowed_issues`, because no configuration switch disables the Codex harness. The gate reduces
+  this to "not discoverable by default" (repository target plus queue label plus a traceable
+  allowlist); eliminating it needs a pilot-only dispatch guard, recorded as a separate backlog item.
+
 ## M1-WIRE-F2 OpenCode 1.18.28 Wire Fixture Provenance Remediation — 2026-10-11
 
 Base: datawarsaw/symphony reference commit `9ce11fd3a9db817d1930e372749fd13ce4b08951` (M1-D).
