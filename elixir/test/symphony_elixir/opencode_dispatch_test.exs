@@ -239,7 +239,7 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
       final = List.last(updates)
       assert final.terminal? == true
       assert final.usage_accounting == :cumulative
-      assert get_in(final, [:tokenUsage, :total, :totalTokens]) == 300
+      assert get_in(final, [:tokenUsage, :total, :totalTokens]) == 385
 
       # Termination evidence reached the recipient before the task could exit.
       {:termination, termination_issue_id, %{worker_termination: termination}} = termination_evidence(messages)

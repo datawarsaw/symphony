@@ -307,7 +307,7 @@ defmodule SymphonyElixir.OpenCodeTest do
 
       assert res.usage.input_tokens == 50
       assert res.usage.output_tokens == 150
-      assert res.usage.total_tokens == 200
+      assert res.usage.total_tokens == 235
       assert res.usage.reasoning_tokens == 20
       assert res.usage.cache_read_tokens == 10
       assert res.usage.cache_write_tokens == 5
@@ -394,6 +394,96 @@ defmodule SymphonyElixir.OpenCodeTest do
                {:error_event, err} -> err["name"] == "ModelNotFoundError"
                _ -> false
              end)
+    end
+  end
+
+  # ===========================================================================
+  # 4a. Token Usage Accounting (OpenCode 1.18.28 wire contract)
+  # ===========================================================================
+
+  describe "Token usage accounting (OpenCode wire contract)" do
+    # Wire semantics verified against OpenCode 1.18.28 source: part.tokens
+    # carries five non-overlapping categories — input is the non-cached input,
+    # output is the visible output (reasoning excluded), and cache read/write
+    # sit outside input. The v1.18.28 step-finish wire carries no total; when
+    # one is supplied it is inclusive of all five categories and is the
+    # source of truth, never summed on top of them.
+    test "missing total sums input, output, reasoning and cache categories" do
+      stream =
+        step_finish_tokens_line(%{
+          "input" => 50,
+          "output" => 150,
+          "reasoning" => 20,
+          "cache" => %{"read" => 10, "write" => 5}
+        })
+
+      usage = parse_step_usage(stream)
+
+      assert usage.total_tokens == 235
+    end
+
+    test "explicit total is honored and not added on top of the categories" do
+      stream =
+        step_finish_tokens_line(%{
+          "input" => 50,
+          "output" => 150,
+          "reasoning" => 20,
+          "cache" => %{"read" => 10, "write" => 5},
+          "total" => 240
+        })
+
+      usage = parse_step_usage(stream)
+
+      assert usage.total_tokens == 240
+      assert usage.input_tokens == 50
+      assert usage.output_tokens == 150
+      assert usage.reasoning_tokens == 20
+      assert usage.cache_read_tokens == 10
+      assert usage.cache_write_tokens == 5
+    end
+
+    test "cache read and write tokens count toward the total" do
+      stream =
+        step_finish_tokens_line(%{
+          "input" => 100,
+          "output" => 200,
+          "cache" => %{"read" => 4_000, "write" => 1_000}
+        })
+
+      usage = parse_step_usage(stream)
+
+      assert usage.cache_read_tokens == 4_000
+      assert usage.cache_write_tokens == 1_000
+      assert usage.total_tokens == 5_300
+    end
+
+    test "reasoning tokens count toward the total" do
+      stream =
+        step_finish_tokens_line(%{"input" => 100, "output" => 200, "reasoning" => 2_000})
+
+      usage = parse_step_usage(stream)
+
+      assert usage.reasoning_tokens == 2_000
+      assert usage.total_tokens == 2_300
+    end
+
+    test "multi-step cumulative total sums the per-step totals" do
+      stream =
+        step_finish_tokens_line(%{"input" => 40, "output" => 60, "reasoning" => 10, "cache" => %{"read" => 5, "write" => 5}},
+          reason: "tool-calls",
+          part_id: "step_f1",
+          message_id: "msg_1"
+        ) <>
+          step_finish_tokens_line(%{"input" => 60, "output" => 90, "reasoning" => 15, "cache" => %{"read" => 10, "write" => 5}},
+            part_id: "step_f2",
+            message_id: "msg_2"
+          )
+
+      usage = parse_step_usage(stream)
+
+      assert usage.input_tokens == 100
+      assert usage.output_tokens == 150
+      assert usage.total_tokens == 300
     end
   end
 
@@ -500,7 +590,7 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert result.message_ids == ["msg_01"]
       assert length(result.tool_events) == 1
       assert hd(result.tool_events).tool == "read"
-      assert result.usage.total_tokens == 300
+      assert result.usage.total_tokens == 385
       assert result.completion_state == :completed
       assert result.exit_code == 0
       assert result.failure_evidence == []
@@ -1236,7 +1326,7 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert result.message_ids == ["msg_01", "msg_02"]
       assert result.usage.input_tokens == 100
       assert result.usage.output_tokens == 150
-      assert result.usage.total_tokens == 250
+      assert result.usage.total_tokens == 300
       assert abs(result.usage.cost - 0.005) < 1.0e-9
     end
 
@@ -1525,6 +1615,30 @@ defmodule SymphonyElixir.OpenCodeTest do
         }
       }
     }) <> "\n"
+  end
+
+  defp step_finish_tokens_line(tokens, opts \\ []) do
+    Jason.encode!(%{
+      "type" => "step_finish",
+      "timestamp" => 2,
+      "sessionID" => Keyword.get(opts, :session_id, "ses_acc"),
+      "part" => %{
+        "type" => "step-finish",
+        "id" => Keyword.get(opts, :part_id, "step_f1"),
+        "messageID" => Keyword.get(opts, :message_id, "msg_1"),
+        "reason" => Keyword.get(opts, :reason, "stop"),
+        "cost" => Keyword.get(opts, :cost, 0.001),
+        "tokens" => tokens
+      }
+    }) <> "\n"
+  end
+
+  defp parse_step_usage(stream) do
+    Parser.new()
+    |> Parser.feed(stream)
+    |> Parser.finish(0)
+    |> Parser.to_result()
+    |> Map.get(:usage)
   end
 
   defp tool_use_completed_event(session_id, message_id, tool, call_id, output) do

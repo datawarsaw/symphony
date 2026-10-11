@@ -10,6 +10,14 @@ defmodule SymphonyElixir.OpenCode.Parser do
   - token usage (input, output, reasoning, cache read/write, total, cost)
   - failure evidence (protocol errors, tool failures, malformed lines, process exits)
 
+  Token accounting contract (OpenCode 1.18.28 wire): the five part.tokens
+  categories are non-overlapping — input is non-cached input, output is
+  visible output with reasoning excluded, cache read/write sit outside
+  input — so a missing total is the additive sum of all five. An explicit
+  wire total is inclusive of every category and is honored as-is; it is
+  never added on top of the categories. Cost is accumulated per step,
+  unchanged.
+
   Resilience invariants:
   - Fragmented streams across arbitrary byte boundaries are safely buffered.
   - Windows CRLF and standard LF line endings are supported.
@@ -404,17 +412,18 @@ defmodule SymphonyElixir.OpenCode.Parser do
   defp process_step_finish(state, event, session_accepted?) do
     part = Map.get(event, "part", %{})
 
-    tokens = Map.get(part, "tokens", %{})
+    tokens = Map.get(part, "tokens") || %{}
     cost = Map.get(part, "cost", 0.0) || 0.0
 
     in_tokens = Map.get(tokens, "input", 0) || 0
     out_tokens = Map.get(tokens, "output", 0) || 0
     reasoning_tokens = Map.get(tokens, "reasoning", 0) || 0
-    cache = Map.get(tokens, "cache", %{})
+    cache = Map.get(tokens, "cache", %{}) || %{}
     cache_read = Map.get(cache, "read", 0) || 0
     cache_write = Map.get(cache, "write", 0) || 0
 
     cur_usage = state.usage
+    step_total = step_total(tokens, in_tokens, out_tokens, reasoning_tokens, cache_read, cache_write)
 
     new_usage = %{
       input_tokens: cur_usage.input_tokens + in_tokens,
@@ -422,7 +431,7 @@ defmodule SymphonyElixir.OpenCode.Parser do
       reasoning_tokens: cur_usage.reasoning_tokens + reasoning_tokens,
       cache_read_tokens: cur_usage.cache_read_tokens + cache_read,
       cache_write_tokens: cur_usage.cache_write_tokens + cache_write,
-      total_tokens: cur_usage.total_tokens + in_tokens + out_tokens,
+      total_tokens: cur_usage.total_tokens + step_total,
       cost: cur_usage.cost + cost
     }
 
@@ -442,6 +451,19 @@ defmodule SymphonyElixir.OpenCode.Parser do
       end
     else
       state
+    end
+  end
+
+  # OpenCode 1.18.28 wire contract: part.tokens carries five non-overlapping
+  # categories — input is the non-cached input, output is the visible output
+  # with reasoning excluded, and cache read/write sit outside input. The wire
+  # step-finish normally carries no total; an explicit total is inclusive of
+  # all five categories and is the source of truth, never added on top of
+  # them (that would double count).
+  defp step_total(tokens, in_tokens, out_tokens, reasoning_tokens, cache_read, cache_write) do
+    case Map.get(tokens, "total") do
+      value when is_integer(value) and value >= 0 -> value
+      _ -> in_tokens + out_tokens + reasoning_tokens + cache_read + cache_write
     end
   end
 

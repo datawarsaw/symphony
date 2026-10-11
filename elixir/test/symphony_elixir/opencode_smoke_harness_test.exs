@@ -92,12 +92,13 @@ defmodule SymphonyElixir.OpenCodeSmokeHarnessTest do
 
       # Step 1: in=40, out=60, reas=10, cache_r=5, cache_w=5, cost=0.002
       # Step 2: in=60, out=90, reas=15, cache_r=10, cache_w=5, cost=0.003
+      # Per-step totals 120 + 180: the five wire categories are additive.
       assert usage.input_tokens == 100
       assert usage.output_tokens == 150
       assert usage.reasoning_tokens == 25
       assert usage.cache_read_tokens == 15
       assert usage.cache_write_tokens == 10
-      assert usage.total_tokens == 250
+      assert usage.total_tokens == 300
       assert usage.cost == 0.005
     end
 

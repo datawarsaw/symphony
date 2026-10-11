@@ -307,6 +307,15 @@ defmodule SymphonyElixir.TestSupport.OpenCodeWorkerFixture do
         cache_r = Map.get(cache, "read", 0)
         cache_w = Map.get(cache, "write", 0)
 
+        # Same contract as production accounting: the five wire categories are
+        # non-overlapping, an explicit total is inclusive of all of them, and a
+        # missing total is the additive sum.
+        step_total =
+          case Map.get(tokens, "total") do
+            value when is_integer(value) and value >= 0 -> value
+            _ -> in_tok + out_tok + reas_tok + cache_r + cache_w
+          end
+
         %{
           acc
           | input_tokens: acc.input_tokens + in_tok,
@@ -314,7 +323,7 @@ defmodule SymphonyElixir.TestSupport.OpenCodeWorkerFixture do
             reasoning_tokens: acc.reasoning_tokens + reas_tok,
             cache_read_tokens: acc.cache_read_tokens + cache_r,
             cache_write_tokens: acc.cache_write_tokens + cache_w,
-            total_tokens: acc.total_tokens + in_tok + out_tok,
+            total_tokens: acc.total_tokens + step_total,
             cost: Float.round(acc.cost + cost, 6)
         }
       else

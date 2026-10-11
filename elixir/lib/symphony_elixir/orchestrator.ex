@@ -4162,13 +4162,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp step_token_delta(running_entry, update) do
     usage = update[:usage] || Map.get(update, "usage") || %{}
-    input = non_negative_token(usage[:input_tokens] || Map.get(usage, "input_tokens"))
-    output = non_negative_token(usage[:output_tokens] || Map.get(usage, "output_tokens"))
+    input = step_usage_token(usage, :input_tokens)
+    output = step_usage_token(usage, :output_tokens)
+    reasoning = step_usage_token(usage, :reasoning_tokens)
+    cache_read = step_usage_token(usage, :cache_read_tokens)
+    cache_write = step_usage_token(usage, :cache_write_tokens)
 
+    # Fallback matches the OpenCode wire accounting contract: the five usage
+    # categories are non-overlapping, so a missing total is their additive
+    # sum (input + output alone would silently drop reasoning and cache).
     total =
       case usage[:total_tokens] || Map.get(usage, "total_tokens") do
         value when is_integer(value) and value >= 0 -> value
-        _ -> input + output
+        _ -> input + output + reasoning + cache_read + cache_write
       end
 
     prev_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
@@ -4187,6 +4193,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp non_negative_token(value) when is_integer(value) and value >= 0, do: value
   defp non_negative_token(_), do: 0
+
+  defp step_usage_token(usage, key) when is_atom(key) do
+    non_negative_token(usage[key] || Map.get(usage, Atom.to_string(key)))
+  end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),

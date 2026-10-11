@@ -613,7 +613,17 @@ defmodule SymphonyElixir.WorkerEvent do
       in_tokens = usage_number(event.usage, :input_tokens)
       out_tokens = usage_number(event.usage, :output_tokens)
       explicit_total = usage_number(event.usage, :total_tokens)
-      total_tokens = if explicit_total == 0 and (in_tokens != 0 or out_tokens != 0), do: in_tokens + out_tokens, else: explicit_total
+
+      total_tokens =
+        if explicit_total == 0 and (in_tokens != 0 or out_tokens != 0) do
+          # Same fallback contract as per-step normalization: a usage map
+          # without a total is summed additively across every category it
+          # reports, so cache and reasoning cannot silently vanish.
+          in_tokens + out_tokens + usage_number(event.usage, :reasoning_tokens) +
+            usage_number(event.usage, :cache_read_tokens) + usage_number(event.usage, :cache_write_tokens)
+        else
+          explicit_total
+        end
 
       Map.put(update, :tokenUsage, %{
         total: %{
@@ -870,13 +880,17 @@ defmodule SymphonyElixir.WorkerEvent do
     input = acc.input_tokens + usage_number(usage, :input_tokens)
     output = acc.output_tokens + usage_number(usage, :output_tokens)
 
+    # Each step's usage already carries the contract total (explicit wire
+    # total or the additive five-category sum), so the cumulative total is
+    # the sum of per-step totals. Recomputing it from input + output would
+    # silently drop reasoning and cache tokens again.
     %{
       input_tokens: input,
       output_tokens: output,
       reasoning_tokens: acc.reasoning_tokens + usage_number(usage, :reasoning_tokens),
       cache_read_tokens: acc.cache_read_tokens + usage_number(usage, :cache_read_tokens),
       cache_write_tokens: acc.cache_write_tokens + usage_number(usage, :cache_write_tokens),
-      total_tokens: input + output,
+      total_tokens: acc.total_tokens + usage_number(usage, :total_tokens),
       cost: to_float(acc.cost) + to_float(usage_number(usage, :cost))
     }
   end
@@ -1010,6 +1024,7 @@ defmodule SymphonyElixir.WorkerEvent do
     cache = Map.get(tokens, "cache") || Map.get(tokens, :cache) || %{}
     cache_read = usage_number(cache, :read, "read")
     cache_write = usage_number(cache, :write, "write")
+    explicit_total = usage_number(tokens, :total, "total")
 
     %{
       input_tokens: in_tokens,
@@ -1017,12 +1032,26 @@ defmodule SymphonyElixir.WorkerEvent do
       reasoning_tokens: reasoning_tokens,
       cache_read_tokens: cache_read,
       cache_write_tokens: cache_write,
-      total_tokens: in_tokens + out_tokens,
+      total_tokens: opencode_total(explicit_total, in_tokens, out_tokens, reasoning_tokens, cache_read, cache_write),
       cost: to_float(cost)
     }
   end
 
   defp normalize_opencode_tokens(_tokens, _cost), do: nil
+
+  # OpenCode 1.18.28 wire contract: the five part.tokens categories are
+  # non-overlapping (input is non-cached input, output excludes reasoning,
+  # cache read/write sit outside input). An explicit wire total is inclusive
+  # of every category and is the source of truth when present; adding it on
+  # top of the categories would double count. A missing total is the additive
+  # sum of all five.
+  defp opencode_total(explicit_total, in_tokens, out_tokens, reasoning_tokens, cache_read, cache_write) do
+    if explicit_total > 0 do
+      explicit_total
+    else
+      in_tokens + out_tokens + reasoning_tokens + cache_read + cache_write
+    end
+  end
 
   defp normalize_usage(%{} = usage) do
     in_tokens =

@@ -118,7 +118,7 @@ defmodule SymphonyElixir.WorkerEventTest do
       assert event.usage == %{
                input_tokens: 150,
                output_tokens: 350,
-               total_tokens: 500,
+               total_tokens: 580,
                reasoning_tokens: 50,
                cache_read_tokens: 20,
                cache_write_tokens: 10,
@@ -607,6 +607,78 @@ defmodule SymphonyElixir.WorkerEventTest do
     end
   end
 
+  describe "OpenCode token usage accounting contract" do
+    # The wire carries five non-overlapping categories; the per-step total is
+    # the explicit wire total when supplied (inclusive of all categories) and
+    # the additive sum otherwise. Cumulative accounting sums per-step totals,
+    # and a repeated step identity never counts twice.
+    test "per-step usage totals the additive wire categories when no total is supplied" do
+      event = step_tokens_event("m-t1", %{"input" => 100, "output" => 200, "reasoning" => 25, "cache" => %{"read" => 50, "write" => 10}})
+
+      assert event.usage == %{
+               input_tokens: 100,
+               output_tokens: 200,
+               reasoning_tokens: 25,
+               cache_read_tokens: 50,
+               cache_write_tokens: 10,
+               total_tokens: 385,
+               cost: 0.005
+             }
+    end
+
+    test "an explicit wire total is the per-step total and is never summed on top" do
+      event =
+        step_tokens_event("m-t2", %{
+          "input" => 100,
+          "output" => 200,
+          "reasoning" => 25,
+          "cache" => %{"read" => 50, "write" => 10},
+          "total" => 390
+        })
+
+      assert event.usage.total_tokens == 390
+      assert event.usage.reasoning_tokens == 25
+      assert event.usage.cache_read_tokens == 50
+    end
+
+    test "cumulative accounting includes cache and reasoning in the totals" do
+      first = step_tokens_event("m-c1", %{"input" => 40, "output" => 60, "reasoning" => 10, "cache" => %{"read" => 5, "write" => 5}})
+      second = step_tokens_event("m-c2", %{"input" => 60, "output" => 90, "reasoning" => 15, "cache" => %{"read" => 10, "write" => 5}})
+
+      assert {:ok, state, event_a} = WorkerEvent.accumulate(nil, first)
+      assert event_a.usage.total_tokens == 120
+
+      assert {:ok, _state, event_b} = WorkerEvent.accumulate(state, second)
+      assert event_b.usage.total_tokens == 300
+      assert event_b.usage.reasoning_tokens == 25
+      assert event_b.usage.cache_read_tokens == 15
+      assert event_b.usage.cache_write_tokens == 10
+    end
+
+    test "a repeated step identity does not double count the corrected totals" do
+      line =
+        step_tokens_line("m-dup", %{"input" => 40, "output" => 60, "reasoning" => 10, "cache" => %{"read" => 5, "write" => 5}})
+
+      assert {:ok, state, event} = WorkerEvent.accumulate(nil, line)
+      assert event.usage.total_tokens == 120
+
+      assert {:duplicate, ^state} = WorkerEvent.accumulate(state, line)
+    end
+
+    test "to_update reports the contract total in tokenUsage" do
+      line =
+        step_tokens_line("m-tu", %{"input" => 100, "output" => 200, "reasoning" => 25, "cache" => %{"read" => 50, "write" => 10}})
+
+      {:ok, _state, event} = WorkerEvent.accumulate(nil, line)
+      update = WorkerEvent.to_update(event)
+
+      assert get_in(update, [:tokenUsage, :total, :totalTokens]) == 385
+      assert get_in(update, [:tokenUsage, :total, :inputTokens]) == 100
+      assert get_in(update, [:tokenUsage, :total, :outputTokens]) == 200
+      assert update.usage.total_tokens == 385
+    end
+  end
+
   defp step_finish(reason) do
     part = %{"messageID" => "msg-reason", "tokens" => %{"input" => 1, "output" => 1}}
     part = if is_binary(reason), do: Map.put(part, "reason", reason), else: part
@@ -672,5 +744,24 @@ defmodule SymphonyElixir.WorkerEventTest do
         "tokens" => %{"input" => input, "output" => output}
       }
     })
+  end
+
+  defp step_tokens_line(message_id, tokens, session_id \\ "ses-acc") do
+    Jason.encode!(%{
+      "type" => "step_finish",
+      "timestamp" => 1_728_490_010,
+      "sessionID" => session_id,
+      "part" => %{
+        "id" => "part-" <> message_id,
+        "messageID" => message_id,
+        "reason" => "stop",
+        "cost" => 0.005,
+        "tokens" => tokens
+      }
+    })
+  end
+
+  defp step_tokens_event(message_id, tokens) do
+    step_tokens_line(message_id, tokens) |> WorkerEvent.from_opencode()
   end
 end
