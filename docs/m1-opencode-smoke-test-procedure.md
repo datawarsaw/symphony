@@ -112,6 +112,43 @@ Do not execute this live test until the offline integration gates in section 8 p
 2. A valid provider credential **present in the environment that launches Symphony**, for the exact provider named in `opencode.provider` and drawn from the adapter's credential allowlist (`SymphonyElixir.OpenCode.Environment.provider_auth_keys/2`)-for example `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, `GOOGLE_API_KEY`/`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`. Every OpenCode launch runs with an isolated per-launch home (`<workspace>/.symphony-state/opencode/<launch_id>/` with `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `XDG_*` and `TEMP/TMP` pinned), so an interactive login stored in the shared `~/.local/share/opencode/auth.json` is **not** visible to the launch and `OPENCODE_AUTH_CONTENT` is refused. An absent provider key parks the issue immediately as `auth_unavailable` with no retry.
 3. Symphony configured with `codex.worker_containment_enabled: true` on a Windows host.
 4. A dedicated, isolated `workspace.root` (and therefore a dedicated `.symphony-state`) that no already-running runtime owns.
+5. The runtime is started through the pilot bootstrap gate
+   (`mix symphony.pilot_bootstrap --manifest <pilot-manifest.yml>`), not with a bare `mix run`;
+   see the bootstrap gate subsection below.
+
+### Bootstrap gate (required before any live start)
+
+`mix run` reads `WORKFLOW.md` from the current directory, which in this repository is the tracked
+`elixir/WORKFLOW.md`. The pilot therefore starts through an explicit manifest and only after the
+`:armed` gate passes:
+
+```bash
+cd elixir
+mix symphony.pilot_bootstrap --manifest <pilot-manifest.yml>
+```
+
+`--preflight-only` runs the same checks and exits without starting anything. The gate refuses, before any
+tracker poll, worker dispatch or provider call, when:
+
+- the source checkout HEAD does not match `expected_source_sha`, or the tracked tree is modified
+  (a copied-over `elixir/WORKFLOW.md` now fails this check);
+- the workflow file is missing, is `elixir/WORKFLOW.md`, or has the same content as it;
+- the workspace root or the log root is not inside the pilot directory, or overlaps a protected checkout;
+- `worker.ssh_hosts` is non-empty, `codex.worker_containment_enabled` is not `true`, `discovery.enabled` is
+  not `false`, or `agent.max_concurrent_agents` / `agent.max_turns` is not `1`;
+- `routing.targets` is not exactly one target, or a target's `source_path` is not the single approved
+  repository source path;
+- in `:armed` mode, `opencode.enabled` is not `true`, `opencode.provider`, `opencode.model`,
+  `allowed_tools` or `allowed_issues` is missing or a placeholder, the approved target is absent from
+  `routing.targets`, or an issue in `allowed_issues` would not select the OpenCode harness.
+
+An empty `routing.targets` map is not by itself fail-closed: `RepositoryRouter.resolve/2` returns
+`{:ok, nil}` for it, and a nil route resolves to the default workspace. That is why the gate, not the
+router, requires exactly one approved target before a pilot can be armed.
+
+The gate also sets the workflow path and the disk log file explicitly. The runtime log is
+`<logs_root>/log/symphony.log` inside the pilot directory and cannot fall back to the default runtime
+location. The gate contacts no tracker and no provider.
 
 ### Execution Steps
 
