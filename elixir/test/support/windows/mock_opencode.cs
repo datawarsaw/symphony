@@ -204,6 +204,26 @@ class MockOpenCode
             return exitCode;
         }
 
+        if (mode == "reason-unknown")
+        {
+            WriteStepStart(sessionId, "msg_01");
+            WriteText(sessionId, "msg_01", "assistant text with an inconclusive finish reason");
+            WriteStepFinish(sessionId, "unknown", "msg_01", tokensIn, tokensOut, tokensReasoning, cacheRead, cacheWrite, cost);
+            Console.Out.Flush();
+            return exitCode;
+        }
+
+        if (mode == "reason-unknown-then-stop")
+        {
+            WriteStepStart(sessionId, "msg_01");
+            WriteStepFinish(sessionId, "unknown", "msg_01", tokensIn, tokensOut, tokensReasoning, cacheRead, cacheWrite, cost);
+            WriteStepStart(sessionId, "msg_02");
+            WriteText(sessionId, "msg_02", "model continues after the inconclusive step and finishes cleanly");
+            WriteStepFinish(sessionId, "stop", "msg_02", tokensIn, tokensOut, tokensReasoning, cacheRead, cacheWrite, cost);
+            Console.Out.Flush();
+            return exitCode;
+        }
+
         if (mode == "stalled" || mode == "hang")
         {
             WriteStepStart(sessionId, "msg_01");
@@ -268,6 +288,12 @@ class MockOpenCode
     static void WriteStepStart(string sessionId, string messageId)
     {
         Console.WriteLine("{\"type\":\"step_start\",\"timestamp\":1700000000000,\"sessionID\":\"" + sessionId + "\",\"part\":{\"type\":\"step-start\",\"id\":\"step_s1\",\"sessionID\":\"" + sessionId + "\",\"messageID\":\"" + messageId + "\"}}");
+        Console.Out.Flush();
+    }
+
+    static void WriteText(string sessionId, string messageId, string text)
+    {
+        Console.WriteLine("{\"type\":\"text\",\"timestamp\":1700000000050,\"sessionID\":\"" + sessionId + "\",\"part\":{\"type\":\"text\",\"id\":\"text_" + messageId + "\",\"sessionID\":\"" + sessionId + "\",\"messageID\":\"" + messageId + "\",\"text\":\"" + EscapeJson(text) + "\"}}");
         Console.Out.Flush();
     }
 

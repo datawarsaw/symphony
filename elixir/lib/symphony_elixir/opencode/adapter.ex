@@ -14,7 +14,8 @@ defmodule SymphonyElixir.OpenCode.Adapter do
   - Recoverable launch identity: a durable LaunchMarker is recorded before the OpenCode child process exists;
     it is cleared only on conclusive never-spawned or TERMINATED_CONFIRMED evidence, and unconfirmed
     termination keeps the marker so workspace reuse and cleanup fail closed.
-  - Positive completion: exit status 0 is not success without a completion event, clean JSONL, and confirmed termination.
+  - Positive completion: exit status 0 is not success without an explicit eligible
+    finish reason ("stop"), a completion event, clean JSONL, and confirmed termination.
   - Clean lifecycle: stdin EOF is delivered to OpenCode without closing the containment stop pipe, and stop is idempotent.
   """
 
@@ -297,7 +298,10 @@ defmodule SymphonyElixir.OpenCode.Adapter do
       parser.tool_failures != [] ->
         List.first(parser.tool_failures)
 
-      parser.finish_reason in ["length", "content-filter"] ->
+      # M1-TERM-F: terminal-but-ineligible finish reasons (unknown, other,
+      # length, content-filter) must surface as an explicit terminal-reason
+      # failure rather than falling through to a misleading {:process_exit, 0}.
+      terminal_ineligible_finish_reason?(parser.finish_reason) ->
         {:terminal_reason, parser.finish_reason}
 
       status != 0 ->
@@ -306,6 +310,12 @@ defmodule SymphonyElixir.OpenCode.Adapter do
       true ->
         List.first(parser.failure_evidence) || {:process_exit, status}
     end
+  end
+
+  defp terminal_ineligible_finish_reason?(reason) do
+    is_binary(reason) and
+      Parser.terminal_finish_reason?(reason) and
+      not Parser.eligible_finish_reason?(reason)
   end
 
   defp normalize_chunk({:eol, line}), do: line <> "\n"

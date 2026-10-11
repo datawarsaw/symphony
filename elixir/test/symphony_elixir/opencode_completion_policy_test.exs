@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
   @moduledoc """
-  M1-SEM-F: Comprehensive policy tests separating terminal protocol observation,
-  tool failures, and authoritative worker success.
+  M1-SEM-F / M1-TERM-F: Comprehensive policy tests separating terminal protocol
+  observation, tool failures, and authoritative worker success.
 
   Contract under test:
   1. Protocol completion (completion_state: :completed) reflects wire protocol completion
@@ -11,10 +11,13 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
   3. Fatal failure_evidence is preserved for malformed data, top-level errors, and
      incomplete streams.
   4. Terminal reasons include stop, unknown, and other; tool-calls is intermediate.
+     (M1-TERM-F) Only "stop" is eligible for clean worker success; "unknown" and
+     "other" remain observational terminal completions that never authorize success.
   5. finish_reason is recorded explicitly across all steps.
-  6. length and content-filter are terminal observations but NOT clean success.
-  7. Adapter success strictly requires: exit 0, eligible protocol completion,
-     no fatal evidence, no tool failures, and TERMINATED_CONFIRMED.
+  6. length, content-filter, unknown, and other are terminal observations but NOT
+     clean success.
+  7. Adapter success strictly requires: exit 0, eligible protocol completion
+     (explicit "stop"), no fatal evidence, no tool failures, and TERMINATED_CONFIRMED.
   8. On timeout, a failed result with nonempty evidence is returned even if a terminal
      event was observed before the hang.
   9. Session integrity and Human Acceptance boundaries are strictly preserved.
@@ -58,7 +61,7 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
       assert Parser.eligible_finish_reason?("stop") == true
     end
 
-    test "terminal reason 'unknown' completes protocol and is eligible for clean success" do
+    test "terminal reason 'unknown' completes protocol observation but is NOT eligible for clean success (M1-TERM-F)" do
       stream =
         step_start_line("ses_1", "msg_1") <>
           step_finish_line("ses_1", "msg_1", "unknown", 10, 20)
@@ -69,10 +72,10 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
       assert result.failure_evidence == []
       assert result.tool_failures == []
       assert Parser.terminal_finish_reason?("unknown") == true
-      assert Parser.eligible_finish_reason?("unknown") == true
+      assert Parser.eligible_finish_reason?("unknown") == false
     end
 
-    test "terminal reason 'other' completes protocol and is eligible for clean success (Audit A1)" do
+    test "terminal reason 'other' completes protocol observation but is NOT eligible for clean success (M1-TERM-F / Audit A1)" do
       stream =
         step_start_line("ses_1", "msg_1") <>
           step_finish_line("ses_1", "msg_1", "other", 10, 20)
@@ -83,7 +86,7 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
       assert result.failure_evidence == []
       assert result.tool_failures == []
       assert Parser.terminal_finish_reason?("other") == true
-      assert Parser.eligible_finish_reason?("other") == true
+      assert Parser.eligible_finish_reason?("other") == false
     end
 
     test "terminal reason 'length' completes protocol observation but is NOT clean success" do
@@ -310,16 +313,21 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
     end
 
     @tag :windows_only
-    test "clean execution with finish reason 'other' succeeds with {:ok, result}", %{
+    test "execution with finish reason 'other' is blocked by adapter with :transient_worker_failure (M1-TERM-F)", %{
       workspace: workspace
     } do
-      assert {:ok, result} = run_mock(workspace, "--mock-mode=reason-other")
+      outcome = run_mock(workspace, "--mock-mode=reason-other")
 
+      assert {:error, {{:terminal_reason, "other"}, result}} = outcome
+
+      # Protocol observation is preserved even though success is denied.
       assert result.exit_code == 0
       assert result.completion_state == :completed
       assert result.finish_reason == "other"
       assert result.failure_evidence == []
       assert result.tool_failures == []
+      assert result.failure_info.failure_class == :transient_worker_failure
+      assert result.failure_info.code == "OTHER"
     end
 
     @tag :windows_only

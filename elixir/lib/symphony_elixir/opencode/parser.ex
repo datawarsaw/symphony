@@ -33,9 +33,14 @@ defmodule SymphonyElixir.OpenCode.Parser do
   - A `step_finish` event whose `part.reason` is `"tool-calls"` is intermediate:
     the model continues with tool calls and the turn is not complete.
   - A `step_finish` with a terminal reason (`"stop"`, `"length"`,
-    `"content-filter"`, `"unknown"`, `"other"`) is valid terminal completion evidence.
-  - Missing, unknown, or `"error"` finish reasons are not terminal; the stream
-    fails closed as incomplete at finish.
+    `"content-filter"`, `"unknown"`, `"other"`) is valid observational terminal
+    completion evidence: the protocol turn concluded.
+  - Only `"stop"` is an eligible clean-success reason. `"unknown"` and `"other"`
+    conclude the protocol turn but never authorize worker success: OpenCode
+    1.18.28 treats `"unknown"` as non-concluding and maps unsupported finish
+    reasons to `"unknown"`.
+  - Missing, unrecognized, or `"error"` finish reasons are not terminal; the
+    stream fails closed as incomplete at finish.
   - Each step finish needs a nonblank session ID consistent with the first
     identified event. Conflicting session aliases or later foreign events fail
     closed, including events arriving after terminal completion. IDs changed by
@@ -73,7 +78,11 @@ defmodule SymphonyElixir.OpenCode.Parser do
 
   @intermediate_step_reason "tool-calls"
   @terminal_step_reasons ~w(stop length content-filter unknown other)
-  @eligible_finish_reasons ~w(stop unknown other)
+  # M1-TERM-F: only an explicit OpenCode "stop" conclusion authorizes clean
+  # worker success. "unknown" and "other" stay observationally terminal but
+  # non-eligible: OpenCode v1.18.28 maps unsupported finish reasons to
+  # "unknown" and treats it as non-concluding.
+  @eligible_finish_reasons ~w(stop)
 
   @doc """
   Initializes a new parser accumulator state.
@@ -83,13 +92,20 @@ defmodule SymphonyElixir.OpenCode.Parser do
 
   @doc """
   Returns whether a finish reason represents an observational terminal completion.
+  Terminal reasons conclude the protocol turn but do not by themselves
+  authorize clean worker success; see `eligible_finish_reason?/1`.
   """
   @spec terminal_finish_reason?(String.t() | nil) :: boolean()
   def terminal_finish_reason?(reason) when is_binary(reason), do: reason in @terminal_step_reasons
   def terminal_finish_reason?(_), do: false
 
   @doc """
-  Returns whether a finish reason represents an eligible clean protocol completion.
+  Returns whether a finish reason authorizes clean worker success.
+
+  Only `"stop"` is eligible. `"unknown"`, `"other"`, `"length"`, and
+  `"content-filter"` remain observational terminal reasons
+  (`terminal_finish_reason?/1`) but never make an execution eligible for
+  clean success.
   """
   @spec eligible_finish_reason?(String.t() | nil) :: boolean()
   def eligible_finish_reason?(reason) when is_binary(reason), do: reason in @eligible_finish_reasons
