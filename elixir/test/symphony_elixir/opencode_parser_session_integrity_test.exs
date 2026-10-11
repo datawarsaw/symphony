@@ -48,7 +48,7 @@ defmodule SymphonyElixir.OpenCodeParserSessionIntegrityTest do
              {:incomplete_stream, {:conflicting_session_id, "ses_a", "ses_b"}}
            ]
 
-    assert result.usage.total_tokens == 60
+    assert result.usage.total_tokens == 90
     assert result.usage.cost == 0.25
   end
 
@@ -88,7 +88,7 @@ defmodule SymphonyElixir.OpenCodeParserSessionIntegrityTest do
   test "timestamp fallback agrees with WorkerEvent when message and part ids are missing" do
     first = step("m1", "p1", "tool-calls") |> update_in(["part"], &Map.drop(&1, ["messageID", "id"]))
     later = Map.put(first, "timestamp", 1_728_490_099)
-    assert parse([first, first, later]).usage.total_tokens == 60
+    assert parse([first, first, later]).usage.total_tokens == 90
     assert {:ok, acc, _} = WorkerEvent.accumulate(nil, first)
     assert {:duplicate, acc} = WorkerEvent.accumulate(acc, first)
     assert {:ok, acc, _} = WorkerEvent.accumulate(acc, later)
@@ -109,16 +109,22 @@ defmodule SymphonyElixir.OpenCodeParserSessionIntegrityTest do
     assert result.completion_state == :completed
   end
 
-  test "session gating preserves existing malformed step shape exceptions" do
-    for {event, exception} <- [
-          {%{"type" => "step_finish", "part" => nil}, BadMapError},
-          {%{"type" => "step_finish", "part" => %{"tokens" => 1}}, BadMapError},
-          {%{"type" => "step_finish", "part" => %{"cost" => "1"}}, ArithmeticError}
+  test "session gating keeps malformed step shapes as fail-closed evidence without crashing" do
+    # M1-P-F1 replaced the historical raises with fail-closed evidence; session
+    # gating must not resurrect a crash path for the same shapes.
+    for {event, reason} <- [
+          {%{"type" => "step_finish", "part" => nil}, "invalid_event_shape: part"},
+          {%{"type" => "step_finish", "part" => %{"tokens" => 1}}, "invalid_event_shape: part.tokens"},
+          {%{"type" => "step_finish", "part" => %{"cost" => "1"}}, "invalid_event_shape: part.cost"}
         ] do
-      assert_raise exception, fn -> parse([event]) end
+      result = parse([event])
+      assert result.completion_state == :failed
+      assert [{:malformed_json_line, _, %{reason: ^reason}}] = result.failure_evidence
     end
 
-    assert_raise CaseClauseError, fn -> Parser.feed(Parser.new(), "null\n") end
+    result = parse([nil])
+    assert result.completion_state == :failed
+    assert [{:malformed_json_line, _, %{reason: "invalid_event_shape: record"}}] = result.failure_evidence
   end
 
   test "lossy sanitization cannot collapse distinct session identities into one lock" do
@@ -147,7 +153,7 @@ defmodule SymphonyElixir.OpenCodeParserSessionIntegrityTest do
              {:incomplete_stream, {:conflicting_session_id, "ses_a", "ses_b"}}
            ]
 
-    assert result.usage.total_tokens == 60
+    assert result.usage.total_tokens == 90
   end
 
   test "a terminal event without session identity cannot authorize success" do
@@ -189,7 +195,7 @@ defmodule SymphonyElixir.OpenCodeParserSessionIntegrityTest do
     assert first.usage == %{
              input_tokens: 10,
              output_tokens: 20,
-             total_tokens: 30,
+             total_tokens: 45,
              reasoning_tokens: 4,
              cache_read_tokens: 5,
              cache_write_tokens: 6,
@@ -211,7 +217,7 @@ defmodule SymphonyElixir.OpenCodeParserSessionIntegrityTest do
     assert result.usage == %{
              input_tokens: 20,
              output_tokens: 40,
-             total_tokens: 60,
+             total_tokens: 90,
              reasoning_tokens: 8,
              cache_read_tokens: 10,
              cache_write_tokens: 12,

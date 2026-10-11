@@ -100,7 +100,7 @@ defmodule SymphonyElixir.OpenCodeParserSafetyTest do
     assert result.completion_state == :completed
     assert result.failure_evidence == []
     assert result.event_count == 2
-    assert result.usage.total_tokens == 7
+    assert result.usage.total_tokens == 9
     assert result.usage.cache_write_tokens == 2
     assert result.usage.reasoning_tokens == 0
     assert result.usage.cost == 0.5
