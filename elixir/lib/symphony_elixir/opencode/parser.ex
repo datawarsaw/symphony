@@ -26,15 +26,24 @@ defmodule SymphonyElixir.OpenCode.Parser do
     `"content-filter"`, `"unknown"`) is valid terminal completion evidence.
   - Missing, unknown, or `"error"` finish reasons are not terminal; the stream
     fails closed as incomplete at finish.
+  - Each step finish needs a nonblank session ID consistent with the first
+    identified event. Conflicting session aliases or later foreign events fail
+    closed, including events arriving after terminal completion. IDs changed by
+    redaction or bounding cannot establish session authority.
+  - Repeated WorkerEvent step identities contribute usage only once. Decoded
+    records remain in events for Adapter delivery and observational deduplication
+    by WorkerEvent; parser accounting does not suppress raw records.
   """
 
   alias SymphonyElixir.OpenCode.Redactor
+  alias SymphonyElixir.WorkerEvent
 
   defmodule State do
     @moduledoc false
     defstruct buffer: "",
               session_id: nil,
               message_ids: MapSet.new(),
+              seen_step_finishes: MapSet.new(),
               tool_events: [],
               completion_state: :running,
               usage: %{
@@ -280,20 +289,25 @@ defmodule SymphonyElixir.OpenCode.Parser do
     %{reason: reason |> inspect() |> Redactor.redact()}
   end
 
-  defp process_event(state, event) do
-    event = Redactor.redact(event)
+  defp process_event(state, raw_event) do
+    event = Redactor.redact(raw_event)
 
-    state =
-      state
-      |> maybe_extract_session_id(event)
-      |> record_event(event)
+    {state, session_accepted?} = state |> record_event(event) |> maybe_extract_session_id(raw_event)
 
-    event_type = Map.get(event, "type")
+    case {Map.get(event, "type"), session_accepted?} do
+      {"step_finish", _} ->
+        process_step_finish(state, event, session_accepted?)
 
-    case event_type do
-      "step_finish" ->
-        process_step_finish(state, event)
+      {_, false} ->
+        state
 
+      {_, true} ->
+        process_session_event(state, event)
+    end
+  end
+
+  defp process_session_event(state, event) do
+    case Map.get(event, "type") do
       "tool_use" ->
         process_tool_use(state, event)
 
@@ -318,26 +332,77 @@ defmodule SymphonyElixir.OpenCode.Parser do
   end
 
   defp maybe_extract_session_id(state, event) do
-    session_id =
-      Map.get(event, "sessionID") ||
-        get_in(event, ["part", "sessionID"]) ||
-        get_in(event, ["properties", "sessionID"]) ||
-        get_in(event, ["properties", "info", "id"])
+    session_id = extract_session_id(event)
+    conflict = find_session_conflict(event, session_id)
 
-    if is_binary(session_id) and session_id != "" and is_nil(state.session_id) do
-      %{state | session_id: session_id}
-    else
-      state
+    cond do
+      is_nil(session_id) and Map.get(event, "type") != "step_finish" ->
+        {state, true}
+
+      blank_session_id?(session_id) ->
+        reject_session(state, :missing_session_id)
+
+      Redactor.redact(session_id) != session_id ->
+        reject_session(state, :unusable_session_id)
+
+      not is_nil(conflict) ->
+        reject_session(state, {:conflicting_session_id, session_id, conflict})
+
+      is_nil(state.session_id) ->
+        {%{state | session_id: session_id}, true}
+
+      state.session_id == session_id ->
+        {state, true}
+
+      true ->
+        reject_session(state, {:conflicting_session_id, state.session_id, session_id})
     end
+  end
+
+  defp blank_session_id?(session_id) do
+    not is_binary(session_id) or String.trim(session_id) == ""
+  end
+
+  defp extract_session_id(event) do
+    Map.get(event, "sessionID") ||
+      get_in(event, ["part", "sessionID"]) ||
+      get_in(event, ["properties", "sessionID"]) ||
+      get_in(event, ["properties", "info", "id"])
+  end
+
+  defp find_session_conflict(event, session_id) do
+    Enum.find(session_aliases(event), fn id ->
+      not is_nil(id) and id != session_id
+    end)
+  end
+
+  defp session_aliases(event) do
+    part = Map.get(event, "part")
+    properties = Map.get(event, "properties")
+    info = if is_map(properties), do: Map.get(properties, "info")
+
+    [
+      Map.get(event, "sessionID"),
+      if(is_map(part), do: Map.get(part, "sessionID")),
+      if(is_map(properties), do: Map.get(properties, "sessionID")),
+      if(is_map(info), do: Map.get(info, "id"))
+    ]
+  end
+
+  defp reject_session(state, reason) do
+    {%{
+       state
+       | completion_state: :failed,
+         failure_evidence: [{:incomplete_stream, Redactor.redact(reason)} | state.failure_evidence]
+     }, false}
   end
 
   defp record_event(state, event) do
     %{state | events: [event | state.events]}
   end
 
-  defp process_step_finish(state, event) do
+  defp process_step_finish(state, event, session_accepted?) do
     part = Map.get(event, "part", %{})
-    state = maybe_extract_message_id(state, part)
 
     tokens = Map.get(part, "tokens", %{})
     cost = Map.get(part, "cost", 0.0) || 0.0
@@ -361,9 +426,23 @@ defmodule SymphonyElixir.OpenCode.Parser do
       cost: cur_usage.cost + cost
     }
 
-    state
-    |> Map.put(:usage, new_usage)
-    |> apply_step_finish_reason(part)
+    # Keep the existing shape/number handling above. Session rejection and
+    # deduplication only gate accounting and completion, not shape validation.
+    if session_accepted? do
+      step_id = WorkerEvent.from_opencode(event).metadata.event_id
+
+      if MapSet.member?(state.seen_step_finishes, step_id) do
+        state
+      else
+        state
+        |> maybe_extract_message_id(part)
+        |> Map.put(:seen_step_finishes, MapSet.put(state.seen_step_finishes, step_id))
+        |> Map.put(:usage, new_usage)
+        |> apply_step_finish_reason(part)
+      end
+    else
+      state
+    end
   end
 
   # "tool-calls" is intermediate: the model continues the turn with tool calls,
