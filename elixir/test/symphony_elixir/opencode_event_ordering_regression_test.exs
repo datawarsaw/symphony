@@ -263,7 +263,8 @@ defmodule SymphonyElixir.OpenCodeEventOrderingRegressionTest do
       assert result.usage.reasoning_tokens == 25
       assert result.usage.cache_read_tokens == 15
       assert result.usage.cache_write_tokens == 10
-      assert result.usage.total_tokens == 250
+      # M1-U-F additive wire contract: 100 input + 150 output + 25 reasoning + 15 cache read + 10 cache write
+      assert result.usage.total_tokens == 300
       assert Float.round(result.usage.cost, 6) == 0.005
       assert Enum.map(result.tool_events, & &1.call_id) == ["call_01"]
       assert result.message_ids == ["msg_01", "msg_02"]
@@ -555,13 +556,21 @@ defmodule SymphonyElixir.OpenCodeEventOrderingRegressionTest do
 
       {_issue_id, run_result, updates} = run_with_worker_event_callback(parts, ctx)
 
-      assert {:ok, result} = run_result
-      assert result.session_id == @session_canonical
+      # M1-P-F2 session integrity (accepted contract) supersedes the ordering
+      # candidate's original permissive expectation: chronological consumption
+      # locks the canonical session first, and the later rogue-session event
+      # fails the stream closed with explicit conflict evidence naming both
+      # identities — it is never silently dropped, and the canonical session
+      # authority is preserved in the evidence.
+      assert {:error,
+              {
+                {:incomplete_stream, {:conflicting_session_id, @session_canonical, @session_rogue}},
+                %{stderr: "", usage: usage}
+              }} = run_result
 
-      # Chronological consumption locks the canonical session first and drops
-      # only the conflicting event. Reversed chunk delivery inverts the lock:
-      # the rogue session arrives first, and every canonical event — including
-      # the terminal stop — is rejected, losing the whole observed stream.
+      assert usage.input_tokens == 10
+      assert usage.output_tokens == 20
+
       assert Enum.map(updates, &{&1.event, &1.session_id}) == [
                {:step_start, @session_canonical},
                {:step_finish, @session_canonical}
