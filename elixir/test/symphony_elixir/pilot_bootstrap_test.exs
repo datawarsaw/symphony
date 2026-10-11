@@ -1,7 +1,10 @@
 defmodule SymphonyElixir.PilotBootstrapTest do
-  use ExUnit.Case, async: true
+  # Not async: a passing `start/2` arms the pilot dispatch guard and applies
+  # the workflow/log application env, which is shared node state.
+  use ExUnit.Case
 
   alias SymphonyElixir.PilotBootstrap
+  alias SymphonyElixir.PilotGuard
   alias SymphonyElixir.RepositoryRouter
   alias SymphonyElixir.Tracker.Issue
 
@@ -287,6 +290,37 @@ defmodule SymphonyElixir.PilotBootstrapTest do
     assert failure?(failures, :opencode_arming)
     refute_received :runtime_started
     assert Application.get_env(:symphony_elixir, :workflow_file_path) == before
+    refute PilotGuard.armed?()
+  end
+
+  test "start arms the dispatch guard before the runtime starts", %{root: root} do
+    write_tracked_default(root)
+    write_pilot_workflow(root, armed_workflow_opts(root))
+    manifest = write_manifest(root, armed_manifest_opts(root))
+
+    previous = %{
+      workflow_file_path: Application.get_env(:symphony_elixir, :workflow_file_path),
+      log_file: Application.get_env(:symphony_elixir, :log_file),
+      pilot_guard: Application.get_env(:symphony_elixir, :pilot_guard)
+    }
+
+    on_exit(fn ->
+      Enum.each(previous, &restore_app_env/1)
+    end)
+
+    test_pid = self()
+
+    ensure = fn ->
+      send(test_pid, {:guard_at_runtime_start, PilotGuard.armed?()})
+      {:ok, []}
+    end
+
+    assert {:ok, _report} = PilotBootstrap.start(manifest, [ensure_all_started: ensure] ++ gate(root))
+
+    # The guard is armed before the runtime start callback runs, so no poll
+    # or dispatch can outrun it, and it stays armed after the start.
+    assert_received {:guard_at_runtime_start, true}
+    assert PilotGuard.armed?()
   end
 
   # -- helpers --------------------------------------------------------------
@@ -399,6 +433,17 @@ defmodule SymphonyElixir.PilotBootstrapTest do
   defp armed_manifest_opts(root) do
     [approved_repo_target: @target, approved_source_path: approved_source(root)]
   end
+
+  # Route the workflow path through Workflow so a live WorkflowStore reloads
+  # the restored baseline instead of caching the pilot workflow.
+  defp restore_app_env({:workflow_file_path, nil}),
+    do: Application.delete_env(:symphony_elixir, :workflow_file_path)
+
+  defp restore_app_env({:workflow_file_path, path}) when is_binary(path),
+    do: SymphonyElixir.Workflow.set_workflow_file_path(path)
+
+  defp restore_app_env({key, nil}), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_app_env({key, value}), do: Application.put_env(:symphony_elixir, key, value)
 
   defp slash(path), do: String.replace(path, <<92>>, "/")
 end

@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
 
   alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Steering, Tracker, Workspace}
-  alias SymphonyElixir.{DispatchRouter, FailureClass, LaunchMarker, RetryPolicy, RetryStore, RuntimeLease, WorkerContainment, WorkerFence}
+  alias SymphonyElixir.{DispatchRouter, FailureClass, LaunchMarker, PilotGuard, RetryPolicy, RetryStore, RuntimeLease, WorkerContainment, WorkerFence}
   alias SymphonyElixir.Wake.Ledger
   alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Tracker.Issue
@@ -1436,6 +1436,10 @@ defmodule SymphonyElixir.Orchestrator do
     # the pinned harness. AgentRunner still receives the decision immutably
     # and never re-resolves it.
     #
+    # PILOT-GUARD-F1: while the OpenCode-only pilot is armed, no Codex
+    # outcome survives resolve_attempt_harness — it parks below, so the only
+    # spawn this path performs for an armed pilot is OpenCode.
+    #
     # M1-H-F preserved inside the pinned branch: an OpenCode dispatch that
     # selected a remote worker host is refused at the boundary whether or not
     # a pin exists — the harness pin never re-authorizes a remote OpenCode
@@ -1534,8 +1538,15 @@ defmodule SymphonyElixir.Orchestrator do
   # Cross-attempt harness authority. The pin, once validated, outlives config
   # reloads, continuation, failure retries, and restart recovery. OpenCode
   # that can no longer be authorized parks before any other harness is
-  # launched. Codex stays Codex.
+  # launched. Codex stays Codex — unless the pilot guard is armed, in which
+  # case even a pinned Codex lifecycle parks (PILOT-GUARD-F1 below).
   defp resolve_attempt_harness(%State{} = state, %Issue{} = issue) do
+    state
+    |> attempt_harness_decision(issue)
+    |> refuse_codex_while_pilot_armed()
+  end
+
+  defp attempt_harness_decision(%State{} = state, %Issue{} = issue) do
     case Map.get(state.harness_pins, issue.id) do
       %{harness: :opencode} = pin ->
         case authorize_pinned_opencode(issue) do
@@ -1556,6 +1567,26 @@ defmodule SymphonyElixir.Orchestrator do
         end
     end
   end
+
+  # PILOT-GUARD-F1: while the OpenCode-only pilot is armed, Codex is not an
+  # available harness. Every Codex outcome — the unpinned default, an
+  # allowlist miss, a disabled/invalid/unreadable OpenCode configuration, and
+  # a durable Codex pin recovered from before the pilot was armed — is
+  # rewritten to a park before any launch or pin commit. The only dispatch an
+  # armed pilot performs is an OpenCode dispatch HarnessSelection authorized
+  # for that issue. The armed flag lives in the application environment (set
+  # only by the bootstrap gate before the runtime starts), so a WORKFLOW.md
+  # reload can change the allowlist but never disarm the guard; re-admission
+  # is operator action on the pilot, not a retry.
+  defp refuse_codex_while_pilot_armed({:dispatch, :codex, reason, _pin} = decision) do
+    if PilotGuard.armed?() do
+      {:park, :pilot_guard_codex_refusal, "pilot_guard:armed codex refused harness_reason=#{inspect(reason)}"}
+    else
+      decision
+    end
+  end
+
+  defp refuse_codex_while_pilot_armed(other_decision), do: other_decision
 
   defp authorize_pinned_opencode(%Issue{} = issue) do
     case Config.settings() do
