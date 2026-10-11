@@ -1,21 +1,19 @@
 # Symphony project state
 
-## M1-WIRE-F Authentic OpenCode 1.18.28 Protocol Fixtures Candidate — 2026-10-11
+## M1-WIRE-F2 OpenCode 1.18.28 Wire Fixture Provenance Remediation — 2026-10-11
 
 Base: datawarsaw/symphony reference commit `9ce11fd3a9db817d1930e372749fd13ce4b08951` (M1-D).
-Branch: `codex/m1-wire-f-authentic-fixtures`. Isolated worktree: `C:/AI/symphony-workspaces/m1-wire-f-authentic-fixtures`.
-This is a test-fixture, protocol-contract, and documentation candidate only. Production modules remain untouched.
+Remediated candidate: `6459a2da4f1687bb346cb49737c317a20066c5d8` (branch `codex/m1-wire-f-authentic-fixtures`).
+Remediation branch: `codex/m1-wire-f2-provenance-remediation`, isolated checkout `C:/AI/worktrees/m1-wire-f2-remediation`.
+Scope: fixtures, manifest, fixture tests, provenance document and this record. Production modules are unchanged.
 
-- Verified upstream revision: `anomalyco/opencode` @ tag `v1.18.28`, commit `22006d97652839999596a34a48ff6be7dbb40c6e`.
-- Created 9 nonsecret JSONL fixtures in `elixir/test/fixtures/opencode_wire/` with machine-readable `manifest.json`:
-  * 3 `upstream-derived` fixtures: `single_turn_success.jsonl`, `multi_step_tool_success.jsonl`, `reasoning_thinking_turn.jsonl`.
-  * 5 `schema-derived` fixtures: `tool_error_recovery.jsonl` (policy-sensitive), `terminal_reason_other.jsonl`, `api_error_retryable_rate_limit.jsonl`, `api_error_non_retryable_forbidden.jsonl`, `provider_auth_error.jsonl`.
-  * 1 `synthetic` negative control: `synthetic_malformed_control.jsonl`.
-- Fixture coverage includes authentic key names (`ses_*`, `msg_*`, `prt_*`, `call_*`), `tokens.total`, cached tokens (`cache.read`), reasoning tokens, terminal reason `"other"`, HTTP `statusCode`, and `isRetryable`.
-- Protocol contract test suite added in `elixir/test/symphony_elixir/opencode_wire_protocol_test.exs` (12 passing tests, 0 failures), proving deterministic parsing, manifest integrity, and framing/chunking invariance (1-byte, 3-byte, and line boundaries).
-- Expected-red contract gap suite added in `elixir/test/symphony_elixir/opencode_wire_contract_gap_test.exs` (5 gated tests, `@moduletag :expected_red`), asserting desired-but-unimplemented wire behavior for audit M1-W findings (A1 terminal reason whitelist, A2 token accounting, A3 tool error latching, and A5 error classification).
-- Canonical provenance document authored in `docs/m1-opencode-wire-fixtures-provenance.md`, detailing upstream source files, CLI `--format json` streaming semantics, and evidence requiring future authorized live provider captures.
-- Constraints maintained: zero live model/provider calls, zero inspection of private session databases or auth stores, zero production module changes, no PR/merge/push.
+- Upstream tag `v1.18.28` resolves to `22006d97652839999596a34a48ff6be7dbb40c6e` (confirmed with git ls-remote). Source anchors are in `docs/m1-opencode-wire-fixtures-provenance.md`.
+- No fixture is a captured CLI output. All values are synthetic. Labels are `cli-emission-shape` (3 fixtures), `schema-derived` (4), and `synthetic` (4, including two explicit-total fixtures). `live_capture_status` is `none`.
+- `tokens.total` was removed from the upstream-shaped and schema-derived fixtures. Explicit-total coverage, including zero, moved to synthetic fixtures.
+- The five expected-red gates keep their assertions. They are tagged as 3 `product_policy` (gap A1, A2, A3) and 2 `implementation_candidate` (gap A5 status and name). None is a demonstrated upstream defect.
+- Two upstream observations are open and outside the gates: a mid-turn `unknown` step-finish is treated as terminal by the Parser, and provider failures in JSON mode appear as step-finish events rather than error records.
+- Validation: protocol suite 14 passing; gap suite 5 expected red with unchanged received values. This is not a genuine wire-trace certification. Authorized live captures remain required.
+- Constraints maintained: no provider calls, no private session stores or auth files read, no production module changes, no merge, push, PR or deployment.
 
 ## MIC-167 implementation candidate
 

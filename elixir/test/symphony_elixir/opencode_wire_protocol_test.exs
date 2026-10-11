@@ -27,16 +27,18 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
       assert manifest["version"] == "1.18.28"
       assert manifest["upstream_repository"] == "anomalyco/opencode"
       assert manifest["upstream_commit_sha"] == "22006d97652839999596a34a48ff6be7dbb40c6e"
+      assert manifest["live_capture_status"] == "none"
 
       fixtures = manifest["fixtures"]
       assert is_list(fixtures)
-      assert length(fixtures) == 9
+      assert length(fixtures) == 11
 
-      valid_labels = ~w(upstream-derived schema-derived synthetic)
+      valid_labels = ~w(cli-emission-shape schema-derived synthetic)
 
       for fix <- fixtures do
         assert fix["label"] in valid_labels, "Invalid label #{fix["label"]} for #{fix["name"]}"
         assert is_binary(fix["description"])
+        assert fix["captured_from_live_cli"] == false
         assert is_list(fix["source_references"]) and length(fix["source_references"]) > 0
         assert is_list(fix["wire_events"]) and length(fix["wire_events"]) > 0
 
@@ -57,7 +59,7 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
     end
   end
 
-  describe "upstream-derived fixtures" do
+  describe "cli-emission-shape fixtures" do
     test "single_turn_success.jsonl parses cleanly and exposes total_tokens accounting gap" do
       content = read_fixture!("single_turn_success.jsonl")
 
@@ -81,22 +83,16 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
       assert result.usage.cache_write_tokens == 0
       assert result.usage.cost == 0.00312
 
-      # Accounting divergence check (Audit M1-W Finding A2):
-      # Current Symphony implementation computes total_tokens = input + output
+      # Parser accounting: total_tokens is input plus output and ignores any explicit tokens.total.
       assert result.usage.total_tokens == 963
 
-      # Upstream 1.18.28 wire contract has explicit tokens.total = input + output + reasoning + cache.read + cache.write
+      # This fixture carries no tokens.total (removed in remediation; see the provenance document).
       raw_last_event =
         fixture_lines("single_turn_success.jsonl")
         |> List.last()
         |> Jason.decode!()
 
-      upstream_total = get_in(raw_last_event, ["part", "tokens", "total"])
-      assert upstream_total == 8643
-
-      # Disparity: current implementation underreports total when prompt cache is used
-      assert result.usage.total_tokens < upstream_total
-      assert upstream_total - result.usage.total_tokens == 7680
+      assert get_in(raw_last_event, ["part", "tokens", "total"]) == nil
     end
 
     test "multi_step_tool_success.jsonl handles intermediate tool-calls step and terminal completion" do
@@ -153,10 +149,8 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
       assert result.usage.reasoning_tokens == 600
       assert result.usage.cost == 0.005
 
-      # Current total_tokens ignores reasoning tokens (1500 + 150 = 1650 vs wire total 2250)
+      # Parser fallback sums input and output only (1500 + 150 = 1650); reasoning tokens are reported separately.
       assert result.usage.total_tokens == 1650
-      wire_total = 2250
-      assert result.usage.total_tokens + result.usage.reasoning_tokens == wire_total
     end
   end
 
@@ -170,7 +164,7 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
         |> Parser.finish(0)
         |> Parser.to_result()
 
-      # Current Symphony behavior (Audit M1-W Finding A3):
+      # Current Symphony behavior (Gap A3):
       # process_tool_use latches completion_state: :failed on status == "error",
       # and apply_step_finish_reason only completes when state is :running.
       # Therefore, even with exit code 0 and final step_finish reason "stop", the turn fails closed.
@@ -187,11 +181,8 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
                _ -> false
              end)
 
-      # Upstream 1.18.28 protocol reality:
-      # The CLI handles tool errors inside the session loop and exits 0 when the model
-      # concludes its recovery step cleanly with "stop".
-      # This test confirms that Symphony fail-closed policy remains active until
-      # an intentional product recovery decision is made.
+      # Whether upstream exits 0 after a recovered tool error was not traced in this remediation.
+      # This assertion characterizes Symphony's current fail-closed policy only.
     end
 
     test "terminal_reason_other.jsonl documents rejection of 'other' finishReason" do
@@ -203,7 +194,7 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
         |> Parser.finish(0)
         |> Parser.to_result()
 
-      # Current Symphony behavior (Audit M1-W Finding A1):
+      # Current Symphony behavior (Gap A1):
       # @terminal_step_reasons is ~w(stop length content-filter unknown).
       # "other" is not in this list, so apply_step_finish_reason does not transition
       # to :completed, and finish/2 records {:incomplete_stream, :missing_completion_event}.
@@ -214,8 +205,8 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
                _ -> false
              end)
 
-      # Upstream 1.18.28 protocol reality:
-      # AI SDK finishReason mapper in opencode binary returns "other" as default fallback.
+      # Synthetic input: "other" is not in the v1.18.28 FinishReason union (packages/llm/src/schema/ids.ts line 39).
+      # The AI SDK bridge maps unrecognized finish reasons to "unknown" (packages/opencode/src/session/llm/ai-sdk.ts lines 22-23).
     end
   end
 
@@ -256,7 +247,7 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
       assert data["statusCode"] == 403
       assert data["isRetryable"] == false
 
-      # Current Failure classification (Audit M1-W Finding A5):
+      # Current Failure classification (Gap A5):
       # In Failure.classify_error_map, status is read from "status" instead of "statusCode".
       # For a 403 where message doesn't contain explicit permission strings,
       # classification fails to match HTTP 403 (:persistent_worker_failure)
@@ -347,6 +338,41 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
     end
   end
 
+  describe "synthetic schema-optional tokens.total contract" do
+    test "explicit tokens.total leaves input-plus-output accounting unchanged" do
+      content = read_fixture!("synthetic_explicit_total.jsonl")
+
+      result =
+        Parser.new()
+        |> Parser.feed(content)
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :completed
+      assert result.failure_evidence == []
+      assert result.usage.input_tokens == 954
+      assert result.usage.output_tokens == 9
+      assert result.usage.cache_read_tokens == 7680
+      assert result.usage.total_tokens == 963
+    end
+
+    test "explicit zero tokens.total parses as a zero-usage terminal turn" do
+      content = read_fixture!("synthetic_explicit_total_zero.jsonl")
+
+      result =
+        Parser.new()
+        |> Parser.feed(content)
+        |> Parser.finish(0)
+        |> Parser.to_result()
+
+      assert result.completion_state == :completed
+      assert result.failure_evidence == []
+      assert result.usage.total_tokens == 0
+      assert result.usage.input_tokens == 0
+      assert result.usage.output_tokens == 0
+    end
+  end
+
   describe "synthetic negative control" do
     test "synthetic_malformed_control.jsonl captures corrupt line into failure_evidence" do
       content = read_fixture!("synthetic_malformed_control.jsonl")
@@ -381,4 +407,3 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
     do_chunk_binary(rest, size, [chunk | acc])
   end
 end
-

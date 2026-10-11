@@ -1,20 +1,25 @@
 defmodule SymphonyElixir.OpenCodeWireContractGapTest do
   @moduledoc """
-  Expected-red protocol contract test suite for OpenCode 1.18.28 wire alignment.
+  Expected-red contract gates for OpenCode 1.18.28 wire handling.
 
-  ISOLATION NOTE:
-  These checks assert the DESIRED upstream OpenCode 1.18.28 behavior for the
-  gaps identified in protocol audit M1-W (findings A1, A2, A3, A5).
-  Because production modules (Parser, Failure, Adapter) remain untouched
-  in this fixture candidate task, these tests currently fail red against the
-  baseline implementation.
+  Each gate asserts a behavior that the current Parser or Failure module does
+  not yet provide. Gates are not skipped or made green, and this suite changes
+  no production module.
 
-  Per the test contract:
-  - Tests in this module are tagged with `@moduletag :expected_red`.
-  - They are NOT skipped or made artificially green.
-  - They fail with exact assertions describing what implementation change is required.
-  - When production modules are updated in subsequent implementation tasks,
-    these gates will turn green.
+  Gates carry one of two taxonomy tags:
+
+  - :product_policy. The desired behavior is a Symphony policy decision. A red
+    result does not establish a defect, because upstream evidence does not
+    settle the policy question on its own.
+  - :implementation_candidate. The gate becomes a code defect only if the
+    referenced upstream shape is emitted at runtime. The upstream sources and
+    tests read for this suite do not establish that emission.
+
+  No gate is a demonstrated upstream defect. To run one taxonomy, use
+  mix test --only product_policy or mix test --only implementation_candidate.
+
+  Gap labels A1, A2, A3 and A5 are local to the remediation. Their source
+  anchors are listed in docs/m1-opencode-wire-fixtures-provenance.md.
   """
 
   use ExUnit.Case, async: true
@@ -38,8 +43,9 @@ defmodule SymphonyElixir.OpenCodeWireContractGapTest do
     |> String.split(["\r\n", "\n"], trim: true)
   end
 
-  test "GATE 1 (Audit A2): single_turn_success.jsonl accounts for full tokens.total on wire" do
-    content = read_fixture!("single_turn_success.jsonl")
+  @tag :product_policy
+  test "GATE 1 (Gap A2): explicit tokens.total is reflected in total_tokens" do
+    content = read_fixture!("synthetic_explicit_total.jsonl")
 
     result =
       Parser.new()
@@ -47,12 +53,16 @@ defmodule SymphonyElixir.OpenCodeWireContractGapTest do
       |> Parser.finish(0)
       |> Parser.to_result()
 
-    # Wire event has tokens.total = 8643 (input 954 + output 9 + cache.read 7680)
-    # Current implementation reports 963 (input 954 + output 9 only).
+    # Synthetic explicit total 8643 (input 954 + output 9 + cache read 7680).
+    # The current Parser sums input and output only, giving 963. Whether
+    # total_tokens should follow an explicit provider total is a product decision:
+    # packages/llm/src/protocols/shared.ts treats a provider total as authoritative,
+    # while the input-plus-output fallback is documented as intentional.
     assert result.usage.total_tokens == 8643
   end
 
-  test "GATE 2 (Audit A3): tool_error_recovery.jsonl allows recovery when turn concludes with stop" do
+  @tag :product_policy
+  test "GATE 2 (Gap A3): tool_error_recovery.jsonl allows recovery when the turn concludes with stop" do
     content = read_fixture!("tool_error_recovery.jsonl")
 
     result =
@@ -61,12 +71,14 @@ defmodule SymphonyElixir.OpenCodeWireContractGapTest do
       |> Parser.finish(0)
       |> Parser.to_result()
 
-    # Upstream CLI completes naturally with exit 0 when model recovers from tool error.
-    # Current implementation latches completion_state: :failed on tool error.
+    # The current Parser latches completion_state :failed on any tool error
+    # (Parser.process_tool_use/2). Whether a recovered tool error may complete
+    # the turn is a fail-closed policy choice.
     assert result.completion_state == :completed
   end
 
-  test "GATE 3 (Audit A1): terminal_reason_other.jsonl completes successfully on finishReason 'other'" do
+  @tag :product_policy
+  test "GATE 3 (Gap A1): terminal_reason_other.jsonl completes successfully on finish reason other" do
     content = read_fixture!("terminal_reason_other.jsonl")
 
     result =
@@ -75,22 +87,25 @@ defmodule SymphonyElixir.OpenCodeWireContractGapTest do
       |> Parser.finish(0)
       |> Parser.to_result()
 
-    # Upstream AI SDK maps unknown provider completion states to "other".
-    # Current implementation only recognizes stop, length, content-filter, unknown.
+    # The value "other" is synthetic: the v1.18.28 FinishReason union does not include it
+    # (packages/llm/src/schema/ids.ts line 39). The current Parser terminal list is
+    # stop, length, content-filter and unknown.
     assert result.completion_state == :completed
   end
 
-  test "GATE 4 (Audit A5): api_error_non_retryable_forbidden.jsonl maps statusCode 403 to :persistent_worker_failure" do
+  @tag :implementation_candidate
+  test "GATE 4 (Gap A5, status): api_error_non_retryable_forbidden.jsonl maps statusCode 403 to :persistent_worker_failure" do
     [line] = fixture_lines("api_error_non_retryable_forbidden.jsonl")
     event = Jason.decode!(line)
 
-    # Upstream APIError carries statusCode 403 and isRetryable: false.
-    # Current implementation checks map["status"] instead of data["statusCode"],
-    # falling back to :transient_worker_failure instead of :persistent_worker_failure.
+    # The APIError schema (packages/schema/src/v1/session.ts lines 48-55) declares
+    # statusCode optional. Failure.classify_error_map/1 reads only status, so
+    # statusCode is ignored. This is a defect only if the CLI emits statusCode.
     assert Failure.classify(event["error"]) == :persistent_worker_failure
   end
 
-  test "GATE 5 (Audit A5): ProviderAuthError error name classifies directly as :auth_unavailable" do
+  @tag :implementation_candidate
+  test "GATE 5 (Gap A5, name): ProviderAuthError classifies directly as :auth_unavailable" do
     error_map = %{
       "name" => "ProviderAuthError",
       "data" => %{
@@ -99,9 +114,9 @@ defmodule SymphonyElixir.OpenCodeWireContractGapTest do
       }
     }
 
-    # Upstream AuthError is named "ProviderAuthError".
-    # Current implementation only checks "AuthError" and "UnauthorizedError" in name list.
+    # The AuthError schema (packages/schema/src/v1/session.ts lines 38-41) names the
+    # error ProviderAuthError. Failure.classify_error_map/1 checks only AuthError and
+    # UnauthorizedError by name. This is a defect only if the CLI emits this name.
     assert Failure.classify(error_map) == :auth_unavailable
   end
 end
-

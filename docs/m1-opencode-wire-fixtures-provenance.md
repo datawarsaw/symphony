@@ -1,172 +1,120 @@
-# OpenCode 1.18.28 Wire Protocol Fixtures Provenance and Compatibility
+# OpenCode 1.18.28 Wire Fixtures: Provenance and Contract Baseline
 
-**Document Version:** 1.0.0  
-**Date:** 2026-10-11  
-**Task:** M1-WIRE-F (Milestone M1)  
-**Status:** FIXTURE_CANDIDATE_READY  
-
----
-
-## 1. Executive Summary
-
-This document establishes the provenance, schema grounding, and compatibility baseline for the authentic OpenCode 1.18.28 JSONL test fixtures added in task `M1-WIRE-F`.
-
-In accordance with the task constraints:
-- All fixtures were constructed without executing live model requests or invoking external provider APIs.
-- Private session databases (`~/.local/share/opencode/opencode.db`) and auth stores (`auth.json`) were strictly avoided.
-- All fixture structures, event names, nested part fields, and identifier formats are grounded in verified public upstream source code, public test harnesses, and Effect schema definitions of OpenCode CLI version 1.18.28.
-- Every fixture is explicitly categorized under a transparent provenance label: `upstream-derived`, `schema-derived`, or `synthetic`.
-- Deterministic offline tests in Symphony distinguish current baseline behavior from desired-but-unimplemented wire behavior across token accounting, tool error recovery, terminal reasons, and error classification.
+**Document version:** 1.1.0
+**Date:** 2026-10-11
+**Task:** M1-WIRE-F2 (remediation of the M1-WIRE-F candidate 6459a2da4f1687bb346cb49737c317a20066c5d8)
+**Status:** FIXTURE_CONTRACT_BASELINE_REMEDIATED. Not wire-trace certified.
 
 ---
 
-## 2. Upstream Grounding & Reference Verification
+## 1. Scope and claims
 
-### 2.1 Repository and Revision Metadata
+The fixtures in elixir/test/fixtures/opencode_wire/ are hand-written. Their event order and field names follow upstream OpenCode source and tests at tag v1.18.28. Every value in them is synthetic. No fixture is a captured OpenCode CLI output, and the manifest records captured_from_live_cli false for each one.
 
-| Attribute | Verified Value | Evidence Source |
+The fixtures let the Symphony parser and failure classifier be tested against those shapes. They do not show what a real provider run emits. This document makes no genuine wire-trace certification claim. Authorized live provider captures are still required for that. None were recorded or used here.
+
+This remediation did not call any model or provider, did not read private OpenCode session databases or auth stores, and did not change any production module.
+
+## 2. Upstream verification
+
+| Item | Value | How it was verified |
 |---|---|---|
-| **Upstream Repository** | `anomalyco/opencode` (GitHub repo ID: 975734319) | GitHub API & repository redirects (formerly `sst/opencode`) |
-| **Release Tag** | `v1.18.28` | Public release tag |
-| **Tag Object Commit SHA** | `22006d97652839999596a34a48ff6be7dbb40c6e` | `api.github.com/repos/anomalyco/opencode/git/ref/tags/v1.18.28` |
-| **CLI Command Runner Blob SHA** | `cccc2550179f87bb74763004910028f79ade60c9` | `packages/opencode/src/cli/cmd/run.ts` @ `v1.18.28` |
-| **Local CLI Binary** | `opencode-ai 1.18.28` (`opencode.exe` on host) | `%APPDATA%/npm/node_modules/opencode-ai`, verified via `opencode --version` |
+| Upstream repository | anomalyco/opencode | git ls-remote against the public GitHub repository |
+| Release tag | v1.18.28 | git ls-remote refs/tags/v1.18.28 returns commit 22006d97652839999596a34a48ff6be7dbb40c6e (lightweight tag) |
+| packages/opencode/src/cli/cmd/run.ts | blob cccc2550179f87bb74763004910028f79ade60c9 | Downloaded at the commit and hashed with git hash-object; matches the earlier record |
+| packages/schema/src/v1/session.ts | blob 75e9282f117cb25078b087661434fcf5e6660620 | Same method |
+| packages/opencode/src/cli/ui.ts | blob 6ad6495cf10bfe604bff172359d682b3fe9d4dee | Same method |
+| packages/opencode/test/cli/run/run-process.test.ts | blob d2d4bae879216be6fb79840bea83d2a4054e6bec | Same method |
+| packages/opencode/test/provider/error.test.ts | blob 49db2806623dc92c99376111c191f456c28b4a63 | Same method |
 
-### 2.2 Primary Upstream Source Files
+Tree-wide searches used a shallow clone of the tag. The other packages cited below (packages/llm and the ID generator) were read at the same tag through that clone.
 
-1. **`packages/opencode/src/cli/cmd/run.ts`** (`cccc2550`):
-   Defines non-interactive execution (`opencode run --format json`), the `emit(type, data)` formatting function, line-delimited JSON output on `stdout`, event loop termination conditions (`session.status.type === "idle"`), and permission rejection handling.
-2. **`packages/schema/src/v1/session.ts`**:
-   Canonical Effect schema defining all session events, parts (`StepStartPart`, `TextPart`, `ToolPart`, `ReasoningPart`, `StepFinishPart`), state variants (`ToolStateCompleted`, `ToolStateError`), and error structs (`APIError`, `AuthError`, `UnknownError`, `MessageAbortedError`).
-3. **`packages/opencode/test/cli/run/run-process.test.ts`**:
-   Official Bun subprocess integration tests asserting `--format json` line emission, event ordering (`step_start`, `reasoning`, `text`, `tool_use`, `step_finish`), and error record isolation.
-4. **`packages/opencode/test/provider/error.test.ts`**:
-   Upstream unit tests verifying stream error parsing, `isRetryable` flags, and `APIError` mapping.
-5. **`packages/opencode/src/cli/ui.ts`**:
-   Proves that human messages, permission warnings, and UI output write exclusively to `stderr`, guaranteeing `stdout` wire purity in JSON mode.
+## 3. Source anchors for the wire contract
 
----
+Paths are relative to the upstream repository at v1.18.28.
 
-## 3. OpenCode 1.18.28 CLI Wire Contract Specification
+- Envelope and framing. packages/opencode/src/cli/cmd/run.ts lines 678-688: emit() writes a JSON object with type, timestamp, sessionID and the event data, followed by os.EOL. On Windows, Node reports os.EOL as CRLF. That value is read from source. It was not observed in captured output.
+- Event mapping. step_start at run.ts 745-746, step_finish at 749-750, text at 754. tool_use at line 725 for tool parts whose state status is completed or error. reasoning at 766-767, only when the part has time.end set and the thinking flag is on. Error records at 788-789 and at the prompt-rejection paths at 855 and 872.
+- Part and error schemas. packages/schema/src/v1/session.ts: named errors use the shape name plus data (lines 29-35). AuthError is named ProviderAuthError with providerID and message (lines 38-41). APIError has message, statusCode (optional), isRetryable (boolean), responseHeaders, responseBody and metadata (lines 48-55). step-finish has reason as an open string (Schema.String, line 243), cost, and tokens with total optional (line 247), input, output, reasoning, and cache read and write. ToolStateError has status error, input, error text, optional metadata, and time.
+- Finish reason. packages/llm/src/schema/ids.ts line 39 defines FinishReason as stop, length, tool-calls, content-filter, error and unknown. packages/opencode/src/session/llm/ai-sdk.ts lines 22-23 return the reported value only when it is in that union, and return unknown otherwise.
+- Token total. packages/llm/src/protocols/shared.ts lines 39-60: a provider-supplied total is the source of truth when present. The fallback is input plus output. The file describes that fallback as under-counting cache and reasoning by design. The file does not state a formula that adds cache and reasoning to the total.
+- Identifiers. packages/opencode/src/id/id.ts line 16 sets LENGTH to 26. Line 69 builds a value from the prefix, an underscore, 12 hex characters of time, and base62 characters that fill the rest. Session IDs use the ses prefix, message IDs use msg, and part IDs use prt. In session.ts, lines 17-25 define the msg and prt prefixes. At this tag, the search found no call prefix for tool call IDs. The callID value is supplied by the model SDK.
+- Upstream tests. run-process.test.ts line 124 expects step_start, text, step_finish. Lines 155-156 expect a rejected prompt to produce one error record and a nonzero exit code. The test "--format json preserves reasoning, tool, and continuation ordering" expects the sequence at lines 186-194. The test "--format json records an unknown stream finish and continuation" (lines 232-246) expects a step-finish with reason unknown in the middle of a turn, then recovered text and a final stop, with exit code 0. error.test.ts lines 5-22 show that parseStreamError returns type api_error with isRetryable and responseBody, and no statusCode.
 
-When invoked with `--format json` (e.g. `opencode run --format json -m provider/model --dir <w> --pure -- <prompt>`), OpenCode CLI 1.18.28 adheres to the following protocol rules:
+## 4. Corrections to the earlier version
 
-### 3.1 Framing and Encoding
-- **Transport:** `stdout` stream.
-- **Framing:** One single-line valid JSON object per event, terminated by the operating system newline (`os.EOL`: `\r\n` on Windows, `\n` on POSIX).
-- **Envelope:** Every line serializes:
-  ```json
-  {
-    "type": "<event_type>",
-    "timestamp": 1728570000000,
-    "sessionID": "ses_01J...",
-    ...data
-  }
-  ```
-- **Purity:** Non-JSON diagnostic messages, auto-reject warnings, and human notifications are directed to `stderr`. If third-party output corrupts `stdout`, the receiver must fail closed.
+Each item below replaces a claim in the earlier version of this document (version 1.0.0).
 
-### 3.2 Event Types and Part Definitions
+- The earlier document described identifiers as ULID or KSUID based. The source shows a prefix, an underscore, 12 hex characters, then base62. The fixture identifiers keep the correct prefixes. Their bodies are hand-written and do not follow the generator. They are synthetic.
+- The earlier document said tool call IDs use a call prefix. No such prefix exists at v1.18.28 in the searched source. The callID values in the fixtures are synthetic.
+- The earlier document gave an upstream formula for the total: input plus output plus reasoning plus cache read plus cache write. It cited the fixture's own total of 8643 as evidence, which is circular, because that total was hand-written. The source says a provider-supplied total is authoritative, and it does not state the formula above. The value 8643 now appears only in the synthetic explicit-total fixture.
+- The earlier document said the AI SDK mapper falls back to other. At this tag, the bridge maps unrecognized values to unknown, and other is not in the FinishReason union. The terminal-reason fixture is therefore synthetic.
+- The earlier document cited an M1-W protocol audit document and a file named m1-w-opencode-jsonl-protocol-audit.md. Neither is in the repository. Those references are removed. The labels A1, A2, A3 and A5 remain only as gap labels in the tests and in this document. Section 6 gives each one its source anchors.
+- The earlier document cited 24 statusCode 403 records found in a local SQLite store. That observation came from a private session store, which this task forbids. It is removed and not used.
+- The earlier document said the local OpenCode binary was verified with opencode --version under the APPDATA npm directory. That check was not repeated here, and the claim is removed.
+- The earlier document labelled several fixtures as authentic upstream. The labels in section 5 replace that.
+- The earlier document said the newline is the OS EOL, which is CRLF on Windows. The source confirms that emit() appends os.EOL. The CRLF value follows from Node's os.EOL on Windows and was not observed in output.
 
-| Wire Event | Part/Payload Type | Upstream Schema & Conditions |
-|---|---|---|
-| `step_start` | `part: StepStartPart` | Emitted at step initiation. Contains `id` (`prt_*`), `sessionID`, `messageID` (`msg_*`), `type: "step-start"`. |
-| `text` | `part: TextPart` | Emitted when `part.type == "text"` and `part.time.end` is set. Contains `text` and `time: {start, end}`. |
-| `reasoning` | `part: ReasoningPart` | Emitted only when `--thinking` flag is active and `part.time.end` is set. Contains `text` and `time: {start, end}`. |
-| `tool_use` | `part: ToolPart` | Emitted when `part.type == "tool"` and `state.status` is `"completed"` or `"error"`. Contains `callID`, `tool`, and `state`. |
-| `step_finish` | `part: StepFinishPart` | Emitted at step conclusion. Contains `reason`, `cost`, and `tokens: {total?, input, output, reasoning, cache: {read, write}}`. |
-| `error` | `error: ErrorStruct` | Emitted upon `session.error` or prompt/command rejection. Contains `name` and `data`. |
+## 5. Provenance labels
 
-### 3.3 Identifier Format Standards
-Upstream 1.18.28 identifiers are ULID/KSUID-based strings prefixed with semantic domain tags:
-- Session: `ses_01J...`
-- Message: `msg_01J...`
-- Part: `prt_01J...`
-- Tool Call: `call_01J...`
+Three labels apply to each fixture as a whole. The manifest records the field-level sources.
 
----
+- cli-emission-shape. The envelope and event order follow emit() and the upstream CLI tests at v1.18.28. All values are synthetic.
+- schema-derived. Field names and types follow the upstream Effect schemas at v1.18.28. The fixture combines them into event sequences that the upstream tests do not show, and the emitted presence of optional fields is not established.
+- synthetic. A value or combination that the searched v1.18.28 source paths do not produce, or intentionally invalid input. Used as a contract input or a negative control.
 
-## 4. Fixture Inventory and Provenance Classification
-
-All fixtures reside in `elixir/test/fixtures/opencode_wire/` and are indexed in `manifest.json`.
-
-### 4.1 Provenance Taxonomy
-
-1. **`upstream-derived`**: Event sequence, ordering, and structure directly mirroring upstream integration tests in `packages/opencode/test/cli/run/run-process.test.ts` @ `v1.18.28`, augmented with authentic 1.18.28 identifier prefixes and token distributions.
-2. **`schema-derived`**: Reconstructed strictly from the Effect schemas in `packages/schema/src/v1/session.ts` and `cmd/run.ts` @ `v1.18.28`, populating all required and optional fields with nonsecret realistic values.
-3. **`synthetic`**: Intentionally constructed non-standard or malformed streams designed as negative test controls.
-
-### 4.2 Fixture Catalog
-
-| # | Fixture Filename | Provenance Label | Key Features Covered |
+| Fixture | Label | tokens.total | Basis |
 |---|---|---|---|
-| 1 | `single_turn_success.jsonl` | `upstream-derived` | Standard single-turn prompt (`step_start` → `text` → `step_finish`), reason: `stop`, explicit `tokens.total`: 8643, prompt cache read: 7680. |
-| 2 | `multi_step_tool_success.jsonl` | `upstream-derived` | Two-step turn: tool execution with completed state, intermediate finish `tool-calls`, followed by second step text and terminal finish `stop`. |
-| 3 | `tool_error_recovery.jsonl` | `schema-derived` | Policy-sensitive fixture: Step 1 tool error (`ENOENT`) with finish `tool-calls`; Step 2 model recovery text and terminal finish `stop` (exit 0). |
-| 4 | `terminal_reason_other.jsonl` | `schema-derived` | Single turn finishing with AI SDK / provider fallback reason `"other"` rather than standard `"stop"`. |
-| 5 | `api_error_retryable_rate_limit.jsonl` | `schema-derived` | Upstream `APIError` with `statusCode`: 429, `isRetryable`: true, `responseHeaders`, and `responseBody`. |
-| 6 | `api_error_non_retryable_forbidden.jsonl` | `schema-derived` | Upstream `APIError` with `statusCode`: 403, `isRetryable`: false, representing account/tier authorization refusal. |
-| 7 | `provider_auth_error.jsonl` | `schema-derived` | Upstream `ProviderAuthError` (`AuthError` schema) with `providerID`: "anthropic" and invalid credential message. |
-| 8 | `reasoning_thinking_turn.jsonl` | `upstream-derived` | Model turn with `--thinking` enabled, emitting reasoning block before text, and recording `reasoning_tokens` in `step_finish`. |
-| 9 | `synthetic_malformed_control.jsonl` | `synthetic` | Corrupt non-JSON line sandwiched between valid events to verify fail-closed parser isolation. |
+| single_turn_success.jsonl | cli-emission-shape | removed | Order from run-process test line 124 |
+| multi_step_tool_success.jsonl | cli-emission-shape | removed from both steps | Continuation order from the test at lines 186-194, without the leading reasoning and text events |
+| reasoning_thinking_turn.jsonl | cli-emission-shape | removed | Reasoning emit condition at run.ts 766-767 |
+| tool_error_recovery.jsonl | schema-derived | removed from both steps | ToolStateError shape. The recovery sequence is not in the upstream tests read |
+| terminal_reason_other.jsonl | synthetic | removed | other is not in the FinishReason union at v1.18.28 |
+| api_error_retryable_rate_limit.jsonl | schema-derived | not applicable | APIError fields. Presence of statusCode in emitted records is not established |
+| api_error_non_retryable_forbidden.jsonl | schema-derived | not applicable | Same basis as the 429 fixture. The SQLite observation is removed |
+| provider_auth_error.jsonl | schema-derived | not applicable | ProviderAuthError fields. Emission is not established by the upstream tests read |
+| synthetic_malformed_control.jsonl | synthetic | synthetic value 100 kept | Non-JSON control line between valid events |
+| synthetic_explicit_total.jsonl | synthetic | explicit synthetic value 8643 | Schema-optional total with a value chosen by the author. Not upstream-observed |
+| synthetic_explicit_total_zero.jsonl | synthetic | explicit synthetic value 0 | Schema-optional explicit zero with all components zero |
 
----
+All identifiers in the fixtures are synthetic. The prefixes follow the upstream generator, and the bodies do not.
 
-## 5. Compatibility Audit Findings & Gap Analysis
+## 6. Gate taxonomy
 
-Based on the protocol verification conducted against Symphony commit `9ce11fd` (and matching findings in protocol audit M1-W):
+The five expected-red gates in elixir/test/symphony_elixir/opencode_wire_contract_gap_test.exs keep their original assertions. They are now tagged by taxonomy. Neither tag means a demonstrated upstream defect. Each gate is red by design and does not measure product correctness.
 
-### 5.1 Finding A1: Terminal Reason Whitelist
-- **Upstream Reality:** The `reason` field in `StepFinishPart` is an open string (`Schema.String`). In the compiled 1.18.28 CLI binary, the AI SDK mapper uses `default: return "other"`.
-- **Symphony Baseline:** `Parser` hardcodes `@terminal_step_reasons ~w(stop length content-filter unknown)`.
-- **Gap Impact:** If an upstream provider finishes with reason `"other"`, Symphony fails closed with `{:incomplete_stream, :missing_completion_event}` despite a clean run and exit 0.
+Product-policy gates (tag product_policy):
 
-### 5.2 Finding A2: Token Accounting (`tokens.total`)
-- **Upstream Reality:** When present, `tokens.total` in OpenCode 1.18.28 includes cached tokens and reasoning tokens: `total = input + output + reasoning + cache.read + cache.write`. (Demonstrated in `single_turn_success.jsonl` where total is 8643: 954 input + 9 output + 7680 cache read).
-- **Symphony Baseline:** `Parser.process_step_finish/2` computes `total_tokens = input + output` (evaluating to 963 in the same example).
-- **Gap Impact:** Symphony severely underreports total token consumption when prompt caching is used.
+- GATE 1, gap A2. Should total_tokens follow an explicit provider total? Upstream says a provider total is authoritative, but the Parser documents its input-plus-output fallback as intentional. The input is the synthetic fixture synthetic_explicit_total.jsonl. Observed value 963; gate expects 8643.
+- GATE 2, gap A3. Should a recovered tool error be allowed to complete the turn? Parser.process_tool_use/2 latches :failed on any tool error, which is an explicit fail-closed design. Whether upstream exits 0 after a recovered tool error was not traced. Observed :failed; gate expects :completed.
+- GATE 3, gap A1. Should the Parser accept the finish reason other? The v1.18.28 FinishReason union does not include it, so the input is synthetic. Accepting it would be a hardening choice, not a fix for an observed defect. Observed :failed; gate expects :completed.
 
-### 5.3 Finding A3: Tool Error Latching Policy
-- **Upstream Reality:** A tool error (e.g. denied file permission or missing file) is emitted as a `tool_use` event with `state.status == "error"`. The model is fed this error and may choose to recover and conclude with `reason: "stop"` and process exit code 0.
-- **Symphony Baseline:** `Parser.process_tool_use/2` sets `completion_state: :failed` on any tool error, and `apply_step_finish_reason` only completes when state is `:running`.
-- **Gap Impact:** A recovered worker run that succeeded naturally is recorded as a failed worker in Symphony. This policy is safe (fail-closed) but prevents multi-turn recovery.
+Implementation-candidate gates (tag implementation_candidate):
 
-### 5.4 Finding A5: Error Classification (`status` vs `statusCode`, `isRetryable`)
-- **Upstream Reality:** Upstream `APIError` structs encapsulate the HTTP status in `data.statusCode` and provide an explicit boolean `data.isRetryable`. Auth errors use the class name `"ProviderAuthError"`.
-- **Symphony Baseline:** `Failure.classify_error_map/1` checks `map["status"]` or `data["status"]`, which misses `data["statusCode"]`. `ProviderAuthError` is missing from the explicit name check list (`["AuthError", "UnauthorizedError"]`).
-- **Gap Impact:** Non-text-matched 403 errors fall back to `:transient_worker_failure` instead of `:persistent_worker_failure`, causing unnecessary retries. `isRetryable` is not evaluated.
+- GATE 4, gap A5 (status). Failure.classify_error_map/1 reads status and does not read statusCode. This is a defect only if the CLI emits statusCode in error records. The schema makes it optional, and the upstream tests read do not show it emitted. Observed :transient_worker_failure; gate expects :persistent_worker_failure.
+- GATE 5, gap A5 (name). The name list in Failure.classify_error_map/1 covers AuthError and UnauthorizedError, but not ProviderAuthError, which the schema declares. This is a defect only if the CLI emits that name in an error record, which the upstream tests read do not show. Observed :transient_worker_failure; gate expects :auth_unavailable.
 
----
+Run one taxonomy with mix test --only product_policy or mix test --only implementation_candidate.
 
-## 6. Deterministic Test Suites
+## 7. Upstream behavior outside the five gates
 
-Two dedicated test suites verify the contract in `elixir/`:
+Two upstream observations are not covered by the gates, and this remediation changes nothing for them.
 
-1. **`test/symphony_elixir/opencode_wire_protocol_test.exs` (12 passing tests):**
-   - Verifies manifest integrity and file existence.
-   - Tests parsing of all fixtures under current baseline implementation.
-   - Proves byte-chunking and framing invariance (1-byte, 3-byte, and line-by-line chunking produce identical state).
-   - Characterizes the exact numerical delta in token accounting (963 vs 8643).
-   - Confirms fail-closed behavior for malformed lines.
+- Unknown finish in the middle of a turn. The upstream test records a step-finish with reason unknown, followed by continued output and a final stop, with exit code 0. The Parser treats any terminal reason, including unknown, as completion when the stream is still running (Parser.apply_step_finish_reason/2). If a stream ends after such a mid-turn unknown with no further completion event, finish/2 reports completed. This may be a fail-open case. It needs a separate decision.
+- Provider failure in JSON mode. The same upstream test shows a provider failure appearing as a step-finish with reason unknown, not as an error record. The Parser's error path does not see that case.
 
-2. **`test/symphony_elixir/opencode_wire_contract_gap_test.exs` (5 expected-red gated tests):**
-   - Tagged with `@moduletag :expected_red`.
-   - Gate 1: Asserts `total_tokens == 8643` (fails: received 963).
-   - Gate 2: Asserts tool error recovery yields `:completed` (fails: received `:failed`).
-   - Gate 3: Asserts `reason: "other"` yields `:completed` (fails: received `:failed`).
-   - Gate 4: Asserts `statusCode: 403` classifies as `:persistent_worker_failure` (fails: received `:transient_worker_failure`).
-   - Gate 5: Asserts `ProviderAuthError` classifies as `:auth_unavailable` (fails: received `:transient_worker_failure`).
+Also, upstream error.test.ts shows that parseStreamError returns type api_error with no statusCode. That differs from the APIError schema. The api_error fixtures follow the schema, so they are not what that function returns.
 
----
+## 8. Validation
 
-## 7. Evidence Requiring an Authorized Live Provider Trace
+- elixir/test/symphony_elixir/opencode_wire_protocol_test.exs: 14 tests, all passing. These cover the manifest, the fixture hygiene rules, the characterization of the current Parser and Failure behavior, framing and chunking invariance, the synthetic explicit total (including zero) and the malformed-line control.
+- elixir/test/symphony_elixir/opencode_wire_contract_gap_test.exs: 5 tests, all failing with the same received values as the candidate (963, :failed, :failed, :transient_worker_failure, :transient_worker_failure). Tag split: 3 product_policy, 2 implementation_candidate.
+- Formatting was checked with mix format --check-formatted on both test files.
 
-While these offline fixtures faithfully reconstruct the 1.18.28 schema and test dialect, an authorized real provider trace (recorded with explicit human approval in Milestone M1 live acceptance) is required to conclusively verify:
+## 9. Remaining limitations
 
-1. **True TCP/Pipe Chunk Fragmentation:** Live socket buffering dynamics between the OpenCode process and BEAM port under high load.
-2. **Trailing Event EOF Behavior:** Whether the OpenCode Node/Bun runtime flushes the final newline before process termination on exit code 0 or abruptly closes without flushing.
-3. **Real-world `reason` Distributions:** Empirical frequency of `"other"` vs `"unknown"` vs `"stop"` across real provider models (Anthropic, Google Antigravity, OpenAI).
-4. **Tool Error Recovery Turn Sequences:** Empirical multi-step prompt traces demonstrating whether and how production agents recover from denied permissions.
-5. **Exact Provider Error Payloads:** Live vendor-specific error JSON bodies embedded in `responseBody` and `metadata`.
-
-Until such authorized captures are recorded, the offline fixtures in `elixir/test/fixtures/opencode_wire/` serve as the canonical contract baseline.
-
+- No live capture exists. Emitted field presence, the newline on Windows, and exit codes after recovered tool errors are not observed.
+- Upstream source was read at one tag, and only the paths listed in section 3 were searched.
+- Identifiers and values are hand-written. They test shapes, not generator output.
+- Gate results are expected red by design. They do not measure whether the product behaves correctly.
+- An authorized live provider trace is still required to certify the wire contract.
