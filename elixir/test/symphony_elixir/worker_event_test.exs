@@ -212,7 +212,7 @@ defmodule SymphonyElixir.WorkerEventTest do
     end
 
     test "step_finish reasons follow the OpenCode CLI contract" do
-      for reason <- ["stop", "length", "content-filter", "unknown"] do
+      for reason <- ["stop", "length", "content-filter", "unknown", "other"] do
         event = step_finish(reason)
         assert event.event == :step_finish
         assert event.terminal?

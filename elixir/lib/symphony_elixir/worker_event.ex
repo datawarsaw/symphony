@@ -7,7 +7,7 @@ defmodule SymphonyElixir.WorkerEvent do
   common representation consumed by Symphony's Orchestrator.
 
   OpenCode completion follows the CLI 1.18.28 run --format json contract.
-  step_finish reasons stop, length, content-filter, and unknown are observational
+  step_finish reasons stop, length, content-filter, unknown, and other are observational
   terminal indicators. tool-calls, a missing reason, and error are not successful
   completions. CLI completion does not depend on session.status idle. A terminal
   WorkerEvent never grants completion authority; successful_completion? stays
@@ -68,7 +68,7 @@ defmodule SymphonyElixir.WorkerEvent do
 
   @behaviour Access
 
-  @terminal_step_reasons ~w(stop length content-filter unknown)
+  @terminal_step_reasons ~w(stop length content-filter unknown other)
   @max_evidence_bytes 4_096
   @truncated "…[truncated]"
   @truncation_budget @max_evidence_bytes - byte_size(@truncated)

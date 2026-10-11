@@ -73,6 +73,9 @@ defmodule SymphonyElixir.OpenCode.Failure do
   def classify({:jobrun_compile_failed, _, _}), do: :probe_infrastructure_error
   def classify({:local_shell_start_failed, _}), do: :probe_infrastructure_error
 
+  def classify({:terminal_reason, reason}), do: classify_finish_reason(reason)
+  def classify({:finish_reason, reason}), do: classify_finish_reason(reason)
+
   def classify({:tool_error, _tool, error_detail}) do
     classify_text(inspect(error_detail), :persistent_worker_failure)
   end
@@ -139,11 +142,25 @@ defmodule SymphonyElixir.OpenCode.Failure do
   # Helpers
   # ---------------------------------------------------------------------------
 
+  defp classify_finish_reason("content-filter"), do: :persistent_worker_failure
+  defp classify_finish_reason("length"), do: :transient_worker_failure
+  defp classify_finish_reason("error"), do: :transient_worker_failure
+  defp classify_finish_reason(_), do: :transient_worker_failure
+
   defp classify_error_map(map) do
     name = Map.get(map, "name") || Map.get(map, :name)
     data = Map.get(map, "data") || Map.get(map, :data) || %{}
     msg = Map.get(data, "message") || Map.get(data, :message) || Map.get(map, "message") || Map.get(map, :message)
-    status = Map.get(map, "status") || Map.get(map, :status) || Map.get(data, "status")
+
+    status =
+      Map.get(map, "status") ||
+        Map.get(map, :status) ||
+        Map.get(data, "status") ||
+        Map.get(data, :status) ||
+        Map.get(data, "statusCode") ||
+        Map.get(data, :statusCode) ||
+        Map.get(map, "statusCode") ||
+        Map.get(map, :statusCode)
 
     cond do
       status == 401 ->
@@ -158,7 +175,7 @@ defmodule SymphonyElixir.OpenCode.Failure do
       status in [500, 502, 503, 504] ->
         :provider_outage
 
-      name in ["AuthError", "UnauthorizedError"] ->
+      name in ["AuthError", "UnauthorizedError", "ProviderAuthError"] ->
         :auth_unavailable
 
       name in ["ModelNotFoundError", "ModelNotFound"] ->
@@ -287,6 +304,10 @@ defmodule SymphonyElixir.OpenCode.Failure do
   defp extract_message(%FailureError{message: msg}), do: msg
   defp extract_message({:tool_error, tool, err}), do: "Tool #{tool} failed: #{inspect(err)}"
   defp extract_message({:malformed_json_line, line, _}), do: "Malformed JSON line: #{line}"
+  defp extract_message(:timeout), do: "OpenCode worker execution timed out"
+  defp extract_message({:timeout, detail}), do: "OpenCode worker execution timed out: #{inspect(detail)}"
+  defp extract_message({:terminal_reason, reason}), do: "Ineligible terminal finish reason: #{reason}"
+  defp extract_message({:finish_reason, reason}), do: "Ineligible finish reason: #{reason}"
   defp extract_message({:process_exit, status}), do: "OpenCode exited with status #{status}"
 
   defp extract_message({:opencode_remote_host_ineligible, worker_host}),
@@ -306,6 +327,10 @@ defmodule SymphonyElixir.OpenCode.Failure do
     Map.get(map, "code") || Map.get(map, :code) || Map.get(map, "name") || Map.get(map, :name)
   end
 
+  defp extract_code(:timeout), do: "TIMEOUT"
+  defp extract_code({:timeout, _}), do: "TIMEOUT"
+  defp extract_code({:terminal_reason, reason}), do: String.upcase(to_string(reason))
+  defp extract_code({:finish_reason, reason}), do: String.upcase(to_string(reason))
   defp extract_code(_), do: nil
 
   defp extract_reset_in_ms(%{} = map) do

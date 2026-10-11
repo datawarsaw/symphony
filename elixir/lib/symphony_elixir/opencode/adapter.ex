@@ -47,6 +47,8 @@ defmodule SymphonyElixir.OpenCode.Adapter do
           optional(:termination) => map() | nil,
           optional(:exit_code) => integer() | nil,
           optional(:stderr) => String.t(),
+          optional(:finish_reason) => String.t() | nil,
+          optional(:tool_failures) => [term()],
           required(:session_id) => String.t() | nil,
           required(:message_ids) => [String.t()],
           required(:tool_events) => [map()],
@@ -221,17 +223,17 @@ defmodule SymphonyElixir.OpenCode.Adapter do
       success?(parser, status, termination, session.identity) ->
         {:ok, result}
 
-      protocol_succeeded?(parser, status) and not termination_ok?(session.identity, termination) ->
+      terminal_protocol_complete?(parser, status) and not termination_ok?(session.identity, termination) ->
         {:error, {:termination_unconfirmed, result}}
 
       true ->
-        reason = find_primary_failure_reason(parser.failure_evidence, status)
+        reason = find_primary_failure_reason(parser, status)
         {:error, {reason, Map.put(result, :failure_info, Failure.failure_info(reason))}}
     end
   end
 
   defp timeout_result(session, parser, termination) do
-    final_parser = Parser.finish(parser, nil)
+    final_parser = Parser.finish(parser, :timeout)
     result = assembled_result(session, final_parser, 253, termination)
     failure_info = Failure.failure_info(:timeout)
     {:error, {:timeout, Map.put(result, :failure_info, failure_info)}}
@@ -247,14 +249,26 @@ defmodule SymphonyElixir.OpenCode.Adapter do
   end
 
   defp success?(parser, status, termination, identity) do
-    protocol_succeeded?(parser, status) and termination_ok?(identity, termination)
+    status == 0 and
+      eligible_protocol_completion?(parser) and
+      parser.failure_evidence == [] and
+      parser.tool_failures == [] and
+      termination_ok?(identity, termination)
   end
 
-  defp protocol_succeeded?(parser, 0) do
-    parser.completion_state == :completed and parser.failure_evidence == []
+  defp eligible_protocol_completion?(parser) do
+    parser.completion_state == :completed and
+      Parser.eligible_finish_reason?(parser.finish_reason)
   end
 
-  defp protocol_succeeded?(_parser, _status), do: false
+  defp terminal_protocol_complete?(parser, 0) do
+    parser.completion_state == :completed and
+      Parser.eligible_finish_reason?(parser.finish_reason) and
+      parser.failure_evidence == [] and
+      parser.tool_failures == []
+  end
+
+  defp terminal_protocol_complete?(_parser, _status), do: false
 
   defp termination_ok?(nil, %{status: :NOT_APPLICABLE}), do: true
   defp termination_ok?(identity, %{status: :TERMINATED_CONFIRMED}) when is_map(identity), do: true
@@ -269,11 +283,29 @@ defmodule SymphonyElixir.OpenCode.Adapter do
 
   defp read_stderr(_session), do: ""
 
-  defp find_primary_failure_reason(evidence_list, status) do
-    Enum.find(evidence_list, fn
-      {:process_exit, _} -> false
-      _ -> true
-    end) || List.first(evidence_list) || {:process_exit, status}
+  defp find_primary_failure_reason(parser, status) do
+    fatal_reason =
+      Enum.find(parser.failure_evidence, fn
+        {:process_exit, _} -> false
+        _ -> true
+      end)
+
+    cond do
+      not is_nil(fatal_reason) ->
+        fatal_reason
+
+      parser.tool_failures != [] ->
+        List.first(parser.tool_failures)
+
+      parser.finish_reason in ["length", "content-filter"] ->
+        {:terminal_reason, parser.finish_reason}
+
+      status != 0 ->
+        {:process_exit, status}
+
+      true ->
+        List.first(parser.failure_evidence) || {:process_exit, status}
+    end
   end
 
   defp normalize_chunk({:eol, line}), do: line <> "\n"

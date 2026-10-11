@@ -998,7 +998,7 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert {:incomplete_stream, :missing_completion_event} in result.failure_evidence
     end
 
-    test "tool error with exit code 0 fails closed even after a terminal step_finish" do
+    test "tool error preserves protocol completion on terminal step_finish while recording tool failure" do
       stream =
         tool_use_error_event("ses_c5", "msg_1", "bash", "call_1", "permission denied") <>
           step_finish_event("ses_c5", "msg_1", "stop", 10, 20)
@@ -1009,8 +1009,9 @@ defmodule SymphonyElixir.OpenCodeTest do
         |> Parser.finish(0)
         |> Parser.to_result()
 
-      assert result.completion_state == :failed
-      assert {:tool_error, "bash", "permission denied"} in result.failure_evidence
+      assert result.completion_state == :completed
+      assert result.failure_evidence == []
+      assert {:tool_error, "bash", "permission denied"} in result.tool_failures
     end
 
     test "malformed JSON with a secret never leaks it and retains no decoder struct" do
@@ -1081,7 +1082,7 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert {:incomplete_stream, :missing_completion_event} in result.failure_evidence
     end
 
-    test "a tool error stays failed when a later terminal step_finish arrives" do
+    test "a tool error preserves protocol completion when a later terminal step_finish arrives" do
       stream =
         tool_use_error_event("ses_tool", "msg_1", "bash", "c1", "permission denied") <>
           step_finish_event("ses_tool", "msg_1", "stop", 10, 20)
@@ -1092,8 +1093,9 @@ defmodule SymphonyElixir.OpenCodeTest do
         |> Parser.finish(0)
         |> Parser.to_result()
 
-      assert result.completion_state == :failed
-      assert {:tool_error, "bash", "permission denied"} in result.failure_evidence
+      assert result.completion_state == :completed
+      assert result.failure_evidence == []
+      assert {:tool_error, "bash", "permission denied"} in result.tool_failures
     end
 
     test "tool output is redacted and bounded" do
@@ -1517,7 +1519,9 @@ defmodule SymphonyElixir.OpenCodeTest do
                run_mock(workspace, "--mock-mode=tool-error")
 
       assert tool_error.exit_code == 0
-      assert tool_error.completion_state == :failed
+      assert tool_error.completion_state == :completed
+      assert tool_error.failure_evidence == []
+      assert {:tool_error, "read", "permission denied"} in tool_error.tool_failures
       assert tool_error.failure_info.failure_class == :persistent_worker_failure
     end
 

@@ -8,7 +8,9 @@ defmodule SymphonyElixir.OpenCode.Parser do
   - tool events (tool, call_id, status, error, output)
   - completion state (:running, :completed, :failed)
   - token usage (input, output, reasoning, cache read/write, total, cost)
-  - failure evidence (protocol errors, tool failures, malformed lines, process exits)
+  - failure evidence (protocol errors, malformed lines, process exits)
+  - tool failures (tool errors recorded separately from protocol failure evidence)
+  - finish reason (explicit finish reason from step_finish)
 
   Token accounting contract (OpenCode 1.18.28 wire): the five part.tokens
   categories are non-overlapping — input is non-cached input, output is
@@ -31,7 +33,7 @@ defmodule SymphonyElixir.OpenCode.Parser do
   - A `step_finish` event whose `part.reason` is `"tool-calls"` is intermediate:
     the model continues with tool calls and the turn is not complete.
   - A `step_finish` with a terminal reason (`"stop"`, `"length"`,
-    `"content-filter"`, `"unknown"`) is valid terminal completion evidence.
+    `"content-filter"`, `"unknown"`, `"other"`) is valid terminal completion evidence.
   - Missing, unknown, or `"error"` finish reasons are not terminal; the stream
     fails closed as incomplete at finish.
   - Each step finish needs a nonblank session ID consistent with the first
@@ -53,7 +55,9 @@ defmodule SymphonyElixir.OpenCode.Parser do
               message_ids: MapSet.new(),
               seen_step_finishes: MapSet.new(),
               tool_events: [],
+              tool_failures: [],
               completion_state: :running,
+              finish_reason: nil,
               usage: %{
                 input_tokens: 0,
                 output_tokens: 0,
@@ -68,13 +72,28 @@ defmodule SymphonyElixir.OpenCode.Parser do
   end
 
   @intermediate_step_reason "tool-calls"
-  @terminal_step_reasons ~w(stop length content-filter unknown)
+  @terminal_step_reasons ~w(stop length content-filter unknown other)
+  @eligible_finish_reasons ~w(stop unknown other)
 
   @doc """
   Initializes a new parser accumulator state.
   """
   @spec new() :: %State{}
   def new, do: %State{}
+
+  @doc """
+  Returns whether a finish reason represents an observational terminal completion.
+  """
+  @spec terminal_finish_reason?(String.t() | nil) :: boolean()
+  def terminal_finish_reason?(reason) when is_binary(reason), do: reason in @terminal_step_reasons
+  def terminal_finish_reason?(_), do: false
+
+  @doc """
+  Returns whether a finish reason represents an eligible clean protocol completion.
+  """
+  @spec eligible_finish_reason?(String.t() | nil) :: boolean()
+  def eligible_finish_reason?(reason) when is_binary(reason), do: reason in @eligible_finish_reasons
+  def eligible_finish_reason?(_), do: false
 
   @doc """
   Feeds a binary chunk of output from the process into the incremental parser.
@@ -94,7 +113,7 @@ defmodule SymphonyElixir.OpenCode.Parser do
   Finalizes parsing after process termination.
   Processes any trailing line in the buffer and applies the final process exit status.
   """
-  @spec finish(%State{}, integer() | nil) :: %State{}
+  @spec finish(%State{}, integer() | nil | atom()) :: %State{}
   def finish(%State{} = state, exit_status \\ 0) do
     state =
       if String.trim(state.buffer) != "" do
@@ -104,6 +123,20 @@ defmodule SymphonyElixir.OpenCode.Parser do
       end
 
     cond do
+      exit_status == :timeout ->
+        %{
+          state
+          | completion_state: :failed,
+            failure_evidence: [{:timeout, :process_timeout} | state.failure_evidence]
+        }
+
+      is_nil(exit_status) ->
+        %{
+          state
+          | completion_state: :failed,
+            failure_evidence: [{:process_exit, :unknown} | state.failure_evidence]
+        }
+
       is_integer(exit_status) and exit_status != 0 ->
         %{
           state
@@ -137,7 +170,9 @@ defmodule SymphonyElixir.OpenCode.Parser do
       session_id: state.session_id,
       message_ids: state.message_ids |> MapSet.to_list() |> Enum.sort(),
       tool_events: Enum.reverse(state.tool_events),
+      tool_failures: Enum.reverse(state.tool_failures),
       completion_state: state.completion_state,
+      finish_reason: state.finish_reason,
       usage: state.usage,
       failure_evidence: Enum.reverse(state.failure_evidence),
       event_count: length(state.events)
@@ -467,11 +502,10 @@ defmodule SymphonyElixir.OpenCode.Parser do
     end
   end
 
-  # "tool-calls" is intermediate: the model continues the turn with tool calls,
-  # so it must never be mistaken for final completion. Only terminal reasons
-  # complete the turn, and only while the stream is still clean and running.
   defp apply_step_finish_reason(state, part) do
     reason = Map.get(part, "reason")
+
+    state = %{state | finish_reason: reason}
 
     cond do
       reason == @intermediate_step_reason ->
@@ -511,18 +545,17 @@ defmodule SymphonyElixir.OpenCode.Parser do
 
     failed? = status == "error" or not is_nil(error)
 
-    new_failure_evidence =
+    new_tool_failures =
       if failed? do
-        [{:tool_error, tool_name, error} | state.failure_evidence]
+        [{:tool_error, tool_name, error} | state.tool_failures]
       else
-        state.failure_evidence
+        state.tool_failures
       end
 
     %{
       state
       | tool_events: new_tool_events,
-        failure_evidence: new_failure_evidence,
-        completion_state: if(failed?, do: :failed, else: state.completion_state)
+        tool_failures: new_tool_failures
     }
   end
 

@@ -162,6 +162,48 @@ class MockOpenCode
             return exitCode;
         }
 
+        if (mode == "terminal-then-hang")
+        {
+            WriteStepStart(sessionId, "msg_01");
+            WriteStepFinish(sessionId, "stop", "msg_01", tokensIn, tokensOut, tokensReasoning, cacheRead, cacheWrite, cost);
+            Console.Out.Flush();
+            if (!string.IsNullOrEmpty(stopFile))
+            {
+                while (true)
+                {
+                    if (File.Exists(stopFile)) break;
+                    Thread.Sleep(50);
+                }
+                return 0;
+            }
+            Thread.Sleep(60000);
+            return exitCode;
+        }
+
+        if (mode == "reason-length")
+        {
+            WriteStepStart(sessionId, "msg_01");
+            WriteStepFinish(sessionId, "length", "msg_01", tokensIn, tokensOut, tokensReasoning, cacheRead, cacheWrite, cost);
+            Console.Out.Flush();
+            return exitCode;
+        }
+
+        if (mode == "reason-content-filter")
+        {
+            WriteStepStart(sessionId, "msg_01");
+            WriteStepFinish(sessionId, "content-filter", "msg_01", tokensIn, tokensOut, tokensReasoning, cacheRead, cacheWrite, cost);
+            Console.Out.Flush();
+            return exitCode;
+        }
+
+        if (mode == "reason-other")
+        {
+            WriteStepStart(sessionId, "msg_01");
+            WriteStepFinish(sessionId, "other", "msg_01", tokensIn, tokensOut, tokensReasoning, cacheRead, cacheWrite, cost);
+            Console.Out.Flush();
+            return exitCode;
+        }
+
         if (mode == "stalled" || mode == "hang")
         {
             WriteStepStart(sessionId, "msg_01");
