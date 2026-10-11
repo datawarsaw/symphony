@@ -135,12 +135,10 @@ defmodule SymphonyElixir.OpenCodeEventOrderingRegressionTest do
   defp chronological_lines(session_id \\ @session) do
     [
       step_start_line(session_id, "msg_01", "step_s1", @base_ts),
-      step_finish_line(session_id, "msg_01", "step_f1", "tool-calls", @base_ts + 100,
-        %{input: 40, output: 60, reasoning: 10, cache_read: 5, cache_write: 5}, 0.002),
+      step_finish_line(session_id, "msg_01", "step_f1", "tool-calls", @base_ts + 100, %{input: 40, output: 60, reasoning: 10, cache_read: 5, cache_write: 5}, 0.002),
       tool_use_line(session_id, "msg_01", "toolu_01", "call_01", @base_ts + 200),
       step_start_line(session_id, "msg_02", "step_s2", @base_ts + 300),
-      step_finish_line(session_id, "msg_02", "step_f2", "stop", @base_ts + 400,
-        %{input: 60, output: 90, reasoning: 15, cache_read: 10, cache_write: 5}, 0.003)
+      step_finish_line(session_id, "msg_02", "step_f2", "stop", @base_ts + 400, %{input: 60, output: 90, reasoning: 15, cache_read: 10, cache_write: 5}, 0.003)
     ]
   end
 
@@ -365,7 +363,12 @@ defmodule SymphonyElixir.OpenCodeEventOrderingRegressionTest do
 
       parts = [
         binary_part(l1, 0, half_l1),
-        binary_part(l1, half_l1, byte_size(l1) - half_l1) <> "\n" <> l2 <> "\n" <> l3 <> "\n" <>
+        binary_part(l1, half_l1, byte_size(l1) - half_l1) <>
+          "\n" <>
+          l2 <>
+          "\n" <>
+          l3 <>
+          "\n" <>
           binary_part(l4, 0, half_l4),
         binary_part(l4, half_l4, byte_size(l4) - half_l4) <> "\r\n" <> l5 <> "\r\n"
       ]
@@ -407,8 +410,7 @@ defmodule SymphonyElixir.OpenCodeEventOrderingRegressionTest do
       lines = [
         step_start_line(@session, "msg_01", "step_s1", @base_ts),
         tool_use_line(@session, "msg_01", "toolu_01", "call_01", @base_ts + 100),
-        step_finish_line(@session, "msg_01", "step_f1", "stop", @base_ts + 200,
-          %{input: 10, output: 20, reasoning: 0, cache_read: 0, cache_write: 0}, 0.001)
+        step_finish_line(@session, "msg_01", "step_f1", "stop", @base_ts + 200, %{input: 10, output: 20, reasoning: 0, cache_read: 0, cache_write: 0}, 0.001)
       ]
 
       # No newline after the final line: the terminal event is only decoded by
@@ -433,10 +435,11 @@ defmodule SymphonyElixir.OpenCodeEventOrderingRegressionTest do
       malformed = "{not-json-line " <> @raw_secret
 
       parts = [
-        step_start_line(@session, "msg_01", "step_s1", @base_ts) <> "\n" <>
-          malformed <> "\n" <>
-          step_finish_line(@session, "msg_01", "step_f1", "stop", @base_ts + 100,
-            %{input: 10, output: 20, reasoning: 0, cache_read: 0, cache_write: 0}, 0.001) <> "\n"
+        step_start_line(@session, "msg_01", "step_s1", @base_ts) <>
+          "\n" <>
+          malformed <>
+          "\n" <>
+          step_finish_line(@session, "msg_01", "step_f1", "stop", @base_ts + 100, %{input: 10, output: 20, reasoning: 0, cache_read: 0, cache_write: 0}, 0.001) <> "\n"
       ]
 
       {_issue_id, run_result, delivered} = run_with_on_event(parts, ctx)
@@ -464,11 +467,13 @@ defmodule SymphonyElixir.OpenCodeEventOrderingRegressionTest do
       malformed = "not-json-at-all-malformed-line"
 
       parts = [
-        step_start_line(@session, "msg_01", "step_s1", @base_ts) <> "\n" <>
-          malformed <> "\n" <>
-          tool_use_line(@session, "msg_01", "toolu_01", "call_01", @base_ts + 100) <> "\n" <>
-          step_finish_line(@session, "msg_01", "step_f1", "stop", @base_ts + 200,
-            %{input: 10, output: 20, reasoning: 0, cache_read: 0, cache_write: 0}, 0.001) <> "\n"
+        step_start_line(@session, "msg_01", "step_s1", @base_ts) <>
+          "\n" <>
+          malformed <>
+          "\n" <>
+          tool_use_line(@session, "msg_01", "toolu_01", "call_01", @base_ts + 100) <>
+          "\n" <>
+          step_finish_line(@session, "msg_01", "step_f1", "stop", @base_ts + 200, %{input: 10, output: 20, reasoning: 0, cache_read: 0, cache_write: 0}, 0.001) <> "\n"
       ]
 
       {_issue_id, _run_result, delivered} = run_with_on_event(parts, ctx)
@@ -545,12 +550,13 @@ defmodule SymphonyElixir.OpenCodeEventOrderingRegressionTest do
 
     test "a mid-stream session change never locks out the canonical session events", ctx do
       canonical_stop =
-        step_finish_line(@session_canonical, "msg_01", "step_f1", "stop", @base_ts + 100,
-          %{input: 10, output: 20, reasoning: 0, cache_read: 0, cache_write: 0}, 0.001)
+        step_finish_line(@session_canonical, "msg_01", "step_f1", "stop", @base_ts + 100, %{input: 10, output: 20, reasoning: 0, cache_read: 0, cache_write: 0}, 0.001)
 
       parts = [
-        step_start_line(@session_canonical, "msg_01", "step_s1", @base_ts) <> "\n" <>
-          canonical_stop <> "\n" <>
+        step_start_line(@session_canonical, "msg_01", "step_s1", @base_ts) <>
+          "\n" <>
+          canonical_stop <>
+          "\n" <>
           step_start_line(@session_rogue, "msg_02", "step_s2", @base_ts + 200) <> "\n"
       ]
 

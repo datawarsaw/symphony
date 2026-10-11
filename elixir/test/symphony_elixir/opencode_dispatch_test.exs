@@ -48,12 +48,7 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
       remove_temp_fixture_root!(root)
     end)
 
-    {:ok,
-     root: root,
-     state_root: state_root,
-     workspace_root: workspace_root,
-     mock_exe: mock_exe,
-     issue: test_issue("ISSUE-OD-1", "MIC-OD-1")}
+    {:ok, root: root, state_root: state_root, workspace_root: workspace_root, mock_exe: mock_exe, issue: test_issue("ISSUE-OD-1", "MIC-OD-1")}
   end
 
   defp test_issue(id, identifier) do

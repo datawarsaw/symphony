@@ -184,6 +184,7 @@ defmodule SymphonyElixir.OpenCodeWireProtocolTest do
                {:tool_error, "read_file", err} -> err =~ "ENOENT"
                _ -> false
              end)
+
       assert result.completion_state == :completed
     end
 

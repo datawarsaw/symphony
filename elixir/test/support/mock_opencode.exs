@@ -55,4 +55,3 @@ defmodule SymphonyElixir.TestSupport.MockOpenCode do
     Enum.find(candidates, &File.exists?/1) || raise "csc.exe not found on host"
   end
 end
-

@@ -257,7 +257,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp opencode_termination_confirmation({_status, {_reason, %{} = run_result}})
        when is_map_key(run_result, :termination),
-    do: Map.get(run_result, :termination)
+       do: Map.get(run_result, :termination)
 
   defp opencode_termination_confirmation(_other), do: nil
 
