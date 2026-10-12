@@ -15,6 +15,25 @@ defmodule SymphonyElixir.PilotBootstrap do
   worker dispatch or provider call - when something is missing, invalid,
   unverifiable, or points at a protected path.
 
+  Containment is not decided lexically. Every boundary-relevant path - the pilot
+  root, the manifest entries, the protected roots and the working directory - is
+  resolved against the real filesystem by walking each existing ancestor, so
+  NTFS junctions, directory and file symlinks, and chained links that leave the
+  approved pilot directory are rejected however the path is spelled: forward or
+  back slashes, any casing, trailing separators, `.`/`..` segments or `\\?\`
+  device-path aliases. A path that cannot be resolved safely - a broken or
+  looping link, an unreadable ancestor, a `\\.\` device namespace - fails closed.
+  Resolution only stats and reads; it never follows a link into a protected tree
+  to write anything, and paths that do not exist yet are accepted only when
+  every existing ancestor resolves inside the boundary.
+
+  This is a validation-time control, not filesystem sandboxing. Between the
+  check and any later mutation, a process that can write inside the pilot
+  directory can still replace a component with a link (TOCTOU), and 8.3
+  short-name aliases are matched by prefix rather than expanded. Operating-system
+  level isolation remains the only absolute boundary; this gate narrows, but
+  does not eliminate, the window.
+
   The gate is policy plus filesystem and `git` inspection. It contacts no tracker,
   prepares no workspace, invokes no provider and starts no process, so it runs
   offline and is safe to repeat.
@@ -193,22 +212,33 @@ defmodule SymphonyElixir.PilotBootstrap do
   # boundary checks
 
   defp boundary_checks(manifest, env, loaded) do
+    resolved = resolve_boundary(manifest, env)
+
     [
-      {:manifest_paths, check_manifest_paths(manifest, env.protected_roots)},
-      {:source_identity, check_source_identity(manifest, env)},
-      {:workflow_identity, check_workflow_identity(manifest)},
+      {:manifest_paths, check_manifest_paths(manifest, resolved)},
+      {:source_identity, check_source_identity(manifest, env, resolved)},
+      {:workflow_identity, check_workflow_identity(manifest, resolved)},
       {:workflow_load, check_workflow_load(loaded)},
-      {:workspace_root, check_workspace_root(manifest, loaded)},
-      {:logs_root, check_logs_root(manifest, env.protected_roots)},
+      {:workspace_root, check_workspace_root(manifest, loaded, resolved)},
+      {:logs_root, check_logs_root(manifest, resolved)},
       {:worker_containment, check_worker_containment(loaded)},
-      {:routing_boundary, check_routing_boundary(manifest, loaded)}
+      {:routing_boundary, check_routing_boundary(manifest, loaded, resolved)}
     ]
   end
 
-  defp check_manifest_paths(manifest, protected) do
+  defp check_manifest_paths(manifest, resolved) do
     with :ok <- absolute_paths(manifest),
-         :ok <- inside_pilot(manifest.source_root, manifest.pilot_root, :source_root_outside_pilot) do
-      unprotected(manifest, protected)
+         :ok <- resolvable_paths(resolved),
+         :ok <-
+           inside_pilot(resolved.entries.source_root, resolved.entries.pilot_root, :source_root_outside_pilot) do
+      unprotected(resolved)
+    end
+  end
+
+  defp resolvable_paths(resolved) do
+    case resolved.unresolvable do
+      [] -> :ok
+      [{name, path, reason} | _rest] -> {:error, {:path_unresolvable, name, path, reason}}
     end
   end
 
@@ -233,10 +263,15 @@ defmodule SymphonyElixir.PilotBootstrap do
     if inside?(path, root), do: :ok, else: {:error, {tag, path, root}}
   end
 
-  defp unprotected(manifest, protected) do
-    entries = Enum.reject(path_entries(manifest), fn {name, _path} -> name == :pilot_root end)
+  defp unprotected(resolved) do
+    entries =
+      Enum.reject(resolved.entries, fn
+        {:pilot_root, _path} -> true
+        {_name, nil} -> true
+        {_name, _path} -> false
+      end)
 
-    case Enum.find_value(protected, fn root -> protected_reference(entries, root) end) do
+    case Enum.find_value(resolved.protected_roots, fn root -> protected_reference(entries, root) end) do
       nil -> :ok
       error -> error
     end
@@ -249,10 +284,10 @@ defmodule SymphonyElixir.PilotBootstrap do
     end
   end
 
-  defp check_source_identity(manifest, env) do
-    expected_cwd = Path.join(manifest.source_root, "elixir")
+  defp check_source_identity(manifest, env, resolved) do
+    expected_cwd = Path.join(resolved.entries.source_root, "elixir")
 
-    with :ok <- same_directory(env.cwd, expected_cwd),
+    with :ok <- same_directory(resolved.cwd, expected_cwd),
          {:ok, head} <- git_head(manifest, env),
          :ok <- head_matches(head, manifest.expected_source_sha) do
       clean_worktree(manifest, env)
@@ -293,9 +328,9 @@ defmodule SymphonyElixir.PilotBootstrap do
     end
   end
 
-  defp check_workflow_identity(manifest) do
-    workflow = manifest.workflow_path
-    tracked = Path.join([manifest.source_root, "elixir", "WORKFLOW.md"])
+  defp check_workflow_identity(manifest, resolved) do
+    workflow = resolved.entries.workflow_path
+    tracked = Path.join([resolved.entries.source_root, "elixir", "WORKFLOW.md"])
 
     cond do
       not inside?(workflow, manifest.pilot_root) ->
@@ -325,22 +360,23 @@ defmodule SymphonyElixir.PilotBootstrap do
   defp check_workflow_load({:ok, _settings}), do: :ok
   defp check_workflow_load({:error, reason}), do: {:error, reason}
 
-  defp check_workspace_root(manifest, loaded) do
-    root = manifest.workspace_root
-    declared = declared_workspace_root(loaded)
+  defp check_workspace_root(manifest, loaded, resolved) do
+    root = resolved.entries.workspace_root
+    declared_path = declared_workspace_root(loaded)
+    declared = resolve_or_lexical(declared_path)
 
     cond do
-      not inside?(root, manifest.pilot_root) ->
-        {:error, {:workspace_root_outside_pilot, root}}
+      not inside?(root, resolved.entries.pilot_root) ->
+        {:error, {:workspace_root_outside_pilot, manifest.workspace_root}}
 
-      inside?(root, manifest.source_root) ->
-        {:error, {:workspace_root_inside_source_checkout, root}}
+      inside?(root, resolved.entries.source_root) ->
+        {:error, {:workspace_root_inside_source_checkout, manifest.workspace_root}}
 
-      not nonblank?(declared) ->
+      not nonblank?(declared_path) ->
         {:error, :workspace_root_missing}
 
       normalize(declared) != normalize(root) ->
-        {:error, {:workspace_root_mismatch, declared, root}}
+        {:error, {:workspace_root_mismatch, declared_path, manifest.workspace_root}}
 
       true ->
         :ok
@@ -350,14 +386,21 @@ defmodule SymphonyElixir.PilotBootstrap do
   defp declared_workspace_root({:ok, settings}), do: settings.workspace.root
   defp declared_workspace_root(_loaded), do: nil
 
-  defp check_logs_root(manifest, protected) do
-    root = manifest.logs_root
+  defp check_logs_root(manifest, resolved) do
+    root = resolved.entries.logs_root
 
     cond do
-      not inside?(root, manifest.pilot_root) -> {:error, {:logs_root_outside_pilot, root}}
-      inside?(root, manifest.source_root) -> {:error, {:logs_root_inside_source_checkout, root}}
-      Enum.any?(protected, &overlaps?(root, &1)) -> {:error, {:logs_root_protected, root}}
-      true -> :ok
+      not inside?(root, resolved.entries.pilot_root) ->
+        {:error, {:logs_root_outside_pilot, manifest.logs_root}}
+
+      inside?(root, resolved.entries.source_root) ->
+        {:error, {:logs_root_inside_source_checkout, manifest.logs_root}}
+
+      Enum.any?(resolved.protected_roots, &overlaps?(root, &1)) ->
+        {:error, {:logs_root_protected, manifest.logs_root}}
+
+      true ->
+        :ok
     end
   end
 
@@ -385,7 +428,7 @@ defmodule SymphonyElixir.PilotBootstrap do
 
   defp check_worker_containment({:error, reason}), do: {:error, reason}
 
-  defp check_routing_boundary(manifest, {:ok, settings}) do
+  defp check_routing_boundary(manifest, {:ok, settings}, resolved) do
     targets = settings.routing.targets || %{}
     approved = manifest.approved_source_path
 
@@ -396,19 +439,21 @@ defmodule SymphonyElixir.PilotBootstrap do
       not nonblank?(approved) ->
         {:error, {:unapproved_repository_targets, Map.keys(targets)}}
 
-      not inside?(approved, manifest.pilot_root) ->
+      not inside?(resolved.entries.approved_source_path, resolved.entries.pilot_root) ->
         {:error, {:approved_source_path_outside_pilot, approved}}
 
       true ->
-        mismatched_source_path(targets, approved)
+        mismatched_source_path(targets, resolved)
     end
   end
 
-  defp check_routing_boundary(_manifest, {:error, reason}), do: {:error, reason}
+  defp check_routing_boundary(_manifest, {:error, reason}, _resolved), do: {:error, reason}
 
-  defp mismatched_source_path(targets, approved) do
+  defp mismatched_source_path(targets, resolved) do
+    approved = resolved.entries.approved_source_path
+
     case Enum.find(targets, fn {_target, config} ->
-           normalize(source_path(config)) != normalize(approved)
+           normalize(resolve_or_lexical(source_path(config))) != normalize(approved)
          end) do
       nil -> :ok
       {target, config} -> {:error, {:routing_source_path_mismatch, target, source_path(config), approved}}
@@ -538,6 +583,163 @@ defmodule SymphonyElixir.PilotBootstrap do
       other -> {:error, other}
     end
   end
+
+  # real-path resolution
+
+  defp resolve_boundary(manifest, env) do
+    %{
+      entries: Map.new(boundary_paths(manifest), fn {name, path} -> {name, resolve_or_lexical(path)} end),
+      unresolvable: unresolvable_entries(manifest),
+      cwd: resolve_or_lexical(env.cwd),
+      protected_roots: Enum.map(env.protected_roots, &resolve_or_lexical/1)
+    }
+  end
+
+  defp boundary_paths(manifest) do
+    path_entries(manifest) ++ [{:approved_source_path, manifest.approved_source_path}]
+  end
+
+  defp unresolvable_entries(manifest) do
+    for {name, path} <- boundary_paths(manifest),
+        nonblank?(path),
+        {:error, reason} <- [resolve_path(path)] do
+      {name, path, reason}
+    end
+  end
+
+  defp resolve_or_lexical(path) when is_binary(path) do
+    case resolve_path(path) do
+      {:ok, resolved} -> resolved
+      {:error, _reason} -> normalize(path)
+    end
+  end
+
+  defp resolve_or_lexical(nil), do: nil
+
+  @link_hop_limit 32
+
+  # Resolves `path` to its real location by walking every existing ancestor:
+  # a junction or symlink found on the way is replaced by its target and the
+  # walk restarts from it (bounded), so the result names where the path actually
+  # lives. A missing tail is kept lexically, because nothing below a directory
+  # that does not exist can be a live link. Anything unreadable is an error,
+  # never a guess.
+  defp resolve_path(path) when is_binary(path) do
+    with {:ok, root, components} <- lexical_components(path) do
+      walk(root, [], components, 0)
+    end
+  end
+
+  defp resolve_path(_other), do: {:error, :not_a_path}
+
+  defp lexical_components(path) do
+    with {:ok, plain} <- strip_device_prefix(String.replace(path, <<92>>, "/")) do
+      split_root(plain)
+    end
+  end
+
+  defp strip_device_prefix(path) do
+    down = String.downcase(path)
+
+    cond do
+      String.starts_with?(down, "//./") -> {:error, :device_namespace_path}
+      String.starts_with?(down, "//?/unc/") -> {:ok, "//" <> String.slice(path, 8..-1//1)}
+      String.starts_with?(down, "//?/") -> {:ok, String.slice(path, 4..-1//1)}
+      true -> {:ok, path}
+    end
+  end
+
+  defp split_root("//" <> unc_rest) do
+    {:ok, "//", components(unc_rest)}
+  end
+
+  defp split_root(plain) do
+    if drive_root?(String.downcase(plain)) do
+      {_drive, rest} = String.split_at(plain, 2)
+      {:ok, String.slice(plain, 0, 2), components(rest)}
+    else
+      {:error, :not_absolute}
+    end
+  end
+
+  defp drive_root?(<<letter, ?:, _rest::binary>>) when letter in ?a..?z, do: true
+  defp drive_root?(_other), do: false
+
+  defp components(rest), do: String.split(rest, "/", trim: true)
+
+  defp walk(root, resolved, [], _hops), do: {:ok, join_root(root, resolved)}
+
+  defp walk(root, resolved, [component | rest], hops) when hops <= @link_hop_limit do
+    cond do
+      component == "." -> walk(root, resolved, rest, hops)
+      component == ".." -> walk_parent(root, resolved, rest, hops)
+      true -> walk_component(root, resolved, component, rest, hops)
+    end
+  end
+
+  defp walk(_root, _resolved, _components, _hops), do: {:error, :link_hop_limit_exceeded}
+
+  defp walk_parent(root, resolved, rest, hops) do
+    if resolved == [],
+      do: walk(root, [], rest, hops),
+      else: walk(root, Enum.drop(resolved, -1), rest, hops)
+  end
+
+  defp walk_component(root, resolved, component, rest, hops) do
+    candidate = join_root(root, resolved ++ [component])
+
+    case File.lstat(candidate) do
+      {:ok, %File.Stat{type: :symlink}} -> follow_link(root, resolved, component, rest, hops)
+      {:ok, %File.Stat{type: :directory}} -> walk(root, resolved ++ [component], rest, hops)
+      {:ok, %File.Stat{type: _leaf}} -> {:ok, lexical_tail(root, resolved ++ [component], rest)}
+      {:error, :enoent} -> {:ok, lexical_tail(root, resolved ++ [component], rest)}
+      {:error, reason} -> {:error, {:path_stat_failed, candidate, reason}}
+    end
+  end
+
+  defp follow_link(root, resolved, component, rest, hops) do
+    link_path = join_root(root, resolved ++ [component])
+
+    case File.read_link(link_path) do
+      {:ok, target} ->
+        case link_replacement(target) do
+          {:absolute, new_root, components} -> walk(new_root, [], components ++ rest, hops + 1)
+          {:relative, components} -> walk(root, resolved, components ++ rest, hops + 1)
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, {:link_target_unreadable, link_path, reason}}
+    end
+  end
+
+  defp link_replacement(target) do
+    with {:ok, plain} <- strip_device_prefix(String.replace(target, <<92>>, "/")) do
+      case split_root(plain) do
+        {:ok, root, components} -> {:absolute, root, components}
+        {:error, :not_absolute} -> {:relative, components(plain)}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  # The tail below a missing component cannot hold live links, so `.`/`..` and
+  # names are folded lexically onto the last resolved prefix.
+  defp lexical_tail(root, resolved, rest) do
+    resolved =
+      Enum.reduce(rest, resolved, fn
+        ".", acc -> acc
+        "..", acc -> if acc == [], do: acc, else: Enum.drop(acc, -1)
+        name, acc -> acc ++ [name]
+      end)
+
+    join_root(root, resolved)
+  end
+
+  defp join_root("//" = root, []), do: root
+  defp join_root("//" = root, components), do: root <> Enum.join(components, "/")
+  defp join_root(root, []), do: root
+  defp join_root(root, components), do: root <> "/" <> Enum.join(components, "/")
 
   # helpers
 
