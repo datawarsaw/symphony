@@ -51,7 +51,13 @@ defmodule SymphonyElixir.OpenCodeIntegrationSmokeTest do
     File.mkdir_p!(marker_root)
     Application.put_env(:symphony_elixir, :launch_marker_root, marker_root)
 
+    # PILOT-AUTH-F: launches pass the production credential preflight with a
+    # synthetic placeholder credential (offline, never authenticated).
+    saved_credential = System.get_env("ANTHROPIC_API_KEY")
+    System.put_env("ANTHROPIC_API_KEY", "sk-ant-synthetic-test-placeholder")
+
     on_exit(fn ->
+      restore_env("ANTHROPIC_API_KEY", saved_credential)
       Application.delete_env(:symphony_elixir, :launch_marker_root)
       File.rm_rf(workspace)
     end)

@@ -43,7 +43,14 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
     mock_exe = MockOpenCode.ensure_built!()
     Application.put_env(:symphony_elixir, :opencode_executable, mock_exe)
 
+    # PILOT-AUTH-F: the pinned pilot provider is a mapped allowlist identity
+    # ("anthropic"); the synthetic placeholder credential satisfies the
+    # production credential presence preflight offline.
+    saved_credential = System.get_env("ANTHROPIC_API_KEY")
+    System.put_env("ANTHROPIC_API_KEY", "sk-ant-synthetic-test-placeholder")
+
     on_exit(fn ->
+      restore_env("ANTHROPIC_API_KEY", saved_credential)
       Application.delete_env(:symphony_elixir, :opencode_executable)
       remove_temp_fixture_root!(root)
     end)
@@ -66,7 +73,7 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
   defp pilot(identifier, overrides \\ []) do
     %OpenCode{
       enabled: true,
-      provider: "mockprovider",
+      provider: "anthropic",
       model: "mock-model",
       timeout_ms: 15_000,
       allowed_tools: ["read", "glob"],
@@ -81,7 +88,7 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
       Keyword.merge(
         [
           opencode_enabled: true,
-          opencode_provider: "mockprovider",
+          opencode_provider: "anthropic",
           opencode_model: "mock-model",
           opencode_allowed_tools: ["read", "glob"],
           opencode_allowed_issues: [issue.identifier]
@@ -117,7 +124,7 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
 
   defp adapter_opts(%{state_root: state_root}, %Issue{} = issue, extra \\ []) do
     [
-      provider: "mockprovider",
+      provider: "anthropic",
       model: "mock-model",
       allowed_tools: ["read", "glob"],
       timeout_ms: 15_000,
@@ -167,7 +174,7 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
 
       assert {:opencode, snapshot} = Orchestrator.dispatch_harness_for_test(issue)
       assert %OpenCode{} = snapshot
-      assert snapshot.provider == "mockprovider"
+      assert snapshot.provider == "anthropic"
       assert snapshot.model == "mock-model"
       assert snapshot.allowed_tools == ["read", "glob"]
       assert snapshot.timeout_ms == 900_000
@@ -334,6 +341,43 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
       # NEVER_STARTED expectation is published and no marker is stranded.
       messages = drain_worker_mailbox()
       {:termination, _issue_id, %{termination_expectation: :NEVER_STARTED}} = termination_evidence(messages)
+      refute File.exists?(LaunchMarker.marker_path(issue.id, root: state_root))
+    end
+
+    # PILOT-AUTH-F: the armed pilot is refused at the credential presence
+    # preflight — before worker-process creation, before any launch
+    # directory or marker exists, with the pinned provider/model identity
+    # intact (no Codex or alternate-provider substitution).
+    test "an armed pilot without a provider credential is refused before worker creation", context do
+      %{issue: issue, state_root: state_root} = context
+      workspace = prepare_workspace!(context, issue)
+      enable_pilot!(issue)
+
+      saved_credential = System.get_env("ANTHROPIC_API_KEY")
+      System.delete_env("ANTHROPIC_API_KEY")
+
+      try do
+        error =
+          assert_raise AgentRunner.FailureError, fn ->
+            AgentRunner.run(issue, self(), dispatch_opts(context, pilot(issue.identifier)))
+          end
+
+        assert {:missing_provider_credential, "anthropic"} = error.reason
+        assert error.failure_class == :persistent_worker_failure
+        assert error.failure_info.message =~ "anthropic"
+
+        # No process was ever created, so no termination confirmation may be
+        # claimed either: the recipient sees a nil worker termination.
+        messages = drain_worker_mailbox()
+        {:termination, _issue_id, %{worker_termination: termination}} = termination_evidence(messages)
+        refute termination
+      after
+        restore_env("ANTHROPIC_API_KEY", saved_credential)
+      end
+
+      # The refusal precedes directory/config/marker creation and the child
+      # process: no launch state under the workspace, no stranded marker.
+      refute File.exists?(Path.join(workspace, ".symphony-state"))
       refute File.exists?(LaunchMarker.marker_path(issue.id, root: state_root))
     end
 

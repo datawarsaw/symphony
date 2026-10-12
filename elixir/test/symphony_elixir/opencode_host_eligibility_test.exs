@@ -48,7 +48,14 @@ defmodule SymphonyElixir.OpenCodeHostEligibilityTest do
     mock_exe = MockOpenCode.ensure_built!()
     Application.put_env(:symphony_elixir, :opencode_executable, mock_exe)
 
+    # PILOT-AUTH-F: the pinned pilot provider is a mapped allowlist identity
+    # ("anthropic"); the synthetic placeholder credential satisfies the
+    # production credential presence preflight offline.
+    saved_credential = System.get_env("ANTHROPIC_API_KEY")
+    System.put_env("ANTHROPIC_API_KEY", "sk-ant-synthetic-test-placeholder")
+
     on_exit(fn ->
+      restore_env("ANTHROPIC_API_KEY", saved_credential)
       Application.delete_env(:symphony_elixir, :opencode_executable)
       remove_temp_fixture_root!(root)
     end)
@@ -281,7 +288,7 @@ defmodule SymphonyElixir.OpenCodeHostEligibilityTest do
   defp pilot(identifier, overrides \\ []) do
     %OpenCode{
       enabled: true,
-      provider: "mockprovider",
+      provider: "anthropic",
       model: "mock-model",
       timeout_ms: 15_000,
       allowed_tools: ["read", "glob"],
@@ -293,7 +300,7 @@ defmodule SymphonyElixir.OpenCodeHostEligibilityTest do
   defp pilot_workflow do
     [
       opencode_enabled: true,
-      opencode_provider: "mockprovider",
+      opencode_provider: "anthropic",
       opencode_model: "mock-model",
       opencode_allowed_tools: ["read", "glob"],
       opencode_allowed_issues: ["MIC-HE-1", "MIC-HE-2", "MIC-HE-3"]
@@ -366,7 +373,7 @@ defmodule SymphonyElixir.OpenCodeHostEligibilityTest do
 
   defp adapter_opts(%{state_root: state_root}, %Issue{} = issue, extra \\ []) do
     [
-      provider: "mockprovider",
+      provider: "anthropic",
       model: "mock-model",
       allowed_tools: ["read", "glob"],
       timeout_ms: 15_000,

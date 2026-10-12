@@ -8,6 +8,16 @@ defmodule SymphonyElixir.OpenCodeParserSessionIntegrityTest do
 
   Code.require_file("../support/mock_opencode.exs", __DIR__)
 
+  # PILOT-AUTH-F: adapter launches in this suite pass the production
+  # credential preflight with a synthetic placeholder credential (offline,
+  # never authenticated).
+  setup do
+    saved_credential = System.get_env("ANTHROPIC_API_KEY")
+    System.put_env("ANTHROPIC_API_KEY", "sk-ant-synthetic-test-placeholder")
+    on_exit(fn -> restore_env("ANTHROPIC_API_KEY", saved_credential) end)
+    :ok
+  end
+
   @tag :windows_only
   test "Adapter fails closed for empty fixture session identity with existing classification" do
     workspace = Path.join(System.tmp_dir!(), "m1pf2-#{System.unique_integer([:positive])}")

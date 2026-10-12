@@ -6,6 +6,11 @@ defmodule SymphonyElixir.OpenCode.Adapter do
   - Local-host eligibility: a launch naming a remote worker_host is refused before any artifact exists;
     the adapter has no SSH execution path and never substitutes a local run for a remote one.
   - Explicit provider and model routing: rejects bare models and forbids automatic provider fallback.
+  - Credential presence preflight: an armed launch is refused before any directory, config, marker,
+    or process exists when the selected provider has no supported credential mapping, when no
+    supported nonempty credential variable resolves for it, or when an endpoint/base-URL override
+    would be inherited silently from the ambient environment. The check is presence-only and never
+    authenticates; provider and model identity stay pinned with no substitution.
   - Deny-by-default tool permissions: configuration is generated per launch with tools denied by default.
   - Effective config isolation: project config is disabled and inherited OpenCode config, permission, and home lookup are pinned to the launch directory.
   - Credential boundary: the child environment is an allowlist limited to the selected provider.
@@ -86,9 +91,10 @@ defmodule SymphonyElixir.OpenCode.Adapter do
 
   @doc """
   Starts an OpenCode process session.
-  Validates model/provider selection, prepares isolated environment,
-  writes deny-by-default config, records the durable launch marker, and opens
-  the contained Port.
+  Validates model/provider selection, refuses launches without a supported
+  credential for the selected provider (before any launch artifact exists),
+  prepares isolated environment, writes deny-by-default config, records the
+  durable launch marker, and opens the contained Port.
   """
   @spec start_session(Path.t(), String.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, prompt, opts \\ []) do
@@ -98,6 +104,7 @@ defmodule SymphonyElixir.OpenCode.Adapter do
 
     with :ok <- validate_host_eligibility(opts),
          {:ok, {provider, model}} <- validate_model_selection(opts),
+         :ok <- Environment.preflight_provider_credentials(provider, opts),
          {:ok, canonical_workspace} <- validate_workspace(workspace),
          {:ok, executable} <- resolve_executable(opts),
          {:ok, dirs} <- Environment.prepare_directories(canonical_workspace, launch_id),
