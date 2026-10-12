@@ -55,7 +55,10 @@ defmodule SymphonyElixir.OpenCode.Environment do
     "aws" => ["AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "AWS_SESSION_TOKEN"],
     "cloudflare" => ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"],
     "databricks" => ["DATABRICKS_TOKEN", "DATABRICKS_HOST"],
-    "codex" => ["CODEX_API_KEY"]
+    "codex" => ["CODEX_API_KEY"],
+    # Native OpenCode Go provider only; the separately billed "opencode" Zen
+    # provider is deliberately unmapped, so its launches are refused.
+    "opencode-go" => ["OPENCODE_API_KEY"]
   }
 
   @inherited_keys [

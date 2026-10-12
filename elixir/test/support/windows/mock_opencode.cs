@@ -373,6 +373,7 @@ class MockOpenCode
             + "\"LINEAR_API_KEY\":" + Present("LINEAR_API_KEY") + ","
             + "\"OPENAI_API_KEY\":" + Present("OPENAI_API_KEY") + ","
             + "\"ANTHROPIC_API_KEY\":" + Present("ANTHROPIC_API_KEY") + ","
+            + "\"OPENCODE_API_KEY\":" + Present("OPENCODE_API_KEY") + ","
             + "\"OPENCODE_PERMISSION\":" + Present("OPENCODE_PERMISSION") + ","
             + "\"OPENCODE_CONFIG_CONTENT\":" + Present("OPENCODE_CONFIG_CONTENT") + ","
             + "\"OPENCODE_DISABLE_PROJECT_CONFIG\":" + Present("OPENCODE_DISABLE_PROJECT_CONFIG") + ","
