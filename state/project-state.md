@@ -1,6 +1,131 @@
 # Symphony project state
 
-## PILOT-BOOT-F safe pilot bootstrap gate — 2026-10-11
+## PILOT-HARDEN-INT pilot safety integration — 2026-10-12
+
+Integration branch `pilot/pilot-harden-int`, worktree `C:/AI/symphony-workspaces/pilot-harden-int`,
+base `dbc83f2f3e5948bce19f1d2b7799ae2761458cf4` (PILOT-BOOT-F bootstrap gate candidate). Local
+candidate only: no push, merge into main, PR or deployment; the pilot was not started and no live
+pilot authorization is implied.
+
+### Verified inputs
+
+- F1 pilot-only dispatch guard: `c5e9d57208c78635f9ebdbd7b92fa13af2538559`, branch `pilot/guard-f1`,
+  worktree `C:/AI/symphony-workspaces/pilot-guard-f1` (clean).
+- F2 Windows path hardening: `f875912a1daaceab5000993b488584520264f8d5`, branch `hardening/pilot-guard-f2`,
+  worktree `C:/AI/symphony-workspaces/pilot-guard-f2` (clean).
+- F3 credential presence preflight: resolved reported `f14b6b3` to
+  `f14b6b30a65d7a650059e7b5fb014976ec73239e`, branch `pilot-auth-f/opencode-credential-preflight`,
+  worktree `C:/AI/symphony-workspaces/pilot-auth-f` (clean).
+- Each input is exactly one commit on top of `dbc83f2` (verified `git merge-base --is-ancestor`), and
+  the changed-file set of each matches its mandate with no unrelated changes. The Human Accepted M1
+  `cdbea16944b342f0fe7c11b4b6a8d40070903b80` remains an ancestor of `dbc83f2` — ancestry intact.
+
+### Integration method and conflict resolution
+
+Deterministic merge order F1 → F2 → F3, each as an explicit `--no-ff` merge so every original commit
+stays a reachable merge parent (identity preserved: `c5e9d57`, `f875912`, `f14b6b3` are parents of
+merge commits `06b3d6c`, `ef5a941`, `d004c9a` respectively). The predicted overlap in
+`elixir/lib/symphony_elixir/pilot_bootstrap.ex` (F1 alias/moduledoc/`PilotGuard.arm` vs F2 containment
+moduledoc and boundary rework) auto-merged under `ort` with no textual conflict. The auto-merge was
+verified semantically, not just textually: F1's `PilotGuard` alias, arming paragraph, and the
+`:ok = PilotGuard.arm(...)` call in `start/2` (armed after the hardened `:armed` preflight passes,
+before `ensure_all_started`) are all present, and F2's resolved-filesystem machinery
+(`resolve_boundary`/`resolve_path`/`walk`/link handling) is intact. Neither side's protections were
+discarded. Cumulative diff vs `dbc83f2` is exactly the union of the three inputs: 21 files,
++1788/−98 = F1 (+462/−3) + F2 (+657/−39) + F3 (+669/−56); every file touched by only one input is
+byte-identical to that input.
+
+### Variant B preserved
+
+`elixir/lib/symphony_elixir/retry_policy.ex` is byte-identical to the baseline (empty diff):
+`@max_attempts 10`, `@max_age_ms 2 * 60 * 60 * 1_000` (2-hour window), `@max_identical 3`. No token
+or cost budget, no single-attempt limit; operator-supervised execution assumptions unchanged.
+
+### Combined offline validation
+
+- `mix compile --warnings-as-errors`: pass.
+- Pilot suites (`pilot_bootstrap_test`, `pilot_bootstrap_windows_test`, `pilot_guard_test`):
+  45 tests, 0 failures.
+- OpenCode suites (credential preflight, dispatch, completion policy, event ordering, host
+  eligibility, integration smoke, offline acceptance, parser negative contract, parser session
+  integrity, terminal reason, opencode): 244 tests, 0 failures.
+- Retry/recovery/containment/harness suites (retry policy/envelope/store, parked/beam-death/wake
+  recovery, worker containment ×3, workspace root containment, harness authority/selection/isolation):
+  164 tests, 0 failures, 2 skipped.
+- `mix format --check-formatted`: pass. `mix specs.check`: pass.
+- Full suite once (`_int_full_tests.log`): 1504 tests, 56 failures, 12 skipped, 747.3 s.
+
+### Baseline failure-identity comparison
+
+Committed baseline (tracked `_cp0_baseline_tests.log`, 55 failures at ancestor `31529e5`) vs
+integration run (`_cmp_int_names.txt`): all 55 baseline failure identities reproduce with identical
+test names and modules; none disappeared or changed. One additional failure appeared in the
+integration full run only: `test a malformed chain with an extra entry stops on the first broken pair
+(SymphonyElixir.Delivery.DeliveryProofTest)`. Attribution as a scheduling/environment flake, not a
+regression: (a) the exact test and the whole 26-test file pass deterministically on the integration
+tree in isolation; (b) the `SymphonyElixir.Delivery` dependency graph (`Delivery.{Git,
+ArtifactManifest, Replay, Proof}`) has zero overlap with the six lib files the integration touches;
+(c) a control full-suite rerun on pristine `dbc83f2` (throwaway worktree, `_cmp_base_rerun_names.txt`)
+reproduced the identical 55-failure baseline set and did not reproduce this failure — the failure is
+order-dependent, not tree-dependent. Known inherited Windows-environment failures (e.g. the
+`Mix.Tasks.Workspace.BeforeRemoveTest` gh fake-binary group and the `/tmp` path-expansion config
+test) remain identical to baseline.
+
+### Combined safety invariants
+
+- Pilot startup requires the explicit reviewed manifest; nothing starts until the `:armed` gate
+  passes, and `--preflight-only` starts nothing and never arms (task calls `preflight/2`, not
+  `start/2`). Evidence: `pilot_bootstrap_test` suite.
+- The tracked default `WORKFLOW.md` cannot silently become the pilot workflow (identity checks
+  unchanged from PILOT-BOOT-F, now evaluated on resolved paths). Evidence: `pilot_bootstrap_test`.
+- Source SHA, workspace root and log root validated against resolved real paths. Evidence:
+  `pilot_bootstrap_test` + `pilot_bootstrap_windows_test`.
+- Junctions, directory/file symlinks, junction chains, ancestor junctions, link loops, device-path
+  aliases (forward and backslash) and noncanonical spellings cannot escape approved roots; in-bound
+  junctions and case/separator aliases keep passing. Evidence: `pilot_bootstrap_windows_test` (14 tests).
+- Armed pilot dispatches only explicitly authorized OpenCode issues; unlisted issues park instead of
+  falling back to Codex; invalid/disabled/unreadable OpenCode configuration parks instead of Codex
+  rescue; a durable pre-pilot Codex pin also parks. Evidence: `pilot_guard_test` (orchestrator-level
+  `refuse_codex_while_pilot_armed` rewrites every `{:dispatch, :codex, ...}` decision to a park).
+- Workflow reload cannot silently disarm the guard: the armed flag lives in the application
+  environment, set only by `PilotBootstrap.start/2`; dispatch-time code only reads it. Evidence:
+  `pilot_guard_test` "a workflow reload cannot disarm the guard or rescue an issue into Codex".
+- Missing, unmapped or empty provider credentials fail before worker launch — before any directory,
+  config, marker or process exists; presence is re-evaluated on every launch. Evidence:
+  `opencode_credential_preflight_test` (adapter-level `with` chain order).
+- Unexpected ambient endpoint/base-URL/host overrides fail closed; explicitly operator-supplied
+  `provider_auth` overrides pass; endpoint-shaped variables alone never satisfy presence. Evidence:
+  `opencode_credential_preflight_test`.
+- Credentials are not written to logs or launch artifacts: preflight is presence-only, never
+  authenticates, and error reasons/messages carry provider and variable names only — asserted
+  directly by "error reasons never contain credential values" and "failure messages name providers
+  and variables but never credential values". Limitation: this is enforced and tested for the
+  preflight/adapter surface, not an audit of every conceivable log statement in the codebase.
+- Durable harness pinning and termination containment remain intact (harness authority/isolation,
+  worker containment, recovery suites all green; F1 composes with pinning rather than replacing it).
+- Non-pilot behavior unchanged: guard reads as unarmed outside bootstrap arming (malformed record
+  fails open to unarmed routing, never silently armed), and non-pilot Codex dispatch/failover/rescue
+  tests pass unchanged.
+- Carried limitations (inherited from F2/F3 designs, restated): boundary resolution is a
+  validation-time control, not sandboxing — TOCTOU replacement of a path component after the check
+  and 8.3 short-name prefix matching remain possible; OS-level isolation is still the only absolute
+  boundary. Credential preflight proves presence only, never validity or non-expiry. The one
+  DeliveryProof flake above is not explained by, and is orthogonal to, this integration.
+
+### Pilot and protected state at closeout
+
+- Prepared pilot source checkout `C:/AI/symphony-workspaces/pilot-m1-opencode/source`: still detached
+  at the accepted M1 `cdbea16944b342f0fe7c11b4b6a8d40070903b80`, clean, not moved, not armed.
+- `C:/Users/micha/symphony-source` (`c90e2ad`, clean) and `C:/Users/micha/symphony-runtime`:
+  untouched. No Symphony runtime, OpenCode worker or BEAM process is running (verified); no tracker,
+  provider or network call was made; no real credential was read, written or copied (preflight tests
+  use synthetic values).
+- GO/NO-GO for independent review: GO. Prerequisites met — inputs verified with exact SHAs and
+  ancestry; integration is a clean union with verified conflict semantics; all focused suites,
+  compile, format and specs gates green; full-suite delta vs baseline is exactly one
+  attributed-and-orthogonal flake; Variant B unchanged; pilot not moved, armed or authorized.
+
+
 
 Branch `pilot/pilot-boot-f`, exact base `e65d1854351880b77bffad8fff4f755d8e9ee028` (the procedure
 documentation commit on top of the Human Accepted M1 candidate
