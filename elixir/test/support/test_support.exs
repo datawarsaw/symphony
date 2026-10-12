@@ -11,6 +11,7 @@ defmodule SymphonyElixir.TestSupport do
     :workflow_file_path,
     :server_port_override,
     :memory_tracker_issues,
+    :pilot_guard,
     :retry_store_root
   ]
 

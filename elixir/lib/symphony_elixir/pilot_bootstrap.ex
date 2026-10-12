@@ -23,6 +23,7 @@ defmodule SymphonyElixir.PilotBootstrap do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.HarnessSelection
   alias SymphonyElixir.LogFile
+  alias SymphonyElixir.PilotGuard
   alias SymphonyElixir.RepositoryRouter
   alias SymphonyElixir.Tracker.Issue
   alias SymphonyElixir.Workflow
@@ -89,6 +90,10 @@ defmodule SymphonyElixir.PilotBootstrap do
   tracked production workflow and the disk log cannot fall back to the default
   runtime location. A refusal returns before either is touched, leaving no
   partial configuration behind.
+
+  A start that passes also arms the pilot dispatch guard
+  (`SymphonyElixir.PilotGuard`), so once running, the pilot parks any issue it
+  cannot authorize on the OpenCode harness instead of falling back to Codex.
   """
   @spec start(Path.t(), keyword()) :: {:ok, report()} | {:error, term()}
   def start(manifest_path, opts \\ []) do
@@ -97,6 +102,10 @@ defmodule SymphonyElixir.PilotBootstrap do
     with {:ok, report} <- preflight(manifest_path, Keyword.merge(opts, mode: :armed)) do
       :ok = Workflow.set_workflow_file_path(report.workflow_path)
       Application.put_env(:symphony_elixir, :log_file, report.log_file)
+      # PILOT-GUARD-F1: armed before the runtime starts so no poll or dispatch
+      # can outrun the guard. Application environment, not WORKFLOW.md: a
+      # workflow reload can change the allowlist but never disarm the guard.
+      :ok = PilotGuard.arm(workflow_path: report.workflow_path, source_sha: report.source_sha)
 
       case env.ensure_all_started.() do
         {:ok, _started} -> {:ok, report}
