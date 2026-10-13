@@ -258,6 +258,129 @@ defmodule SymphonyElixir.PilotBootstrapTest do
     assert failure?(failures, :worker_containment)
   end
 
+  # -- resolved-tools admission wiring (PILOT-TOOL-CONFIG-FIX) ---------------
+
+  test "an armed gate proves the resolved tools of the generated configuration", %{root: root} do
+    armed = armed_workflow_opts(root)
+    write_tracked_default(root)
+    write_pilot_workflow(root, armed)
+    manifest = write_manifest(root, armed_manifest_opts(root))
+    test_pid = self()
+
+    gate_opts =
+      Keyword.put(gate(root), :verify_resolved_tools, fn config ->
+        send(test_pid, {:resolved_tools_probe, config})
+        :ok
+      end)
+
+    assert {:ok, report} = PilotBootstrap.preflight(manifest, gate_opts ++ [mode: :armed])
+
+    assert report.armed_ready?
+    assert report.arming_blockers == []
+
+    # The gate validates exactly the document a launch would write: the
+    # wildcard-free explicit shape with the workflow allowlist enabled.
+    assert_received {:resolved_tools_probe, config}
+    refute Map.has_key?(config["permission"], "*")
+
+    assert config["tools"] |> Enum.filter(fn {_tool, enabled?} -> enabled? end) |> Enum.map(&elem(&1, 0)) |> Enum.sort() ==
+             ["edit", "read"]
+
+    assert config["permission"]["bash"] == "deny"
+    refute_received {:resolved_tools_probe, _}
+  end
+
+  test "an armed configuration whose resolved tools fail validation is refused", %{root: root} do
+    armed = armed_workflow_opts(root)
+    write_tracked_default(root)
+    write_pilot_workflow(root, armed)
+    manifest = write_manifest(root, armed_manifest_opts(root))
+
+    # The R3 failure signature: a permitted tool resolves disabled.
+    reason = {:resolved_tools_disabled, ["read"]}
+
+    gate_opts =
+      Keyword.put(gate(root), :verify_resolved_tools, fn _config -> {:error, reason} end)
+
+    assert {:ok, report} = PilotBootstrap.preflight(manifest, gate_opts)
+    refute report.armed_ready?
+
+    assert List.keyfind(report.arming_blockers, :opencode_resolved_tools, 0) ==
+             {:opencode_resolved_tools, reason}
+
+    assert {:error, {:pilot_bootstrap_refused, failures}} =
+             PilotBootstrap.preflight(manifest, gate_opts ++ [mode: :armed])
+
+    assert List.keyfind(failures, :opencode_resolved_tools, 0) == {:opencode_resolved_tools, reason}
+
+    test_pid = self()
+
+    ensure = fn ->
+      send(test_pid, :runtime_started)
+      {:ok, []}
+    end
+
+    assert {:error, {:pilot_bootstrap_refused, _}} =
+             PilotBootstrap.start(manifest, [ensure_all_started: ensure] ++ gate_opts)
+
+    refute_received :runtime_started
+    refute PilotGuard.armed?()
+  end
+
+  test "a disabled OpenCode section runs no resolution probe", %{root: root} do
+    write_tracked_default(root)
+    write_pilot_workflow(root)
+    manifest = write_manifest(root)
+    test_pid = self()
+
+    gate_opts =
+      Keyword.put(gate(root), :verify_resolved_tools, fn config ->
+        send(test_pid, {:resolved_tools_probe, config})
+        :ok
+      end)
+
+    assert {:ok, report} = PilotBootstrap.preflight(manifest, gate_opts)
+
+    refute report.armed_ready?
+    refute_received {:resolved_tools_probe, _}
+  end
+
+  test "the default probe refuses arming when no OpenCode executable can be resolved", %{root: root} do
+    armed = armed_workflow_opts(root)
+    write_tracked_default(root)
+    write_pilot_workflow(root, armed)
+    manifest = write_manifest(root, armed_manifest_opts(root))
+
+    previous = Application.get_env(:symphony_elixir, :opencode_executable)
+    on_exit(fn -> restore_app_env({:opencode_executable, previous}) end)
+    Application.put_env(:symphony_elixir, :opencode_executable, "definitely-not-opencode-r4.exe")
+
+    # The real default check, offline: a missing executable cannot prove the
+    # resolution, so the gate fails closed before anything can start.
+    assert {:error, {:pilot_bootstrap_refused, failures}} =
+             PilotBootstrap.preflight(manifest, Keyword.delete(gate(root), :verify_resolved_tools) ++ [mode: :armed])
+
+    assert {:opencode_resolved_tools, {:executable_not_found, "definitely-not-opencode-r4.exe"}} =
+             List.keyfind(failures, :opencode_resolved_tools, 0)
+  end
+
+  @tag :windows_only
+  test "the armed gate passes when the installed CLI resolves the pilot configuration", %{root: root} do
+    armed = armed_workflow_opts(root)
+    write_tracked_default(root)
+    write_pilot_workflow(root, armed)
+    manifest = write_manifest(root, armed_manifest_opts(root))
+
+    assert {:ok, report} =
+             PilotBootstrap.preflight(
+               manifest,
+               Keyword.delete(gate(root), :verify_resolved_tools) ++ [mode: :armed]
+             )
+
+    assert report.armed_ready?
+    assert report.arming_blockers == []
+  end
+
   test "the routing contract refuses an unlabelled issue once a target is authorized" do
     routing = %SymphonyElixir.Config.Schema.Routing{
       targets: %{@target => %{"source_path" => "C:/pilot/approved-source"}}
@@ -326,7 +449,14 @@ defmodule SymphonyElixir.PilotBootstrapTest do
   # -- helpers --------------------------------------------------------------
 
   defp gate(root) do
-    [cwd: source_elixir(root), git: git_stub(@sha)]
+    [
+      cwd: source_elixir(root),
+      git: git_stub(@sha),
+      # Hermetic resolved-tools probe default: the probe's own resolution
+      # behavior is exercised by the focused OpenCode suites and by the
+      # real-CLI arming tests below; the gate wiring tests stub it.
+      verify_resolved_tools: fn _config -> :ok end
+    ]
   end
 
   defp git_stub(sha, status \\ "") do

@@ -404,7 +404,7 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
                Config.build(allowed_tools: ["unauthorized_exec"])
 
       assert {:ok, config} = Config.build(allowed_tools: ["read", "bash"])
-      assert config["permission"]["*"] == "deny"
+      refute Map.has_key?(config["permission"], "*")
       assert config["permission"]["read"] == "allow"
       assert config["permission"]["bash"] == "allow"
       assert config["permission"]["edit"] == "deny"
@@ -536,7 +536,7 @@ defmodule SymphonyElixir.OpenCodeOfflineAcceptanceTest do
       assert File.exists?(config_path)
 
       assert {:ok, launch_config} = Jason.decode(File.read!(config_path))
-      assert launch_config["permission"]["*"] == "deny"
+      refute Map.has_key?(launch_config["permission"] || %{}, "*")
       assert launch_config["permission"]["read"] == "allow"
       assert launch_config["permission"]["glob"] == "allow"
       assert launch_config["permission"]["edit"] == "deny"

@@ -15,6 +15,12 @@ defmodule SymphonyElixir.PilotBootstrap do
   worker dispatch or provider call - when something is missing, invalid,
   unverifiable, or points at a protected path.
 
+  For an armed OpenCode section the gate also proves the tool contract
+  mechanically (`PILOT-TOOL-CONFIG-FIX`): the generated configuration is
+  resolved by the installed CLI exactly as a launch would resolve it, and a
+  document that resolves to different tool enablement than it declares
+  refuses admission before any process runs.
+
   Containment is not decided lexically. Every boundary-relevant path - the pilot
   root, the manifest entries, the protected roots and the working directory - is
   resolved against the real filesystem by walking each existing ancestor, so
@@ -35,13 +41,20 @@ defmodule SymphonyElixir.PilotBootstrap do
   does not eliminate, the window.
 
   The gate is policy plus filesystem and `git` inspection. It contacts no tracker,
-  prepares no workspace, invokes no provider and starts no process, so it runs
-  offline and is safe to repeat.
+  prepares no workspace, invokes no provider and starts no worker, so it runs
+  offline and is safe to repeat. The one child process it may start is the
+  bounded OpenCode configuration-resolution probe for an enabled arming
+  section: `opencode debug agent build` in an isolated sandbox under an
+  allowlisted, credential-free environment
+  (`SymphonyElixir.OpenCode.Config.verify_resolved_tools/2`). It reads no
+  credential, contacts no provider, calls no model and launches no worker; it
+  only proves how the installed CLI resolves the generated document.
   """
 
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.HarnessSelection
   alias SymphonyElixir.LogFile
+  alias SymphonyElixir.OpenCode.Config
   alias SymphonyElixir.PilotGuard
   alias SymphonyElixir.RepositoryRouter
   alias SymphonyElixir.Tracker.Issue
@@ -62,7 +75,8 @@ defmodule SymphonyElixir.PilotBootstrap do
           cwd: Path.t() | nil,
           git: (Path.t(), [String.t()] -> {:ok, String.t()} | {:error, term()}),
           protected_roots: [Path.t()],
-          ensure_all_started: (-> {:ok, [atom()]} | {:error, term()})
+          ensure_all_started: (-> {:ok, [atom()]} | {:error, term()}),
+          verify_resolved_tools: (map() -> :ok | {:error, term()})
         }
 
   @type report :: map()
@@ -84,7 +98,7 @@ defmodule SymphonyElixir.PilotBootstrap do
     with {:ok, manifest} <- load_manifest(manifest_path) do
       loaded = load_settings(manifest.workflow_path)
       boundary = boundary_checks(manifest, env, loaded)
-      arming = arming_checks(manifest, loaded)
+      arming = arming_checks(manifest, loaded, env)
       failures = failures(boundary)
       blockers = failures(arming)
 
@@ -141,6 +155,10 @@ defmodule SymphonyElixir.PilotBootstrap do
       ensure_all_started:
         Keyword.get(opts, :ensure_all_started, fn ->
           Application.ensure_all_started(:symphony_elixir)
+        end),
+      verify_resolved_tools:
+        Keyword.get(opts, :verify_resolved_tools, fn config ->
+          Config.verify_resolved_tools(config)
         end)
     }
   end
@@ -471,10 +489,11 @@ defmodule SymphonyElixir.PilotBootstrap do
 
   # arming checks
 
-  defp arming_checks(manifest, loaded) do
+  defp arming_checks(manifest, loaded, env) do
     [
       {:tracker_arming, check_tracker_arming(loaded)},
       {:opencode_arming, check_opencode_arming(loaded)},
+      {:opencode_resolved_tools, check_opencode_resolved_tools(loaded, env)},
       {:routing_arming, check_routing_arming(manifest, loaded)},
       {:route_proof, check_route_proof(manifest, loaded)},
       {:harness_selection, check_harness_selection(loaded)}
@@ -509,6 +528,27 @@ defmodule SymphonyElixir.PilotBootstrap do
   end
 
   defp check_opencode_arming({:error, reason}), do: {:error, reason}
+
+  # PILOT-TOOL-CONFIG-FIX admission check: an enabled OpenCode section must
+  # prove that the installed CLI resolves the generated configuration to
+  # exactly the declared tool enablement before the pilot can be armed. The
+  # probe runs offline in an isolated sandbox (no credential, no provider, no
+  # model call, no worker) and any refusal fails the arming gate closed. A
+  # section that does not enable OpenCode needs no proof and runs no process -
+  # arming already refuses it on the opencode_arming check.
+  defp check_opencode_resolved_tools({:ok, settings}, env) do
+    opencode = settings.opencode
+
+    if opencode.enabled == true do
+      with {:ok, config} <- Config.build(allowed_tools: opencode.allowed_tools) do
+        env.verify_resolved_tools.(config)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp check_opencode_resolved_tools({:error, reason}, _env), do: {:error, reason}
 
   defp check_routing_arming(manifest, {:ok, settings}) do
     targets = settings.routing.targets || %{}

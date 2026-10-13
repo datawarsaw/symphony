@@ -42,7 +42,7 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert config["$schema"] == "https://opencode.ai/config.json"
       assert config["plugin"] == []
       assert is_map(config["permission"])
-      assert config["permission"]["*"] == "deny"
+      refute Map.has_key?(config["permission"], "*")
       assert config["permission"]["read"] == "deny"
       assert config["permission"]["edit"] == "deny"
       assert config["permission"]["bash"] == "deny"
@@ -57,7 +57,11 @@ defmodule SymphonyElixir.OpenCodeTest do
       assert config["permission"]["glob"] == "allow"
       assert config["permission"]["edit"] == "deny"
       assert config["permission"]["bash"] == "deny"
-      assert config["permission"]["*"] == "deny"
+      refute Map.has_key?(config["permission"], "*")
+
+      # Deny-by-default is explicit: every unlisted known tool carries its own
+      # deny rule (15 known tools, 2 allowed here).
+      assert Enum.count(config["permission"], fn {_tool, action} -> action == "deny" end) == 13
     end
 
     test "unrestricted permissions fail closed" do
@@ -92,7 +96,103 @@ defmodule SymphonyElixir.OpenCodeTest do
       parsed = Jason.decode!(File.read!(sub_file))
       assert parsed["permission"]["read"] == "allow"
       assert parsed["permission"]["bash"] == "deny"
-      assert parsed["permission"]["*"] == "deny"
+      refute Map.has_key?(parsed["permission"], "*")
+    end
+  end
+
+  # ===========================================================================
+  # 1b. Resolved tool validation (PILOT-TOOL-CONFIG-FIX)
+  #
+  # opencode 1.18.28 resolves a document combining a tools object with a
+  # wildcard-denied permission map ("*" => "deny") to a worker agent with
+  # every tool disabled — the R3 live failure. The generated document carries
+  # no wildcard, and Config.verify_resolved_tools/2 proves the installed CLI
+  # resolves it with exactly the intended tool enablement, fail-closed.
+  # ===========================================================================
+
+  describe "Resolved tool validation" do
+    @pilot_allowlist [:read, :edit]
+
+    @pilot_permission %{
+      "read" => "allow",
+      "edit" => "allow",
+      "glob" => "deny",
+      "grep" => "deny",
+      "list" => "deny",
+      "bash" => "deny",
+      "task" => "deny",
+      "external_directory" => "deny",
+      "todowrite" => "deny",
+      "question" => "deny",
+      "webfetch" => "deny",
+      "websearch" => "deny",
+      "lsp" => "deny",
+      "doom_loop" => "deny",
+      "skill" => "deny"
+    }
+
+    test "the generated pilot document keeps explicit deny rules without a permission wildcard" do
+      {:ok, config} = Config.build(allowed_tools: @pilot_allowlist)
+
+      refute Map.has_key?(config["permission"], "*")
+      assert config["permission"] == @pilot_permission
+      assert config["tools"] == %{
+               "read" => true,
+               "edit" => true,
+               "glob" => false,
+               "grep" => false,
+               "list" => false,
+               "bash" => false,
+               "task" => false,
+               "external_directory" => false,
+               "todowrite" => false,
+               "question" => false,
+               "webfetch" => false,
+               "websearch" => false,
+               "lsp" => false,
+               "doom_loop" => false,
+               "skill" => false
+             }
+    end
+
+    test "the R3 wildcard-denied document fails closed before any process runs" do
+      {:ok, config} = Config.build(allowed_tools: @pilot_allowlist)
+      r3_document = Map.update!(config, "permission", &Map.put(&1, "*", "deny"))
+
+      assert {:error, :wildcard_permission_forbidden} =
+               Config.verify_resolved_tools(r3_document, executable: "unused-opencode.exe")
+    end
+
+    test "the resolution probe fails closed when no OpenCode executable can be resolved" do
+      {:ok, config} = Config.build(allowed_tools: @pilot_allowlist)
+
+      assert {:error, {:executable_not_found, _}} =
+               Config.verify_resolved_tools(config, executable: "definitely-not-opencode.exe")
+    end
+
+    @tag :windows_only
+    test "installed OpenCode resolves the pilot document with read/edit enabled and the rest disabled" do
+      {:ok, config} = Config.build(allowed_tools: @pilot_allowlist)
+
+      assert :ok = Config.verify_resolved_tools(config, timeout_ms: 60_000)
+    end
+
+    @tag :windows_only
+    test "installed OpenCode resolves a deny-all document with no executable tools" do
+      {:ok, config} = Config.build(allowed_tools: [])
+
+      assert :ok = Config.verify_resolved_tools(config, timeout_ms: 60_000)
+    end
+
+    @tag :windows_only
+    test "the validation fails when the installed CLI resolves an enabled tool as disabled" do
+      # tools claims bash is enabled while permission denies it: the resolved
+      # agent must not be blessed, catching any future tools/permission drift.
+      {:ok, config} = Config.build(allowed_tools: @pilot_allowlist)
+      inconsistent = put_in(config, ["tools", "bash"], true)
+
+      assert {:error, {:resolved_tools_disabled, ["bash"]}} =
+               Config.verify_resolved_tools(inconsistent, timeout_ms: 60_000)
     end
   end
 
@@ -1604,7 +1704,7 @@ defmodule SymphonyElixir.OpenCodeTest do
 
         assert config_status == 0
         parsed = Jason.decode!(config_out)
-        assert parsed["permission"]["*"] == "deny"
+        refute Map.has_key?(parsed["permission"] || %{}, "*")
         assert parsed["permission"]["bash"] == "deny"
         assert parsed["permission"]["edit"] == "deny"
         assert parsed["permission"]["read"] == "allow"

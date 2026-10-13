@@ -14,10 +14,15 @@ defmodule Mix.Tasks.Symphony.PilotBootstrap do
   source identity does not match, the workflow is the tracked production file,
   the workspace or log root is outside the pilot, the routing contract is not
   exactly one approved target, or an authorized issue would not select the
-  OpenCode harness.
+  OpenCode harness. For an enabled OpenCode section, arming additionally
+  requires the installed CLI to resolve the generated configuration to exactly
+  the declared tool enablement.
 
   The gate never contacts a tracker or a provider. It reads the manifest, the
-  workflow file and local `git` state only.
+  workflow file and local `git` state only. Its one possible child process is
+  the bounded, offline OpenCode resolution probe (`opencode debug agent build`
+  in an isolated, credential-free sandbox) - no credential is read, no provider
+  is contacted, no model is called and no worker is launched.
   """
 
   use Mix.Task

@@ -347,6 +347,22 @@ defmodule SymphonyElixir.OpenCodeConfigTest do
         assert {:error, {:unknown_tool_permission, ["teleport"]}} =
                  @adapter_contract_module.build(allowed_tools: ["teleport"])
       end
+
+      # PILOT-TOOL-CONFIG-FIX: a wildcard-denied permission map combined with
+      # the tools map disables every resolved tool in opencode 1.18.28, so the
+      # deny-by-default contract is explicit per-tool entries and no wildcard.
+      test "the generated document denies unlisted tools explicitly without a permission wildcard" do
+        allowed = MapSet.new(["read", "edit"])
+
+        assert {:ok, adapter_config} = @adapter_contract_module.build(allowed_tools: MapSet.to_list(allowed))
+
+        refute Map.has_key?(adapter_config["permission"], "*")
+
+        denied =
+          for {tool, "deny"} <- adapter_config["permission"], into: MapSet.new(), do: tool
+
+        assert MapSet.equal?(denied, MapSet.difference(MapSet.new(OpenCode.known_tool_names()), allowed))
+      end
     end
   end
 
