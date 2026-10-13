@@ -217,7 +217,7 @@ defmodule SymphonyElixir.RetryStore do
       when is_binary(workspace_root) and is_binary(issue_id) and is_map(pin) do
     case read_record(workspace_root, issue_id) do
       {:ok, record} ->
-        write_record(workspace_root, Map.merge(record, harness_field_map(pin)))
+        write_record(workspace_root, promote_readmitted_pin(record, harness_field_map(pin)))
 
       {:error, :not_found} ->
         write_lifecycle_pin(workspace_root, %{
@@ -238,6 +238,18 @@ defmodule SymphonyElixir.RetryStore do
         :ok
     end
   end
+
+  # PILOT-R4-READMISSION: committing a harness pin IS the launch of the
+  # re-admitted attempt, so the record leaves the resting "readmitted" state
+  # for the ordinary "active" lifecycle and the PILOT-R3 restart safety (a
+  # durable active record parks on recovery) covers a crash while that
+  # attempt is in flight. The embedded readmission evidence is preserved
+  # verbatim.
+  defp promote_readmitted_pin(%{"status" => "readmitted"} = record, pin_fields) do
+    record |> Map.merge(pin_fields) |> Map.put("status", "active")
+  end
+
+  defp promote_readmitted_pin(record, pin_fields), do: Map.merge(record, pin_fields)
 
   @doc """
   Parks a record whose harness authority is missing or contradictory.

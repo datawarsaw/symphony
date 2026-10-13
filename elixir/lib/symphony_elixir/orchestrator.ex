@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
 
   alias SymphonyElixir.{AgentRunner, Config, RepositoryRouter, StatusDashboard, Steering, Tracker, Workspace}
-  alias SymphonyElixir.{DispatchRouter, FailureClass, LaunchMarker, PilotGuard, RetryPolicy, RetryStore, RuntimeLease, WorkerContainment, WorkerFence}
+  alias SymphonyElixir.{DispatchRouter, FailureClass, LaunchMarker, PilotGuard, PilotReadmit, RetryPolicy, RetryStore, RuntimeLease, WorkerContainment, WorkerFence}
   alias SymphonyElixir.Wake.Ledger
   alias SymphonyElixir.Codex.WorkerRouting
   alias SymphonyElixir.Tracker.Issue
@@ -3123,6 +3123,9 @@ defmodule SymphonyElixir.Orchestrator do
       is_binary(issue_id) and status in ["active", "continuing"] ->
         recover_harness_lifecycle_record(state, record, root, issue_id, status)
 
+      is_binary(issue_id) and status == "readmitted" ->
+        recover_readmitted_record(state, record, root, issue_id)
+
       true ->
         recover_failure_retry_record(state, record, root)
     end
@@ -3225,6 +3228,51 @@ defmodule SymphonyElixir.Orchestrator do
     else
       state
     end
+  end
+
+  # PILOT-R4-READMISSION: restart recovery of an operator-authorized
+  # re-admission record ("readmitted"). Only the offline
+  # `mix symphony.pilot_readmit` procedure writes that status — no runtime
+  # path creates it — and it authorizes exactly ONE new dispatch attempt for
+  # the issue through the ordinary poller. Recovery therefore restores the
+  # validated harness pin and deliberately claims nothing: the issue is
+  # poller-admissible, and the single-attempt funnel guards the new attempt
+  # exactly as it guarded the consumed one, so the re-admitted dispatch
+  # parks again on completion or failure and only a fresh explicit
+  # re-admission can release it. Fail closed: a "readmitted" record with
+  # missing or invalid readmission evidence, or one read outside an armed
+  # OpenCode pilot, claims the issue with no timer, like any other
+  # ambiguous record.
+  defp recover_readmitted_record(%State{} = state, record, _root, issue_id) do
+    with class_name when is_binary(class_name) <- Map.get(record, "failure_class"),
+         {:ok, _class} <- FailureClass.from_name(class_name),
+         attempt_count when is_integer(attempt_count) and attempt_count >= 1 <- Map.get(record, "attempt_count"),
+         {:ok, readmission} <- PilotReadmit.validate_readmission_evidence(Map.get(record, "readmission")),
+         {:ok, harness, authority, evidence} <- classify_recovered_harness(state, issue_id, record) do
+      if pilot_single_attempt_suppression?(state, issue_id, %{harness: harness}) do
+        Logger.warning(
+          "Pilot re-admission: operator-authorized record for issue_id=#{issue_id} " <>
+            "issue_identifier=#{Map.get(record, "identifier", issue_id)} " <>
+            "readmission_id=#{Map.get(readmission, "readmission_id")}; one new attempt admitted through the poller, " <>
+            "single-attempt policy applies to it"
+        )
+
+        put_harness_pin(state, issue_id, %{harness: harness, authority: authority, evidence: evidence})
+      else
+        fail_closed_readmitted_record(state, issue_id, :outside_armed_opencode_pilot)
+      end
+    else
+      _ -> fail_closed_readmitted_record(state, issue_id, :invalid_readmission_evidence)
+    end
+  end
+
+  defp fail_closed_readmitted_record(%State{} = state, issue_id, reason) do
+    Logger.warning(
+      "Ambiguous readmitted retry record issue_id=#{inspect(issue_id)} reason=#{inspect(reason)}; " <>
+        "failing closed with claim and no timer"
+    )
+
+    %{state | claimed: MapSet.put(state.claimed, issue_id)}
   end
 
   defp classify_recovered_harness(%State{} = state, issue_id, record) do
