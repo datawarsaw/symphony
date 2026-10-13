@@ -7,8 +7,13 @@ defmodule Mix.Tasks.Symphony.PilotBootstrap do
       mix symphony.pilot_bootstrap --manifest <path> [--preflight-only]
 
   Without `--preflight-only` the task starts the orchestrator only after the
-  `:armed` gate passes, then blocks until the application supervisor exits. With
-  `--preflight-only` it reports readiness and exits without starting anything.
+  `:armed` gate passes, then blocks until the application supervisor exits.
+  While it waits, a valid, exact-instance runtime stop request
+  (`mix symphony.stop_request`, or the documented stop.request file) triggers
+  a guarded graceful stop: supervised termination, then the authority lease is
+  released and its removal verified — no stale-lease recovery needed after a
+  normal stop. With `--preflight-only` it reports readiness and exits without
+  starting anything.
 
   Both modes refuse with a non-zero exit code when the manifest is missing, the
   source identity does not match, the workflow is the tracked production file,
@@ -28,6 +33,7 @@ defmodule Mix.Tasks.Symphony.PilotBootstrap do
   use Mix.Task
 
   alias SymphonyElixir.PilotBootstrap
+  alias SymphonyElixir.RuntimeShutdown
 
   @switches [manifest: :string, preflight_only: :boolean, protected_root: :keep, help: :boolean]
 
@@ -102,16 +108,10 @@ defmodule Mix.Tasks.Symphony.PilotBootstrap do
   end
 
   defp wait_for_shutdown do
-    case Process.whereis(SymphonyElixir.Supervisor) do
-      nil ->
-        Mix.raise("symphony.pilot_bootstrap: runtime supervisor is not running")
-
-      pid ->
-        ref = Process.monitor(pid)
-
-        receive do
-          {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
-        end
+    case RuntimeShutdown.wait_for_shutdown() do
+      :ok -> :ok
+      {:error, {:supervisor_exited, _reason}} -> :ok
+      {:error, :supervisor_not_running} -> Mix.raise("symphony.pilot_bootstrap: runtime supervisor is not running")
     end
   end
 

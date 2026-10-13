@@ -171,10 +171,24 @@ class MockOpenCode
             return exitCode;
         }
 
-        if (mode == "tool-failure" || mode == "tool-error")
+        if (mode == "tool-failure")
         {
             WriteStepStart(sessionId, "msg_err");
             WriteToolUse(sessionId, "toolu_err", "msg_err", "read", "call_err", "error", "permission denied");
+            WriteStepFinish(sessionId, "stop", "msg_err", 100, 200, 25, 50, 10, 0.005);
+            return (exitCode != 0) ? exitCode : 0;
+        }
+
+        // M1-COMPLETION-POLICY (PILOT-LIVE-R4): the verbatim OpenCode
+        // permission-rule rejection (rules list genericized to workspace-shaped
+        // paths; the load-bearing phrase is byte-identical), so
+        // --mock-mode=tool-error exercises the recovered containment-denial
+        // policy with the exact real-world signature.
+        if (mode == "tool-error")
+        {
+            WriteStepStart(sessionId, "msg_err");
+            WriteToolUse(sessionId, "toolu_err", "msg_err", "read", "call_err", "error",
+                "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{\"permission\":\"external_directory\",\"action\":\"deny\",\"pattern\":\"*\"},{\"permission\":\"external_directory\",\"pattern\":\"C:\\\\workspace\\\\allowed\\\\*\",\"action\":\"allow\"}]");
             WriteStepFinish(sessionId, "stop", "msg_err", 100, 200, 25, 50, 10, 0.005);
             return (exitCode != 0) ? exitCode : 0;
         }

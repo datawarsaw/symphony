@@ -7,7 +7,12 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
   1. Protocol completion (completion_state: :completed) reflects wire protocol completion
      and is preserved even when tool failures occurred during previous steps.
   2. Tool failures are recorded separately in tool_failures, and remain disqualifying
-     for authoritative worker success by default.
+     for authoritative worker success by default. (M1-COMPLETION-POLICY / PILOT-LIVE-R4)
+     A tool failure that is an OpenCode permission-rule rejection whose deny held — the
+     exact R4 containment signature — is recovered containment evidence: it never
+     disqualifies an otherwise-clean completed run. Generic permission wording,
+     including ordinary EACCES/EPERM execution errors, is not containment evidence
+     and fails closed.
   3. Fatal failure_evidence is preserved for malformed data, top-level errors, and
      incomplete streams.
   4. Terminal reasons include stop, unknown, and other; tool-calls is intermediate.
@@ -17,7 +22,9 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
   6. length, content-filter, unknown, and other are terminal observations but NOT
      clean success.
   7. Adapter success strictly requires: exit 0, eligible protocol completion
-     (explicit "stop"), no fatal evidence, no tool failures, and TERMINATED_CONFIRMED.
+     (explicit "stop"), no fatal evidence, no non-denial tool failures (every recorded
+     tool failure must be a recovered OpenCode permission-rule denial), and
+     TERMINATED_CONFIRMED.
   8. On timeout, a failed result with nonempty evidence is returned even if a terminal
      event was observed before the hang.
   9. Session integrity and Human Acceptance boundaries are strictly preserved.
@@ -32,6 +39,15 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
   alias SymphonyElixir.TestSupport.MockOpenCode
   alias SymphonyElixir.WorkerContainment
   alias SymphonyElixir.WorkerEvent
+
+  # Verbatim OpenCode permission-rule rejection from the PILOT-LIVE-R4 runtime
+  # log (rules list genericized to workspace-shaped paths; the load-bearing
+  # phrase is byte-identical). This is the external_directory containment deny
+  # that held while the model adapted and completed the task, and the only
+  # error text the completion policy recognizes as a recovered containment
+  # denial (M2-COMPLETION-POLICY-TIGHTENING: generic permission wording,
+  # including ordinary EACCES/EPERM execution errors, fails closed).
+  @r4_denial "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{\"permission\":\"external_directory\",\"action\":\"deny\",\"pattern\":\"*\"},{\"permission\":\"external_directory\",\"pattern\":\"C:\\\\workspace\\\\allowed\\\\*\",\"action\":\"allow\"}]"
 
   setup do
     workspace =
@@ -194,24 +210,55 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
     end
 
     @tag :windows_only
-    test "recovered turn under adapter has completion_state: :completed but adapter success is BLOCKED by tool failures", %{
+    test "recovered containment denial under adapter is authoritative success with the denial preserved for audit (PILOT-LIVE-R4)", %{
       workspace: workspace
     } do
-      # --mock-mode=tool-error emits a tool error, followed by step_finish 'stop' and exits 0.
+      # --mock-mode=tool-error emits the OpenCode permission-rule rejection
+      # (the R4 external_directory deny), followed by step_finish 'stop' and
+      # exit 0 — the R4 shape: the deny held and the model adapted, so the
+      # worker completed the task.
       outcome = run_mock(workspace, "--mock-mode=tool-error")
 
-      # Authoritative adapter run MUST be an error: worker success is blocked by tool failure
-      assert {:error, {{:tool_error, "read", "permission denied"}, result}} = outcome
+      assert {:ok, result} = outcome
 
-      # Protocol completion is preserved (NOT mixed with tool failures)
+      # Protocol completion and clean evidence are preserved.
       assert result.completion_state == :completed
+      assert result.finish_reason == "stop"
       assert result.exit_code == 0
       assert result.failure_evidence == []
-      assert [{:tool_error, "read", "permission denied"}] = result.tool_failures
 
-      # Classified failure info matches the tool error
+      # The denial is still recorded as observational evidence — never erased.
+      assert [{:tool_error, "read", @r4_denial}] = result.tool_failures
+
+      if WorkerContainment.containment_active?() do
+        assert result.termination.status == :TERMINATED_CONFIRMED
+      end
+    end
+
+    @tag :windows_only
+    test "a non-denial tool error still blocks adapter success even when the turn ends clean", %{
+      workspace: workspace
+    } do
+      err = "ENOENT: no such file or directory, open 'required.txt'"
+
+      outcome =
+        run_parts(
+          workspace,
+          [
+            tool_use_error_line("ses_nondenial", "msg_1", "read", "c1", err) <>
+              step_finish_line("ses_nondenial", "msg_1", "stop", 10, 20)
+          ]
+        )
+
+      assert {:error, {{:tool_error, "read", ^err}, result}} = outcome
+
+      assert result.completion_state == :completed
+      assert result.finish_reason == "stop"
+      assert result.exit_code == 0
+      assert result.failure_evidence == []
+      assert [{:tool_error, "read", ^err}] = result.tool_failures
       assert result.failure_info.failure_class == :persistent_worker_failure
-      assert result.failure_info.message =~ "permission denied"
+      assert result.failure_info.message =~ "ENOENT"
     end
   end
 
@@ -435,6 +482,190 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
   end
 
   # ===========================================================================
+  # 8. Recovered Containment Denial vs Terminal Failure (M1-COMPLETION-POLICY /
+  #    PILOT-LIVE-R4)
+  # ===========================================================================
+
+  describe "8. Recovered containment denial vs terminal failure (PILOT-LIVE-R4)" do
+    test "parser records the R4 external_directory denial separately while protocol completion stays clean" do
+      r4_denial = @r4_denial
+
+      stream =
+        step_start_line("ses_r4", "msg_1") <>
+          tool_use_error_line("ses_r4", "msg_1", "read", "call_r4", r4_denial) <>
+          step_finish_line("ses_r4", "msg_1", "stop", 10, 20)
+
+      result = feed_stream(stream)
+
+      assert result.completion_state == :completed
+      assert result.finish_reason == "stop"
+      assert result.failure_evidence == []
+      assert [{:tool_error, "read", ^r4_denial}] = result.tool_failures
+    end
+
+    test "permission_denial? recognizes the exact R4 rule-rejection signature and fails closed on everything else" do
+      r4_denial = @r4_denial
+
+      assert Failure.permission_denial?({:tool_error, "read", r4_denial}) == true
+
+      # Ordinary execution errors whose text carries generic permission
+      # wording are tool faults, not containment evidence.
+      refute Failure.permission_denial?({:tool_error, "bash", "bash: /etc/shadow: Permission denied"})
+      refute Failure.permission_denial?({:tool_error, "read", "EACCES: permission denied, open 'out.txt'"})
+      refute Failure.permission_denial?({:tool_error, "write", "EPERM: operation not permitted, write 'out.txt'"})
+
+      # Non-denial tool failures containing permission-related words.
+      refute Failure.permission_denial?({:tool_error, "bash", "tool permission check failed: script exited 3"})
+      refute Failure.permission_denial?({:tool_error, "bash", "user is not permitted to run sudo"})
+      refute Failure.permission_denial?({:tool_error, "bash", "permission auto-rejected by policy"})
+
+      # Missing, blank, or non-text evidence fails closed — even when a
+      # non-text payload contains the signature phrase.
+      refute Failure.permission_denial?({:tool_error, "write", nil})
+      refute Failure.permission_denial?({:tool_error, "read", ""})
+      refute Failure.permission_denial?({:tool_error, "read", %{"message" => @r4_denial}})
+      refute Failure.permission_denial?(nil)
+    end
+
+    test "an unresolved denial still classifies persistent_worker_failure — classification never sees completion state" do
+      r4_denial = @r4_denial
+
+      assert Failure.classify({:tool_error, "read", r4_denial}) == :persistent_worker_failure
+      assert Failure.classify({:tool_error, "read", "permission denied"}) == :persistent_worker_failure
+      assert Failure.classify({:tool_error, "read", "ENOENT: no such file or directory"}) == :persistent_worker_failure
+    end
+
+    @tag :windows_only
+    test "R4 signature end-to-end: external_directory denial recovered by a clean stop is adapter success", %{
+      workspace: workspace
+    } do
+      r4_denial = @r4_denial
+
+      # Two-step shape from the R4 timeline: the denied read concludes an
+      # intermediate step, the model adapts, and the turn ends with "stop".
+      stream =
+        step_start_line("ses_r4_adapter", "msg_1") <>
+          tool_use_error_line("ses_r4_adapter", "msg_1", "read", "call_r4", r4_denial) <>
+          step_finish_line("ses_r4_adapter", "msg_1", "tool-calls", 10, 20) <>
+          step_start_line("ses_r4_adapter", "msg_2") <>
+          text_line("ses_r4_adapter", "Recovered; wrote the artifact inside the workspace") <>
+          step_finish_line("ses_r4_adapter", "msg_2", "stop", 30, 40)
+
+      assert {:ok, result} = run_parts(workspace, [stream])
+
+      assert result.exit_code == 0
+      assert result.completion_state == :completed
+      assert result.finish_reason == "stop"
+      assert result.failure_evidence == []
+      assert [{:tool_error, "read", ^r4_denial}] = result.tool_failures
+
+      if WorkerContainment.containment_active?() do
+        assert result.termination.status == :TERMINATED_CONFIRMED
+      end
+    end
+
+    @tag :windows_only
+    test "denial with a non-eligible finish reason is not a recovered success and fails closed", %{
+      workspace: workspace
+    } do
+      r4_denial = @r4_denial
+
+      stream =
+        step_start_line("ses_r4_unk", "msg_1") <>
+          tool_use_error_line("ses_r4_unk", "msg_1", "read", "call_r4u", r4_denial) <>
+          step_finish_line("ses_r4_unk", "msg_1", "unknown", 10, 20)
+
+      # The turn never reached an eligible "stop", so recovery never happened.
+      # Recorded tool failures keep their pre-existing precedence as the
+      # surfaced reason and the run stays a persistent failure (fail closed).
+      assert {:error, {{:tool_error, "read", ^r4_denial}, result}} = run_parts(workspace, [stream])
+      assert result.failure_info.failure_class == :persistent_worker_failure
+      assert [{:tool_error, "read", ^r4_denial}] = result.tool_failures
+    end
+
+    @tag :windows_only
+    test "denial with a nonzero exit is not a recovered success — an unsuccessful task stays a failure", %{
+      workspace: workspace
+    } do
+      r4_denial = @r4_denial
+
+      stream =
+        step_start_line("ses_r4_exit", "msg_1") <>
+          tool_use_error_line("ses_r4_exit", "msg_1", "read", "call_r4x", r4_denial) <>
+          step_finish_line("ses_r4_exit", "msg_1", "stop", 10, 20)
+
+      assert {:error, {{:tool_error, "read", ^r4_denial}, result}} =
+               run_parts(workspace, [stream], exit_code: 1)
+
+      assert result.exit_code == 1
+      assert result.completion_state == :failed
+      assert {:process_exit, 1} in result.failure_evidence
+      assert result.failure_info.failure_class == :persistent_worker_failure
+    end
+
+    @tag :windows_only
+    test "one genuine tool failure disqualifies the run even alongside recovered denials", %{
+      workspace: workspace
+    } do
+      r4_denial = @r4_denial
+      write_err = "ENOENT: no such file or directory, open 'out.txt'"
+
+      stream =
+        step_start_line("ses_mix", "msg_1") <>
+          tool_use_error_line("ses_mix", "msg_1", "read", "c1", r4_denial) <>
+          tool_use_error_line("ses_mix", "msg_1", "write", "c2", write_err) <>
+          step_finish_line("ses_mix", "msg_1", "stop", 10, 20)
+
+      # The recorded tool failures keep their pre-existing precedence: the
+      # most recent one surfaces as the reason and the run stays a failure —
+      # recovered denials never whitewash a run with a genuine tool failure.
+      assert {:error, {{:tool_error, "write", ^write_err}, result}} = run_parts(workspace, [stream])
+      assert result.failure_info.failure_class == :persistent_worker_failure
+      assert length(result.tool_failures) == 2
+    end
+
+    @tag :windows_only
+    test "an ordinary EACCES execution error is not a recovered containment denial — a clean stop does not rescue it", %{
+      workspace: workspace
+    } do
+      eacces = "EACCES: permission denied, open 'C:\\workspace\\allowed\\out.txt'"
+
+      stream =
+        step_start_line("ses_eacces", "msg_1") <>
+          tool_use_error_line("ses_eacces", "msg_1", "read", "call_ea", eacces) <>
+          step_finish_line("ses_eacces", "msg_1", "stop", 10, 20)
+
+      # M2 policy tightening regression pin: generic "permission denied" text
+      # is not rule-rejection evidence, so the otherwise-clean stop cannot
+      # turn this execution error into a recovered success.
+      assert {:error, {{:tool_error, "read", ^eacces}, result}} = run_parts(workspace, [stream])
+      assert result.completion_state == :completed
+      assert result.finish_reason == "stop"
+      assert result.failure_info.failure_class == :persistent_worker_failure
+      assert [{:tool_error, "read", ^eacces}] = result.tool_failures
+    end
+
+    @tag :windows_only
+    test "a recovered denial with an incomplete stream never becomes a success", %{
+      workspace: workspace
+    } do
+      r4_denial = @r4_denial
+
+      stream =
+        step_start_line("ses_r4_partial", "msg_1") <>
+          tool_use_error_line("ses_r4_partial", "msg_1", "read", "call_r4p", r4_denial)
+
+      # No terminal step_finish ever arrives, so the run is incomplete and the
+      # surfaced reason is the missing completion event — fail closed.
+      assert {:error, {{:incomplete_stream, :missing_completion_event}, result}} =
+               run_parts(workspace, [stream])
+
+      assert result.completion_state == :failed
+      assert [{:tool_error, "read", ^r4_denial}] = result.tool_failures
+    end
+  end
+
+  # ===========================================================================
   # Helpers
   # ===========================================================================
 
@@ -454,6 +685,28 @@ defmodule SymphonyElixir.OpenCodeCompletionPolicyTest do
         extra
       )
     )
+  end
+
+  # Drives the mock in emit-parts mode: every chunk becomes one flushed stdout
+  # write of byte-exact JSONL, so adapter-level tests control the stream the
+  # parser sees (same mechanism as the event-ordering regression suite).
+  defp run_parts(workspace, chunks, opts \\ []) do
+    parts_dir = Path.join(workspace, "parts-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(parts_dir)
+
+    chunks
+    |> Enum.with_index(1)
+    |> Enum.each(fn {data, idx} ->
+      name = String.pad_leading(Integer.to_string(idx), 2, "0") <> ".part"
+      File.write!(Path.join(parts_dir, name), data)
+    end)
+
+    File.write!(
+      Path.join(workspace, "opencode-mock-control.txt"),
+      "mode=emit-parts\nparts_dir=#{parts_dir}\nexit_code=#{Keyword.get(opts, :exit_code, 0)}\n"
+    )
+
+    run_mock(workspace, "emit-parts", Keyword.delete(opts, :exit_code))
   end
 
   defp feed_stream(stream) do

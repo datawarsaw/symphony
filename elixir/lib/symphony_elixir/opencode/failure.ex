@@ -141,6 +141,38 @@ defmodule SymphonyElixir.OpenCode.Failure do
     }
   end
 
+  # Containment-denial evidence for the completion policy: the OpenCode
+  # permission-rule rejection phrasing, observed verbatim as the PILOT-LIVE-R4
+  # external_directory deny, which quotes the effective permission rules that
+  # blocked the tool call. Deliberately narrow: generic permission wording —
+  # including ordinary EACCES/EPERM execution errors ("permission denied",
+  # "operation not permitted") and the same phrases inside arbitrary tool
+  # output — is not containment evidence, so it fails closed instead of
+  # counting as a recovered denial.
+  @denial_signals [
+    ~r/specified a rule which prevents you from using this specific tool call/
+  ]
+
+  @doc """
+  Whether a recorded tool failure is an OpenCode permission-rule rejection
+  whose deny held — containment boundary evidence, not a tool execution
+  failure.
+
+  Accepts the parser's `{:tool_error, tool, error}` records or a bare error
+  value. Recognition requires the explicit rule-rejection evidence; anything
+  else — generic permission errors (EACCES/EPERM), permission-related wording
+  in ordinary failures, or a missing, blank, or non-text error detail — is not
+  a denial, so callers fail closed on it.
+  """
+  @spec permission_denial?(term()) :: boolean()
+  def permission_denial?({:tool_error, _tool, error}), do: permission_denial?(error)
+
+  def permission_denial?(error) when is_binary(error) do
+    error != "" and signal?(String.downcase(error), @denial_signals)
+  end
+
+  def permission_denial?(_error), do: false
+
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------

@@ -1607,7 +1607,7 @@ defmodule SymphonyElixir.OpenCodeTest do
     end
 
     @tag :windows_only
-    test "exit 0 without completion, malformed JSON, or a tool error is not success", %{
+    test "exit 0 without completion or with malformed JSON is not success", %{
       workspace: workspace
     } do
       assert {:error, {{:incomplete_stream, :missing_completion_event}, partial}} =
@@ -1621,16 +1621,14 @@ defmodule SymphonyElixir.OpenCodeTest do
 
       assert malformed.exit_code == 0
       assert malformed.completion_state == :failed
-
-      assert {:error, {{:tool_error, "read", "permission denied"}, tool_error}} =
-               run_mock(workspace, "--mock-mode=tool-error")
-
-      assert tool_error.exit_code == 0
-      assert tool_error.completion_state == :completed
-      assert tool_error.failure_evidence == []
-      assert {:tool_error, "read", "permission denied"} in tool_error.tool_failures
-      assert tool_error.failure_info.failure_class == :persistent_worker_failure
     end
+
+    # M1-COMPLETION-POLICY (PILOT-LIVE-R4): --mock-mode=tool-error emits the
+    # OpenCode permission-rule rejection (the R4 containment deny) followed by
+    # a clean "stop", which is a recovered containment denial — authoritative
+    # success with the denial preserved. Recognition is limited to that
+    # explicit rule-rejection signature; generic permission wording fails
+    # closed. That policy lives in opencode_completion_policy_test.exs.
 
     @tag :windows_only
     test "tool output, callbacks, and stderr do not expose secrets", %{workspace: workspace} do

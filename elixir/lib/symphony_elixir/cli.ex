@@ -177,21 +177,16 @@ defmodule SymphonyElixir.CLI do
 
   @spec wait_for_shutdown() :: no_return()
   defp wait_for_shutdown do
-    case Process.whereis(SymphonyElixir.Supervisor) do
-      nil ->
+    case SymphonyElixir.RuntimeShutdown.wait_for_shutdown() do
+      :ok ->
+        System.halt(0)
+
+      {:error, :supervisor_not_running} ->
         IO.puts(:stderr, "Symphony supervisor is not running")
         System.halt(1)
 
-      pid ->
-        ref = Process.monitor(pid)
-
-        receive do
-          {:DOWN, ^ref, :process, ^pid, reason} ->
-            case reason do
-              :normal -> System.halt(0)
-              _ -> System.halt(1)
-            end
-        end
+      {:error, {:supervisor_exited, _reason}} ->
+        System.halt(1)
     end
   end
 end

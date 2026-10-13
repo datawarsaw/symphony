@@ -21,6 +21,12 @@ defmodule SymphonyElixir.OpenCode.Adapter do
     termination keeps the marker so workspace reuse and cleanup fail closed.
   - Positive completion: exit status 0 is not success without an explicit eligible
     finish reason ("stop"), a completion event, clean JSONL, and confirmed termination.
+    A tool failure that is an OpenCode permission-rule rejection whose deny held (the
+    exact PILOT-LIVE-R4 containment signature) does not disqualify that success when
+    the run is otherwise clean — the boundary held and the worker recovered. Recognition
+    is deliberately narrow: generic permission wording, including ordinary EACCES/EPERM
+    execution errors, is not containment evidence and still fails the run, as do any
+    non-denial tool failure, protocol failure evidence, or unconfirmed termination.
   - Clean lifecycle: stdin EOF is delivered to OpenCode without closing the containment stop pipe, and stop is idempotent.
   """
 
@@ -279,8 +285,23 @@ defmodule SymphonyElixir.OpenCode.Adapter do
     status == 0 and
       eligible_protocol_completion?(parser) and
       parser.failure_evidence == [] and
-      parser.tool_failures == [] and
+      tool_failures_recovered?(parser) and
       termination_ok?(identity, termination)
+  end
+
+  # M1-COMPLETION-POLICY (PILOT-LIVE-R4): a denied tool call whose deny held is
+  # the containment boundary working as designed, not a worker fault. When
+  # every recorded tool failure is such a denial and the run is otherwise
+  # clean — exit 0, an explicit eligible "stop", no protocol failure evidence,
+  # confirmed termination — the worker recovered from the denied probe and
+  # completed the task, so the denials do not disqualify success.
+  # Recognition is OpenCode permission-rule rejection evidence only
+  # (Failure.permission_denial?/1): generic permission wording, including
+  # ordinary EACCES/EPERM execution errors, fails closed. Any non-denial tool
+  # failure, any protocol failure evidence, or unconfirmed termination stays
+  # disqualifying (fail closed).
+  defp tool_failures_recovered?(parser) do
+    Enum.all?(parser.tool_failures, &Failure.permission_denial?/1)
   end
 
   defp eligible_protocol_completion?(parser) do
@@ -292,7 +313,7 @@ defmodule SymphonyElixir.OpenCode.Adapter do
     parser.completion_state == :completed and
       Parser.eligible_finish_reason?(parser.finish_reason) and
       parser.failure_evidence == [] and
-      parser.tool_failures == []
+      tool_failures_recovered?(parser)
   end
 
   defp terminal_protocol_complete?(_parser, _status), do: false

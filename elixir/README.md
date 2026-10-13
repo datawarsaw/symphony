@@ -92,7 +92,10 @@ At startup Symphony acquires a durable single-instance lease over the configured
 (`<state_root>/.symphony-state/runtime/authority.json`) before any lifecycle processing starts.
 A second runtime pointed at the same root fails closed instead of becoming a second lifecycle
 authority, crash residue keeps fresh runtimes fail closed until explicit operator recovery, and
-normal shutdown releases the lease. See [runtime authority](docs/runtime_authority.md).
+normal shutdown releases the lease. A supported graceful stop exists for foreground runtimes:
+write an attributable stop request (`mix symphony.stop_request`) and the runtime drains,
+terminates under supervision, and releases the lease itself. See
+[runtime authority](docs/runtime_authority.md).
 
 ## Launch diagnostics
 
