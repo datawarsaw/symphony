@@ -1917,7 +1917,76 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  # PILOT-SINGLE-ATTEMPT: the single admission point for every automatic
+  # rescheduling path — failure retry, success continuation, stall restart,
+  # spawn failure, restart recovery, CONTROL relaunch and CONTROL recovery —
+  # so the pilot suppression is enforced exactly once, here. While the
+  # bootstrap-armed OpenCode pilot runs, an issue pinned to (or carried on)
+  # the authorized OpenCode harness gets exactly one automatic dispatch
+  # attempt: the funnel parks it fail-closed instead of arming a retry timer.
+  # Unarmed runs and non-OpenCode (Codex) lifecycles take the unchanged
+  # envelope path.
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
+       when is_binary(issue_id) and is_map(metadata) do
+    if pilot_single_attempt_suppression?(state, issue_id, metadata) do
+      park_pilot_single_attempt(state, issue_id, metadata)
+    else
+      schedule_issue_retry_envelope(state, issue_id, attempt, metadata)
+    end
+  end
+
+  defp pilot_single_attempt_suppression?(%State{} = state, issue_id, metadata)
+       when is_binary(issue_id) and is_map(metadata) do
+    PilotGuard.armed?() and
+      (match?(%{harness: :opencode}, Map.get(state.harness_pins, issue_id)) or
+         metadata[:harness] == :opencode)
+  end
+
+  defp park_pilot_single_attempt(%State{} = state, issue_id, metadata) do
+    # Mirror the envelope's pin bookkeeping so the durable park carries the
+    # same validated harness authority the dispatch committed.
+    state = remember_metadata_harness(state, issue_id, metadata)
+    metadata = put_pinned_harness(metadata, state, issue_id)
+    previous_retry = Map.get(state.retry_attempts, issue_id, %{})
+    identifier = metadata[:identifier] || Map.get(previous_retry, :identifier) || issue_id
+
+    error =
+      case metadata[:error] || Map.get(previous_retry, :error) do
+        nil -> "pilot single-attempt policy: automatic rescheduling suppressed after the first attempt"
+        message -> "#{message} (pilot single-attempt policy: automatic rescheduling suppressed)"
+      end
+
+    Logger.warning(
+      "Pilot single-attempt policy: suppressing automatic rescheduling for issue_id=#{issue_id} " <>
+        "issue_identifier=#{identifier}; parking with claim, no retry timer, no second dispatch"
+    )
+
+    state =
+      park_issue(state, issue_id, nil, %{
+        identifier: identifier,
+        issue_url: metadata[:issue_url] || Map.get(previous_retry, :issue_url),
+        error: error,
+        worker_host: metadata[:worker_host] || Map.get(previous_retry, :worker_host),
+        workspace_path: metadata[:workspace_path] || Map.get(previous_retry, :workspace_path),
+        workspace_root: metadata[:workspace_root] || Map.get(previous_retry, :workspace_root),
+        worker_identity: metadata[:worker_identity],
+        termination_expectation: metadata[:termination_expectation],
+        failure_class: metadata[:failure_class],
+        attempt_count: metadata[:attempt_count],
+        identical_failure_count: metadata[:identical_failure_count],
+        first_failure_at: metadata[:first_failure_at],
+        route: metadata[:route],
+        primary_failure_count: metadata[:primary_failure_count],
+        stop_reason: :pilot_single_attempt
+      })
+
+    # The success-continuation caller completes the issue before scheduling
+    # the continuation check; the suppression park supersedes that completion
+    # so the runtime state ends in exactly one terminal park.
+    %{state | completed: MapSet.delete(state.completed, issue_id)}
+  end
+
+  defp schedule_issue_retry_envelope(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
@@ -3096,7 +3165,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         case status do
           "active" ->
-            state
+            recover_active_lifecycle_record(state, record, root, issue_id, harness, authority, evidence)
 
           "continuing" ->
             metadata = %{
@@ -3118,6 +3187,43 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason, evidence} ->
         fail_closed_harness_record(state, record, root, issue_id, reason, evidence)
+    end
+  end
+
+  # PILOT-R3 restart safety: a durable "active" record is durable evidence of
+  # a previous authorized attempt. Restart recovery restores the harness pin,
+  # but the old BEAM's claim died with it, so without a hold here the issue is
+  # poller-admissible and a fence-ALLOWED launch marker (a drain receipt, or
+  # no marker at all) lets the poller launch a second worker without ever
+  # passing through schedule_issue_retry/4. While the pilot is armed and the
+  # record pins the authorized OpenCode harness, the same single-attempt gate
+  # the scheduling funnel applies parks the issue at recovery: claim + durable
+  # parked record + wake, no retry timer. Unarmed runs and Codex records keep
+  # the unchanged pin-only recovery; armed-node Codex redispatch stays refused
+  # by the PILOT-GUARD-F1 dispatch admission park.
+  defp recover_active_lifecycle_record(%State{} = state, record, root, issue_id, harness, authority, evidence) do
+    metadata = %{
+      identifier: Map.get(record, "identifier", issue_id),
+      error: "pilot single-attempt policy: restart recovery of a durable active attempt record; no second dispatch",
+      worker_host: recovery_blank_to_nil(Map.get(record, "worker_host")),
+      workspace_path: recovery_blank_to_nil(Map.get(record, "workspace_path")),
+      workspace_root: recovery_blank_to_nil(Map.get(record, "workspace_root")) || root,
+      route: recovery_route(Map.get(record, "route")),
+      primary_failure_count: Map.get(record, "primary_failure_count", 0),
+      harness: harness,
+      harness_authority: authority,
+      harness_evidence: evidence
+    }
+
+    if pilot_single_attempt_suppression?(state, issue_id, metadata) do
+      Logger.warning(
+        "Pilot single-attempt policy: restart recovery of a durable active attempt record for issue_id=#{issue_id} " <>
+          "issue_identifier=#{metadata.identifier}; parking with claim, no retry timer, no second dispatch"
+      )
+
+      park_pilot_single_attempt(state, issue_id, metadata)
+    else
+      state
     end
   end
 
@@ -3909,7 +4015,14 @@ defmodule SymphonyElixir.Orchestrator do
         state = schedule_issue_retry(state, request.issue_id, next_attempt, metadata)
         # The envelope resolved the replacement attempt (nil delegates to the
         # existing retry schedule); the receipt reports what was scheduled.
-        replacement = state.retry_attempts |> Map.get(request.issue_id) |> Map.get(:attempt)
+        # A pilot single-attempt suppression parks instead of scheduling, so a
+        # missing retry entry must read as "no replacement attempt", never
+        # crash the receipt.
+        replacement =
+          case Map.get(state.retry_attempts, request.issue_id) do
+            %{attempt: attempt} -> attempt
+            _missing -> nil
+          end
 
         {receipt, state} =
           record_control(
