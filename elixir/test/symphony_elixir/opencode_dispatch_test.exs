@@ -160,6 +160,23 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
     end
   end
 
+  defp wait_until_fn(fun, timeout_ms \\ 5_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    case fun.() do
+      nil ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("condition was not met within #{timeout_ms}ms")
+        else
+          Process.sleep(50)
+          wait_until_fn(fun, timeout_ms)
+        end
+
+      value ->
+        value
+    end
+  end
+
   defp termination_evidence(messages) do
     List.keyfind(messages, :termination, 0) || flunk("no termination evidence reached the recipient")
   end
@@ -244,9 +261,12 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
       assert get_in(final, [:tokenUsage, :total, :totalTokens]) == 385
 
       # Termination evidence reached the recipient before the task could exit.
-      {:termination, termination_issue_id, %{worker_termination: termination}} = termination_evidence(messages)
+      # A completed launch publishes its confirmed termination and never a
+      # never-started refinement.
+      {:termination, termination_issue_id, info} = termination_evidence(messages)
       assert termination_issue_id == issue.id
-      assert %{status: :TERMINATED_CONFIRMED} = termination
+      assert %{status: :TERMINATED_CONFIRMED} = info.worker_termination
+      refute Map.has_key?(info, :termination_expectation)
 
       # Completion required containment evidence: the confirmed marker for
       # this issue is gone and the reuse gate re-admits the issue.
@@ -367,10 +387,14 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
         assert error.failure_info.message =~ "anthropic"
 
         # No process was ever created, so no termination confirmation may be
-        # claimed either: the recipient sees a nil worker termination.
+        # claimed either: the pre-spawn refusal reaches the recipient as the
+        # MIC-223 NEVER_STARTED refinement — never as a nil-evidence
+        # termination publication that would suppress the refinement and
+        # mislabel the park as worker_termination_unconfirmed.
         messages = drain_worker_mailbox()
-        {:termination, _issue_id, %{worker_termination: termination}} = termination_evidence(messages)
-        refute termination
+        {:termination, _issue_id, info} = termination_evidence(messages)
+        refute info[:worker_termination]
+        assert info[:termination_expectation] == :NEVER_STARTED
       after
         restore_env("ANTHROPIC_API_KEY", saved_credential)
       end
@@ -379,6 +403,51 @@ defmodule SymphonyElixir.OpenCodeDispatchTest do
       # process: no launch state under the workspace, no stranded marker.
       refute File.exists?(Path.join(workspace, ".symphony-state"))
       refute File.exists?(LaunchMarker.marker_path(issue.id, root: state_root))
+    end
+
+    # START-CLASSIFICATION regression: once a launch DID establish a process,
+    # a death the wrapper could not prove stays termination evidence — the
+    # runner must keep publishing the adapter's TERMINATION_UNCONFIRMED
+    # confirmation (and no never-started refinement), so the orchestrator's
+    # reuse gate parks fail-closed as worker_termination_unconfirmed.
+    test "an unconfirmed post-launch termination still publishes termination evidence", context do
+      %{issue: issue, state_root: state_root} = context
+      prepare_workspace!(context, issue, ["sleep=30000"])
+      enable_pilot!(issue)
+      recipient = self()
+
+      runner =
+        Task.async(fn ->
+          assert_raise AgentRunner.FailureError, fn ->
+            AgentRunner.run(issue, recipient, dispatch_opts(context, pilot(issue.identifier)))
+          end
+        end)
+
+      marker_path = LaunchMarker.marker_path(issue.id, root: state_root)
+      wait_until(fn -> File.exists?(marker_path) end)
+
+      # The wrapper pid is refreshed onto the marker after the Port opens;
+      # killing it before the receipt exists is what forces TERMINATION_UNCONFIRMED.
+      wrapper_pid =
+        wait_until_fn(fn ->
+          case LaunchMarker.read(issue.id, root: state_root) do
+            {:ok, %{"worker_identity" => %{"wrapper_pid" => pid}}} when is_binary(pid) and pid != "" -> pid
+            _other -> nil
+          end
+        end)
+
+      # Hard-kill the containment wrapper so it cannot write a death receipt:
+      # the stop can then only conclude TERMINATION_UNCONFIRMED.
+      assert {_, 0} =
+               System.cmd("taskkill", ["/F", "/T", "/PID", to_string(wrapper_pid)], stderr_to_stdout: true)
+
+      Task.await(runner, 60_000)
+
+      messages = drain_worker_mailbox()
+      {:termination, _issue_id, info} = termination_evidence(messages)
+      assert %{status: :TERMINATION_UNCONFIRMED} = info.worker_termination
+      # A launch that established a process is never refined to NEVER_STARTED.
+      refute Map.has_key?(info, :termination_expectation)
     end
 
     test "every streamed update during an OpenCode attempt stays harness-marked", context do

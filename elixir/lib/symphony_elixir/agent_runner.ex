@@ -240,16 +240,33 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  # A pre-spawn adapter refusal — a bare {:error, reason} with no run-result
+  # map (credential preflight, launch-settings validation, executable or
+  # port failure) — must stay silent on this channel: publishing nil-evidence
+  # termination here would consume the MIC-223 evidence channel and suppress
+  # publish_launch_never_started/3's NEVER_STARTED refinement, so the reuse
+  # gate would mislabel a launch that never created a process as an
+  # unconfirmed worker termination. A result that went through a live launch
+  # always carries the adapter's run-result map, whose assembled form always
+  # has the :termination key.
+  defp launch_established?({:ok, %{termination: _}}), do: true
+  defp launch_established?({:error, {_reason, %{termination: _}}}), do: true
+  defp launch_established?(_pre_spawn_refusal), do: false
+
   defp report_opencode_termination(recipient, issue, result) do
-    send_worker_termination_info(recipient, issue, %{
-      # The durable launch marker (written by the adapter before the child
-      # existed) is the identity authority for reuse/cleanup fences; the
-      # in-memory channel carries the adapter's termination confirmation so
-      # the orchestrator's reuse gate sees fence-grade evidence, never
-      # streaming events alone.
-      worker_identity: nil,
-      worker_termination: opencode_termination_confirmation(result)
-    })
+    if launch_established?(result) do
+      send_worker_termination_info(recipient, issue, %{
+        # The durable launch marker (written by the adapter before the child
+        # existed) is the identity authority for reuse/cleanup fences; the
+        # in-memory channel carries the adapter's termination confirmation so
+        # the orchestrator's reuse gate sees fence-grade evidence, never
+        # streaming events alone.
+        worker_identity: nil,
+        worker_termination: opencode_termination_confirmation(result)
+      })
+    end
+
+    :ok
   end
 
   defp opencode_termination_confirmation({_status, %{} = run_result}) when is_map_key(run_result, :termination),

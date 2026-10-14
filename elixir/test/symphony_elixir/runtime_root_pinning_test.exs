@@ -105,12 +105,20 @@ defmodule SymphonyElixir.RuntimeRootPinningTest do
 
       assert File.exists?(RuntimeLease.authority_path(root_a))
 
-      # no spelling of the same physical root can mint a second authority:
-      # through the other spelling the alias-recorded lease reads back as a
-      # mismatch (fail closed, never a new domain). The physical authority
-      # file is shared, so the alias is the same mutation domain.
+      # no spelling of the same physical root can mint a second authority: the
+      # alias-claimed lease IS this root's lease, so the other spelling reads it
+      # back as the same domain — one physical authority file, classified and
+      # still protected by the active-lease guard — never a second domain and
+      # never an invalid record.
       assert File.exists?(RuntimeLease.authority_path(root_a))
-      assert {:error, {:lease_state_invalid, :root_mismatch}} = RuntimeLease.claim(root_a)
+      assert File.exists?(RuntimeLease.authority_path(alias_root))
+      assert {:ok, evidence} = RuntimeLease.observe(root_a)
+      assert evidence["class"] == "active"
+
+      assert {:error, {:active_lease, _sealed}} =
+               RuntimeLease.force_release(root_a, confirm: true, reason: "operator: alias probe")
+
+      assert File.exists?(RuntimeLease.authority_path(root_a))
 
       assert :ok = RuntimeLease.release_held(holder)
     after

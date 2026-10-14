@@ -1452,25 +1452,31 @@ defmodule SymphonyElixir.Orchestrator do
         if worker_host != nil do
           park_opencode_remote_host(state, issue, worker_host)
         else
-          state = commit_harness_pin(state, issue, pin)
+          case gate_opencode_credential_availability(pilot) do
+            :ok ->
+              state = commit_harness_pin(state, issue, pin)
 
-          Logger.info(
-            "Dispatch harness selected for #{issue_context(issue)} harness=opencode " <>
-              "provider=#{pilot.provider} model=#{pilot.model} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"} " <>
-              "harness_authority=#{pin.authority}"
-          )
+              Logger.info(
+                "Dispatch harness selected for #{issue_context(issue)} harness=opencode " <>
+                  "provider=#{pilot.provider} model=#{pilot.model} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"} " <>
+                  "harness_authority=#{pin.authority}"
+              )
 
-          spawn_with_selection(
-            state,
-            issue,
-            attempt,
-            recipient,
-            worker_host,
-            resumed?,
-            route,
-            :opencode,
-            dispatch_opts ++ [harness: :opencode, opencode: pilot]
-          )
+              spawn_with_selection(
+                state,
+                issue,
+                attempt,
+                recipient,
+                worker_host,
+                resumed?,
+                route,
+                :opencode,
+                dispatch_opts ++ [harness: :opencode, opencode: pilot]
+              )
+
+            {:defer, reason} ->
+              defer_dispatch_on_missing_credential(state, issue, pilot, reason)
+          end
         end
 
       {:dispatch, :codex, harness_reason, pin} ->
@@ -1509,6 +1515,67 @@ defmodule SymphonyElixir.Orchestrator do
       failure_class: "PERSISTENT_WORKER_FAILURE",
       worker_host: worker_host
     })
+  end
+
+  # Pre-dispatch credential availability gate (fail closed, presence only).
+  #
+  # A new single-attempt dispatch must not be consumed when the selected
+  # provider has no resolvable credential: the adapter's credential presence
+  # preflight would refuse the launch anyway, but only after this dispatch had
+  # already claimed the issue, spawned the worker task, and burned the one
+  # attempt on a failure no retry can repair.
+  #
+  # The gate runs the same presence-only preflight the adapter runs
+  # (`OpenCode.preflight_provider_credentials` — the provider credential
+  # allowlist in OpenCode.Environment is the single mapping source) with the
+  # same resolution the launch will see: ambient BEAM environment, no caller
+  # `provider_auth`, because AgentRunner passes none. It is deliberately
+  # narrow:
+  #
+  # - Only `{:missing_provider_credential, _}` defers. Every other preflight
+  #   refusal (unmapped provider, unauthorized key, ambient endpoint
+  #   override) keeps today's downstream behavior: the adapter refuses the
+  #   launch inside the attempt and the existing envelope parks it.
+  # - Deferral mutates nothing: no claim, no harness pin commit, no park, no
+  #   blocked entry, no retry timer, no spawn. The issue stays a poll
+  #   candidate, so the next cycle re-runs the gate and dispatches normally
+  #   once the operator supplies the credential. Nothing about the decision
+  #   is cached.
+  # - `:ok` asserts credential presence only, never provider validity or
+  #   runtime readiness: the launch still passes every downstream gate and
+  #   still classifies real provider auth failures through the normal
+  #   taxonomy.
+  # - Reasons and logs carry provider and variable names only, never
+  #   credential values; the preflight is value-blind by construction.
+  @spec gate_opencode_credential_availability(SymphonyElixir.Config.Schema.OpenCode.t()) ::
+          :ok | {:defer, {:missing_provider_credential, String.t()}}
+  defp gate_opencode_credential_availability(pilot) do
+    case SymphonyElixir.OpenCode.preflight_provider_credentials(pilot.provider) do
+      :ok ->
+        :ok
+
+      {:error, {:missing_provider_credential, _provider} = reason} ->
+        {:defer, reason}
+
+      # Config- and authorization-shaped refusals are not availability: the
+      # adapter refuses them inside the attempt through the same preflight,
+      # so dispatch semantics stay exactly as before this gate existed.
+      {:error, _other_refusal} ->
+        :ok
+    end
+  end
+
+  # The deferral outcome: the issue is left exactly as found — queued,
+  # unclaimed, unconsumed — and the log names the provider so the operator
+  # can supply the missing credential. No timer is armed: the poller itself
+  # re-runs the gate on the next cycle, so recovery needs no bookkeeping.
+  defp defer_dispatch_on_missing_credential(%State{} = state, %Issue{} = issue, pilot, reason) do
+    Logger.warning(
+      "Dispatch deferred for #{issue_context(issue)}: provider #{pilot.provider} has no resolvable credential " <>
+        "reason=#{inspect(reason)}; no attempt consumed, issue stays queued, no retry timer"
+    )
+
+    state
   end
 
   # One harness decision per dispatch attempt. HarnessSelection is the pure

@@ -32,6 +32,7 @@ defmodule SymphonyElixir.OpenCodeHostEligibilityTest do
   alias SymphonyElixir.OpenCode.Adapter
   alias SymphonyElixir.TestSupport.FakeSSH
   alias SymphonyElixir.TestSupport.MockOpenCode
+  alias SymphonyElixir.Wake.{Ledger, Store}
   alias SymphonyElixir.WorkerContainment
 
   @moduletag :opencode_integration
@@ -165,6 +166,72 @@ defmodule SymphonyElixir.OpenCodeHostEligibilityTest do
       # The remote worker attempt fails fast against the fake (no codex
       # server answers); wait it out so no task outlives the assertion.
       wait_until(fn -> Task.Supervisor.children(sup) == [] end, 30_000)
+    end
+  end
+
+  # ===========================================================================
+  # Active wake ledger (WAKE-EVENT-TAXONOMY-FIX)
+  # ===========================================================================
+
+  describe "remote-host refusal with an active wake ledger" do
+    # park_opencode_remote_host/3 observes the refusal as a wake event before it
+    # parks. With `wake_ledger: nil` observe_wake/4 is a no-op (which is why the
+    # delivered dispatch-boundary tests stayed green), so the unregistered kind
+    # only surfaced once a wake ledger was live — as a FunctionClauseError out of
+    # Event.classify/2, raised before the park could happen at all.
+    test "the refusal is classified and persisted without raising, and the park is unchanged" do
+      workflow =
+        pilot_workflow()
+        |> Keyword.update!(:opencode_allowed_issues, &(&1 ++ ["MIC-HE-WL"]))
+        |> Keyword.put(:worker_ssh_hosts, [@remote_host])
+
+      fixture = dispatch_fixture!("wake-ledger", workflow)
+      issue = active_issue("issue-he-wl", "MIC-HE-WL")
+
+      wake_root = Path.join(fixture.test_root, "wake-root")
+      File.mkdir_p!(wake_root)
+
+      {:ok, sup} = start_test_task_supervisor("wake-ledger")
+
+      state = %{runtime_state(sup) | wake_ledger: Ledger.new(wake_root)}
+      state = Orchestrator.dispatch_issue_for_test(state, issue)
+
+      # No classification exception: the refusal is a registered kind and wakes
+      # exactly as an actionable event for this issue.
+      snapshot = Ledger.snapshot(state.wake_ledger)
+
+      refused =
+        Enum.find(snapshot.pending_actionable, &(&1.kind == :opencode_remote_host_ineligible)) ||
+          flunk("remote-host refusal did not reach the wake ledger")
+
+      assert refused.actionable
+      assert refused.issue_id == issue.id
+
+      # The refusal and the park it produces stay distinct pending wakes, the
+      # same way the fence/park pair does (wake_test.exs).
+      assert Enum.sort(Enum.map(snapshot.pending_actionable, & &1.kind)) ==
+               [:opencode_remote_host_ineligible, :parked]
+
+      # Correct event persistence: the actionable receipt is durably recorded.
+      assert File.exists?(Store.issue_path(wake_root, issue.id))
+      assert {:ok, %{pending: pending}} = Store.read_issue(wake_root, issue.id)
+      assert Enum.any?(pending, &(&1.kind == :opencode_remote_host_ineligible and &1.actionable))
+
+      # Unchanged issue parking behavior: the delivered M1-H-F park contract is
+      # intact — claim, no retry timer, no spawn, no workspace, no marker.
+      parked = Map.get(state.parked, issue.id) || flunk("issue was not parked")
+      assert parked.stop_reason == :opencode_remote_host_ineligible
+      assert parked.failure_class == "PERSISTENT_WORKER_FAILURE"
+      assert parked.worker_host == @remote_host
+      assert parked.error =~ "not eligible on remote worker host"
+
+      assert MapSet.member?(state.claimed, issue.id)
+      refute Map.has_key?(state.running, issue.id)
+      assert state.retry_attempts == %{}
+      assert Task.Supervisor.children(sup) == []
+
+      refute File.exists?(Path.join(fixture.workspace_root, Workspace.workspace_key(issue)))
+      refute File.exists?(LaunchMarker.marker_path(issue.id))
     end
   end
 

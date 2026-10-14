@@ -17,7 +17,21 @@ defmodule SymphonyElixir.Wake.Event do
   introducing duplicate event semantics.
   """
 
-  @actionable_kinds [:worker_failed, :worker_termination_unconfirmed, :eligibility_action_required]
+  # `:opencode_remote_host_ineligible` is the M1-H-F dispatch-boundary refusal:
+  # the armed pilot authorized OpenCode for the issue, the selected SSH worker
+  # host cannot contain it, and the runtime parks with claim, no spawn, no
+  # retry timer, and no harness fallback. Retrying cannot resolve it, and
+  # re-admission is an operator action on the pilot allowlist or the SSH host
+  # pool, so the refusal stays visible as an actionable wake. It classifies
+  # like `:eligibility_action_required` (its dispatch-boundary sibling) and like
+  # the co-emitted `:parked` receipt for the same stop reason, which already
+  # resolves to `:actionable` through the parked default.
+  @actionable_kinds [
+    :worker_failed,
+    :worker_termination_unconfirmed,
+    :eligibility_action_required,
+    :opencode_remote_host_ineligible
+  ]
   @deterministic_kinds [:worker_completed, :worker_stale]
   @human_kinds [:discovery_needs_decision, :human_decision_required]
   @observed_kinds [:poll_tick]
@@ -45,6 +59,7 @@ defmodule SymphonyElixir.Wake.Event do
           | :parked
           | :discovery_needs_decision
           | :eligibility_action_required
+          | :opencode_remote_host_ineligible
           | :human_decision_required
           | :tracker_state_changed
           | :poll_tick

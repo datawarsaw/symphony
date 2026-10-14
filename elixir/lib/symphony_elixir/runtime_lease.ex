@@ -49,7 +49,15 @@ defmodule SymphonyElixir.RuntimeLease do
   Recovery is `force_release/2` — explicit operator confirmation plus a written
   reason, with the prior state preserved to `authority.recovery.json` as evidence and
   the removal verified by a re-read. Recovery refuses an `:active` lease unless
-  `force_active: true`; there is no time-based automatic takeover.
+  `force_active: true`; there is no time-based automatic takeover. That refusal
+  does not depend on recognizing a spelling: lease reads compare roots through
+  `roots_match?/2`, and the invalid-state recovery branch refuses any record
+  that still classifies `:active`, whatever root it names. A different spelling
+  of the same physical directory (slash direction, drive-letter case, trailing
+  separator, Windows trailing dot or space, extended-length prefix, junction or
+  symlink alias) is therefore never a shortcut around the guard. The audit record
+  keeps the lease identity fields of the prior state and never its owner token,
+  also when the prior state is unparseable bytes.
 
   Mutation-root pinning: the root the holder claims is the only lifecycle
   mutation root for as long as the holder lives. `authority_root/0` publishes it
@@ -63,6 +71,8 @@ defmodule SymphonyElixir.RuntimeLease do
   use GenServer
   require Logger
 
+  alias SymphonyElixir.OpenCode.Redactor
+
   @schema_version 1
   @kind "runtime-authority"
   @default_heartbeat_ms 60 * 1_000
@@ -72,6 +82,14 @@ defmodule SymphonyElixir.RuntimeLease do
   @op_lock_poll_ms 5
   @authority_check_timeout_ms 5_000
   @core_fields ~w(state_root instance_id owner_token os_pid node started_at heartbeat_at)
+  @identity_fields ~w(schema_version kind state_root instance_id os_pid node hostname started_at heartbeat_at)
+  # The token field name, with any word or escape characters between "owner" and
+  # "token", so JSON-escaped spellings of the key are covered as well.
+  @token_field ~r/"owner[\w\x5C]*token"\s*:\s*("[^"]*"|[^,}\s]+)/i
+  # A truncated token is a token prefix, so every hex run long enough to be one
+  # is withheld from preserved torn bytes.
+  @token_run ~r/[0-9a-f]{8,}/
+  @redacted "[redacted]"
   # Private deterministic-test seam (per-process, unset in production): override for the
   # destructive removal inside force_release/2. Deliberately not a general filesystem hook.
   @force_rm_test_hook :"$runtime_lease_force_rm_hook"
@@ -370,12 +388,25 @@ defmodule SymphonyElixir.RuntimeLease do
   heartbeat classification is diagnostic evidence, never takeover authority on its
   own. Recovery of stale/releasable/corrupt/foreign state needs no override.
 
+  The `:active` guard is alias-safe and does not rely on recognizing a spelling:
+  a readable lease is compared through `roots_match?/2`, and an invalid-state
+  record that still classifies `:active` is refused whatever root it names —
+  blank, relative, or an equivalent spelling this module cannot resolve (Windows
+  trailing dot or space, extended-length prefix, mapped drive). Only stale,
+  releasable, and liveness-unknown state recovers without the override.
+
   Recovery runs under the same op lock as claim/renew/release, so a fresh runtime's
   lease can never be destroyed by a recovery that started earlier. The prior state
   (or the corrupt raw bytes) is preserved to `authority.recovery.json` before
-  removal; the removal result is checked and the root is re-read afterwards: success
-  is returned only when the lease is verifiably gone. A surviving lease (same,
-  replacement, or corrupt) or a failed removal fails closed.
+  removal as a projection onto the lease contract fields with `owner_token`
+  dropped (marked `"owner_token_redacted": true`) — fields outside the contract
+  are reported by name only, and a verbatim copy of the token value inside the
+  projection is replaced. When the prior state does not decode, the raw bytes are
+  preserved with the token field and token-shaped hex runs cut out. Every field
+  that identifies the recovered lease is kept. The removal result is checked and
+  the root is re-read afterwards: success is returned only when the lease is
+  verifiably gone. A surviving lease (same, replacement, or corrupt) or a failed
+  removal fails closed.
   Options: `forced_by`, `lock_timeout_ms` (default #{@default_op_lock_timeout_ms}ms).
   """
   @spec force_release(String.t(), keyword()) ::
@@ -422,24 +453,49 @@ defmodule SymphonyElixir.RuntimeLease do
 
       # Corrupt/ambiguous/schema-invalid/foreign content: explicit operator recovery
       # remains the only way through. The raw bytes (or best-effort decode) become
-      # the evidence.
+      # the evidence. Invalid is not the same as free, though: an `:active` record
+      # that cannot be proven to belong to a different mutation domain still needs
+      # the operator's force_active override, so this branch is never an alias
+      # shortcut around the active-lease guard above.
       {:error, {:lease_state_invalid, invalid}} ->
-        case File.read(authority_path(state_root)) do
-          {:ok, raw} ->
-            record = recovery_record(decode_or_raw(raw), Atom.to_string(invalid), reason, force_active, opts)
-            remove_and_verify(state_root, record, nil)
-
-          {:error, :enoent} ->
-            {:error, :lease_missing}
-
-          {:error, _} ->
-            {:error, {:lease_state_invalid, :unreadable_state}}
-        end
+        recover_invalid_locked(state_root, invalid, reason, force_active, opts)
 
       {:error, :not_found} ->
         {:error, :lease_missing}
     end
   end
+
+  defp recover_invalid_locked(state_root, invalid, reason, force_active, opts) do
+    case File.read(authority_path(state_root)) do
+      {:ok, raw} ->
+        prior_state = decode_or_raw(raw)
+
+        if not force_active and active_prior_state?(prior_state) do
+          {:error, {:active_lease, evidence(prior_state)}}
+        else
+          record = recovery_record(prior_state, Atom.to_string(invalid), reason, force_active, opts)
+          remove_and_verify(state_root, record, nil)
+        end
+
+      {:error, :enoent} ->
+        {:error, :lease_missing}
+
+      {:error, _} ->
+        {:error, {:lease_state_invalid, :unreadable_state}}
+    end
+  end
+
+  # Any prior record that still classifies `:active` keeps the active-lease guard,
+  # whatever root it names. Domain separation cannot be proven from a path
+  # spelling: Windows resolves trailing dots and spaces, extended-length
+  # prefixes, and mapped drives to the same directory, a relative stored root
+  # moves with the reading BEAM's current directory, and an unresolvable or
+  # unreadable one proves nothing at all. An active-looking record is therefore
+  # treated as possibly this root's own lease; stale, releasable, and
+  # liveness-unknown state keeps the pre-existing recovery path.
+  defp active_prior_state?(prior_state) when is_map(prior_state), do: class_of(prior_state) == :active
+
+  defp active_prior_state?(_prior_state), do: false
 
   defp recovery_record(prior_state, prior_class, reason, force_active, opts) do
     %{
@@ -450,8 +506,79 @@ defmodule SymphonyElixir.RuntimeLease do
       "forced_by" => Keyword.get(opts, :forced_by, ""),
       "force_active" => force_active,
       "prior_class" => prior_class,
-      "prior_state" => prior_state
+      "prior_state" => redact_prior_state(prior_state)
     }
+  end
+
+  # The recovery artifact is durable, operator-readable forensics, so the prior
+  # owner token never lands in it: the token is the lease's only secret, and
+  # recovering a lease needs no token. Every field that identifies the recovered
+  # lease (instance_id, node, os_pid, hostname, timestamps, root) is preserved,
+  # and a marker records that a token existed and was deliberately withheld.
+  defp redact_prior_state(prior_state) when is_map(prior_state) do
+    token = Map.get(prior_state, "owner_token")
+
+    projected =
+      for field <- @identity_fields,
+          value = Map.get(prior_state, field),
+          not is_nil(value),
+          into: %{} do
+        {field, redact_token_value(value, token)}
+      end
+
+    unexpected =
+      prior_state
+      |> Map.keys()
+      |> Kernel.--(@identity_fields ++ ["owner_token"])
+      |> Enum.sort()
+
+    projected
+    |> Map.put("owner_token_redacted", is_binary(token))
+    |> put_unexpected_fields(unexpected)
+  end
+
+  defp redact_prior_state(prior_state) when is_binary(prior_state) do
+    redact_raw_prior_state(prior_state)
+  end
+
+  defp redact_prior_state(prior_state), do: prior_state
+
+  # A decodable record is projected onto the fields the lease contract defines:
+  # the artifact records the recovered lease's identity and never arbitrary
+  # content, which a hand-crafted record could otherwise fill with a copy of the
+  # token in any encoding. A field outside the contract is reported by name only.
+  defp put_unexpected_fields(record, []), do: record
+
+  defp put_unexpected_fields(record, names), do: Map.put(record, "unexpected_fields", names)
+
+  # Within the projection, a verbatim copy of the token value is replaced: an
+  # instance id is hex-shaped just like a token, so identity fields keep their
+  # content otherwise.
+  defp redact_token_value(value, token) when is_list(value), do: Enum.map(value, &redact_token_value(&1, token))
+
+  defp redact_token_value(value, token) when is_map(value) do
+    Map.new(value, fn {key, inner} -> {key, redact_token_value(inner, token)} end)
+  end
+
+  defp redact_token_value(value, token) when is_binary(value) and is_binary(token) and token != "" do
+    String.replace(value, token, @redacted)
+  end
+
+  defp redact_token_value(value, _token), do: value
+
+  # Unparseable prior state has no fields to drop, so the token is cut out of the
+  # bytes instead, in two layers: the field is matched with escaped keys and
+  # unquoted or truncated values tolerated, and every hex run long enough to be a
+  # token or a token prefix is withheld as well — a torn record cannot tell a
+  # token from an equally shaped instance id, a write torn inside the value
+  # leaves a usable prefix, and a spelling this module never writes cannot be
+  # assumed. Everything else stays verbatim as torn-state evidence, and the bytes
+  # are made valid UTF-8 first so the artifact stays JSON-encodable.
+  defp redact_raw_prior_state(raw) when is_binary(raw) do
+    raw
+    |> Redactor.ensure_valid_utf8()
+    |> then(&Regex.replace(@token_field, &1, ~s("owner_token": "#{@redacted}")))
+    |> then(&Regex.replace(@token_run, &1, @redacted))
   end
 
   defp remove_and_verify(state_root, record, target_token) do
@@ -497,7 +624,7 @@ defmodule SymphonyElixir.RuntimeLease do
         {:lease_survived, kind, evidence(survivor)}
 
       _ ->
-        {:lease_survived, :corrupt_state, %{"raw" => raw}}
+        {:lease_survived, :corrupt_state, %{"raw" => redact_raw_prior_state(raw)}}
     end
   end
 
@@ -1137,12 +1264,24 @@ defmodule SymphonyElixir.RuntimeLease do
       not fields_valid or not timestamps_parseable ->
         {:error, {:lease_state_invalid, :schema_invalid}}
 
-      lease["state_root"] != state_root ->
-        {:error, {:lease_state_invalid, :root_mismatch}}
+      root_matches?(lease["state_root"], state_root) ->
+        {:ok, lease}
 
       true ->
-        {:ok, lease}
+        {:error, {:lease_state_invalid, :root_mismatch}}
     end
+  end
+
+  # A stored lease's root identity is a physical-domain question, not a string
+  # comparison: the same directory written with forward slashes, a trailing
+  # separator, another drive-letter case, or reached through a junction is this
+  # root's own lease. A literal comparison misreads that lease as a foreign
+  # record, and foreign records are exactly what the recovery path is allowed to
+  # clear — which is how a spelling difference became a way around the
+  # active-lease guard. Literal equality stays first so a spelling that cannot be
+  # resolved (but is identical) never turns a readable lease into a mismatch.
+  defp root_matches?(stored_root, state_root) do
+    stored_root == state_root or roots_match?(stored_root, state_root)
   end
 
   defp write_lease(state_root, lease) do

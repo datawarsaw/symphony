@@ -74,11 +74,32 @@ SymphonyElixir.RuntimeLease.force_release(state_root,
 Recovery requires explicit confirmation (`confirm: true`) and a non-empty
 `reason`. A lease that still classifies `:active` is refused unless
 `force_active: true` is also passed — decide with the heartbeat evidence, since
-owner liveness cannot be positively proven from another BEAM. Recovery is
-serialized against claim/renew/release by the state-root op lock
+owner liveness cannot be positively proven from another BEAM. That refusal is
+bound to the physical root, not to one spelling of it: a lease claimed as
+`C:\state\symphony` is refused just the same when recovery is invoked with
+`C:/state/symphony`, another drive-letter case, a trailing separator, or a
+junction path, because lease reads compare roots with
+`RuntimeLease.roots_match?/2`. An unreadable or ambiguous record that still
+looks active is refused the same way, whatever root it names: domain separation
+cannot be proven from a spelling, because Windows resolves trailing dots and
+spaces, extended-length prefixes, and mapped drives to the same directory, and a
+relative stored path resolves against the reading BEAM's current directory. Only
+stale, releasable, or liveness-unknown state recovers without the override.
+
+Recovery is serialized against claim/renew/release by the state-root op lock
 (`authority.op-lock`), preserves the prior state to `authority.recovery.json`,
 and re-reads after removal: success is returned only when the lease is verifiably
-gone. A surviving lease (same, replacement, or corrupt) fails closed.
+gone. A surviving lease (same, replacement, or corrupt) fails closed. The
+artifact is durable evidence for humans, so it keeps every field that identifies
+the recovered lease (`state_root`, `instance_id`, `node`, `os_pid`,
+`hostname`, timestamps, `prior_class`) and drops the prior `owner_token`,
+marking it with `"owner_token_redacted": true`. The record is a projection onto
+those contract fields: a field outside the contract is reported by name only, so
+a hand-crafted record cannot smuggle a token copy into the artifact, and a
+verbatim copy of the token value inside the projection is replaced. When the
+prior state is unparseable bytes, the bytes are preserved with the token field
+and token-shaped hex runs cut out, so torn-state evidence survives without the
+token.
 
 Never delete `authority.json` by hand while a runtime may be alive: that makes
 the holder fail closed and stop the runtime (by design), and leaves the restart

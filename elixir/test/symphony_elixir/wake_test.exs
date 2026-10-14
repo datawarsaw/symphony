@@ -48,6 +48,18 @@ defmodule SymphonyElixir.WakeTest do
       assert Event.classify(:parked, stop_reason: :recovered_parked) == :deterministic
     end
 
+    # WAKE-EVENT-TAXONOMY-FIX: the M1-H-F dispatch-boundary host refusal is a
+    # declared producer (Orchestrator.park_opencode_remote_host/3), so it must
+    # be a registered kind rather than raising FunctionClauseError.
+    test "opencode remote-host refusal is a registered actionable kind" do
+      assert :opencode_remote_host_ineligible in Event.kinds()
+      assert Event.classify(:opencode_remote_host_ineligible) == :actionable
+
+      # The dedicated kind and the co-emitted park for the same stop reason
+      # agree, so one refusal never reports two contradictory classes.
+      assert Event.classify(:parked, stop_reason: :opencode_remote_host_ineligible) == :actionable
+    end
+
     test "identity is stable for identical evidence and distinct otherwise" do
       a = Event.identity(:worker_failed, "ISS-1", @failed_opts)
       b = Event.identity(:worker_failed, "ISS-1", @failed_opts)
@@ -101,6 +113,47 @@ defmodule SymphonyElixir.WakeTest do
       assert {:suppress, receipt, :deterministic} = verdict
       refute receipt.actionable
       assert Ledger.snapshot(ledger).pending_actionable == []
+    end
+
+    # WAKE-EVENT-TAXONOMY-FIX: with an active ledger the host refusal now wakes
+    # and persists instead of raising on the unregistered kind.
+    test "remote-host refusal wakes and persists an actionable receipt" do
+      root = tmp_root()
+      ledger = Ledger.new(root)
+
+      {ledger, {:wake, receipt}} =
+        Ledger.observe(ledger, :opencode_remote_host_ineligible, "ISS-1", evidence: "harness:host:worker-01:2200")
+
+      assert receipt.kind == :opencode_remote_host_ineligible
+      assert receipt.actionable
+      refute receipt.decision_required
+
+      assert [%{kind: :opencode_remote_host_ineligible, actionable: true}] =
+               Ledger.snapshot(ledger).pending_actionable
+
+      assert {:ok, %{pending: pending}} = Store.read_issue(root, "ISS-1")
+      assert Enum.any?(pending, &(&1.kind == :opencode_remote_host_ineligible and &1.actionable))
+    end
+
+    # The refusal and the park it produces are distinct problems on the same
+    # issue and both stay pending, exactly like the fence/park pair above.
+    test "remote-host refusal and its park stay distinct pending wakes" do
+      ledger = Ledger.new()
+
+      {ledger, {:wake, refused}} =
+        Ledger.observe(ledger, :opencode_remote_host_ineligible, "ISS-1", evidence: "harness:host:worker-01:2200")
+
+      {ledger, {:wake, parked}} =
+        Ledger.observe(ledger, :parked, "ISS-1",
+          stop_reason: :opencode_remote_host_ineligible,
+          evidence: "stop:opencode_remote_host_ineligible:attempt:1",
+          attempt_id: 1
+        )
+
+      refute refused.event_id == parked.event_id
+
+      assert Enum.sort(Enum.map(Ledger.snapshot(ledger).pending_actionable, & &1.kind)) ==
+               [:opencode_remote_host_ineligible, :parked]
     end
   end
 

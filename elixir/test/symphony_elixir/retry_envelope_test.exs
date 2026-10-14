@@ -589,6 +589,95 @@ defmodule SymphonyElixir.RetryEnvelopeTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # START-CLASSIFICATION regression: a provider-credential rejection refuses
+  # the launch before any worker process exists, so the runner refines the
+  # pre-launch expectation to NEVER_STARTED. The armed pilot's single-attempt
+  # funnel must then park that failed single attempt honestly
+  # (:pilot_single_attempt, no retry timer) — never as
+  # :worker_termination_unconfirmed, which is reserved for a process that
+  # existed and whose death stayed unproven.
+  # ---------------------------------------------------------------------------
+
+  test "armed pilot parks a never-started single attempt with no retry timer", %{root: root} do
+    arm_pilot!()
+    state = fresh_state()
+    issue = test_issue("ISS-PILOT-NS", "MT-PILOT-NS")
+
+    entry =
+      managed_entry(issue, %{termination_expectation: :NEVER_STARTED})
+      |> Map.put(:harness, :opencode)
+
+    reason =
+      SymphonyElixir.AgentRunner.FailureError.exception(
+        message: "Agent run failed for #{issue.id}: {:missing_provider_credential, \"opencode-go\"}",
+        failure_class: :persistent_worker_failure,
+        reason: {:missing_provider_credential, "opencode-go"}
+      )
+
+    next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-pns", reason)
+
+    try do
+      parked = Orchestrator.parked_for_test(next)
+      assert Map.has_key?(parked, issue.id)
+      assert parked[issue.id].stop_reason == :pilot_single_attempt
+      assert parked[issue.id].termination_expectation == :NEVER_STARTED
+      assert parked[issue.id].failure_class == "PERSISTENT_WORKER_FAILURE"
+      assert parked[issue.id].worker_identity == nil
+      assert MapSet.member?(next.claimed, issue.id)
+      assert next.retry_attempts == %{}
+
+      assert {:ok, record} = RetryStore.read_record(root, issue.id)
+      assert record["status"] == "parked"
+      assert record["stop_reason"] == "pilot_single_attempt"
+      assert record["termination_expectation"] == "NEVER_STARTED"
+      assert record["attempt_count"] == 1
+      assert record["failure_class"] == "PERSISTENT_WORKER_FAILURE"
+    after
+      cancel_timers(next)
+    end
+  end
+
+  test "armed pilot still parks an unconfirmed post-launch worker termination fail-closed" do
+    arm_pilot!()
+    state = fresh_state()
+    issue = test_issue("ISS-PILOT-UNC", "MT-PILOT-UNC")
+
+    entry =
+      managed_entry(issue, %{
+        harness: :opencode,
+        worker_identity: %{"launch_id" => "l-pilot-unc", "receipt_path" => Path.join(System.tmp_dir!(), "l-pilot-unc.json")},
+        worker_termination: %{status: :TERMINATION_UNCONFIRMED, exit_code: nil, reason: :termination_wait_timeout}
+      })
+
+    next = Orchestrator.handle_failure_for_test(state, issue.id, entry, "sess-punc", :provider_outage)
+
+    try do
+      parked = Orchestrator.parked_for_test(next)
+      assert Map.has_key?(parked, issue.id)
+      # A launch that DID establish a process keeps the fail-closed
+      # unconfirmed-termination park, armed pilot or not.
+      assert parked[issue.id].stop_reason == :worker_termination_unconfirmed
+      assert MapSet.member?(next.claimed, issue.id)
+      assert next.retry_attempts == %{}
+    after
+      cancel_timers(next)
+    end
+  end
+
+  defp arm_pilot! do
+    previous = Application.get_env(:symphony_elixir, :pilot_guard)
+    :ok = SymphonyElixir.PilotGuard.arm(workflow_path: Workflow.workflow_file_path())
+
+    on_exit(fn ->
+      if is_nil(previous) do
+        Application.delete_env(:symphony_elixir, :pilot_guard)
+      else
+        Application.put_env(:symphony_elixir, :pilot_guard, previous)
+      end
+    end)
+  end
+
   test "remote launches keep NOT_APPLICABLE and the legacy retry semantics" do
     state = fresh_state()
     issue = test_issue("ISS-REMOTE-NP", "MT-REMOTE-NP")
