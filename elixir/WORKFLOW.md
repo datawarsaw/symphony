@@ -32,7 +32,7 @@ routing:
       source_path: "C:/AI/wup"
       remote: "https://github.com/datawarsaw/wup.git"
     agent-platform-code-skills:
-      source_path: "C:/AI/code-skills"
+      source_path: "C:/AI/agent-platform/agent-platform-skills"
     agent-platform-workstation-ops:
       source_path: "C:/AI/agent-platform/workstation-ops-mcp"
       remote: "https://github.com/datawarsaw/workstation-ops-mcp.git"
@@ -82,7 +82,7 @@ agent:
 # Optional local read-only gate. Enabling it also polls the Discovery state.
 discovery:
   enabled: false
-  skill_path: C:/AI/code-skills/discovery-gate/SKILL.md
+  skill_path: C:/AI/agent-platform/agent-platform-skills/discovery-gate/SKILL.md
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-6-astra"' --config model_reasoning_effort=medium app-server
   default_model: gpt-6-astra

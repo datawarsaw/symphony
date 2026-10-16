@@ -7,12 +7,12 @@ Discovery is an opt-in, local Symphony lane. It reuses the existing Codex app-se
 ```yaml
 discovery:
   enabled: true
-  skill_path: C:/AI/code-skills/discovery-gate/SKILL.md
+  skill_path: C:/AI/agent-platform/agent-platform-skills/discovery-gate/SKILL.md
 ```
 
-The skill and its sibling `references/discovery-contract.md` must be readable on the Symphony host. They are loaded into a single immutable input with the issue id/title/description, labels, parent/project context, allowlisted repository routing and explicit lifecycle/security constraints. Repository routing must resolve a canonical source path. Discovery adds `Discovery` to the configured active states when enabled. The default is disabled.
+The skill and its sibling `references/discovery-contract.md` must be readable on the Symphony host. They are loaded into a single immutable input with the issue id/title/description, labels, parent/project context, allowlisted repository routing and explicit lifecycle/security constraints. Repository routing must resolve a canonical source path. The input also carries the effective primary provider/model/reasoning route as structured data, so the input digest — and therefore the evidence path — changes whenever that route changes. A receipt retained under an earlier route can never satisfy a lookup for the current route, be republished as current-model evidence, or be handed off as implementation input; the stale issue directory fails closed until Discovery runs again under the current route. Discovery adds `Discovery` to the configured active states when enabled. The default is disabled.
 
-The fixed routes are `xai/grok-4.6` with medium reasoning, followed only on technical failure by `google-antigravity/gemini-3.8-flash` with medium reasoning. The existing gateway owns provider authentication. The returned app-server model must match the requested route. Successful verdicts and malformed successful output never cause fallback. A structured rate-limit failure gets one retry after one second, then technical fallback; other recognized availability/authentication/quota/transport failures go directly to fallback. The fallback gets the exact original input bytes in a fresh session. Outputs from attempts are never combined.
+The fixed routes are `OpenDesign/deepseek-v4.1-flash` with medium reasoning, followed only on technical failure by `google-antigravity/gemini-3.8-flash` with medium reasoning. The existing gateway owns provider authentication. The returned app-server model must match the requested route. Successful verdicts and malformed successful output never cause fallback. A structured rate-limit failure gets one retry after one second, then technical fallback; other recognized availability/authentication/quota/transport failures go directly to fallback. The fallback gets the exact original input bytes in a fresh session. Outputs from attempts are never combined.
 
 ## Read-only boundary
 
@@ -22,7 +22,7 @@ The session requests and verifies a read-only sandbox with network access disabl
 
 ## Output and lifecycle
 
-The validator consumes one Discovery Brief. READY additionally requires a full Todo Handoff, matching issue identity, the configured destination repository, consistent declared scope (LARGE + BROAD is rejected) and `SPLIT REQUIRED: NO`. SPLIT requires a proposal with at least two complete child entries and never exposes a handoff. All other successful verdicts retain their output and cannot start implementation. Invalid output is retained as INVALID rather than being repaired by a second model.
+The validator consumes one Discovery Brief. Workers may stream a short progress narration before the `DISCOVERY BRIEF` heading; only a bounded leading prefix is tolerated, currently **4,000 bytes**. Narration is discarded before validation and is never retained as contract content, but the full worker output is still stored as evidence. A heading at or below that limit is accepted; a heading buried deeper in unrelated output, a duplicated heading, or an inline `DISCOVERY BRIEF` mention that is not on its own line is still rejected as INVALID. READY additionally requires a full Todo Handoff, matching issue identity, the configured destination repository, consistent declared scope (LARGE + BROAD is rejected) and `SPLIT REQUIRED: NO`. SPLIT requires a proposal with at least two complete child entries and never exposes a handoff. All other successful verdicts retain their output and cannot start implementation. Invalid output is retained as INVALID rather than being repaired by a second model.
 
 The host atomically writes result evidence below:
 
@@ -30,7 +30,9 @@ The host atomically writes result evidence below:
 
 Evidence includes the output, input hash, primary/fallback lane, requested provider/model/reasoning and fallback reason. No credential or raw provider-error payload is stored. A completed Discovery run parks the existing issue claim without a continuation retry. Its tracker state remains Discovery, including after READY. An external lifecycle action is required to move the issue to Todo; the Discovery worker never performs that action.
 
-On a later implementation run, a matching READY receipt supplies only its Todo Handoff as the issue description to the existing implementation workflow. The full Discovery transcript is not injected. Previously gated issues with changed input or non-READY evidence fail closed. Todo issues without prior Discovery evidence retain their existing behavior. The evidence cache prevents repeated model runs after process restart. Changes to the issue's relevant input produce a new input identity; the existing block is released when the issue leaves Discovery or its task context changes.
+On a later implementation run, a matching READY receipt supplies only its Todo Handoff as the issue description to the existing implementation workflow. The full Discovery transcript is not injected. Previously gated issues with changed input or non-READY evidence fail closed. Todo issues without prior Discovery evidence retain their existing behavior. The evidence cache prevents repeated model runs after process restart. Changes to the issue's relevant input — including any change to the effective primary route — produce a new input identity, so a route change invalidates the earlier cache entry instead of silently reusing its receipt; the existing block is released when the issue leaves Discovery or its task context changes.
+
+Because the route is part of the input identity, changing the configured primary route requires fresh Discovery evidence for each affected issue before its retained receipt can authorize implementation. Existing receipt files stay untouched as audit history; they are simply no longer addressable under the new identity.
 
 For an intentional rerun of unchanged input after an infrastructure repair, an operator must archive the exact evidence file outside the result store and restart the scheduler. Do not edit a receipt to manufacture READY. Live workflow enablement and delivery of this candidate are separate operations.
 
@@ -44,7 +46,12 @@ Run the repository's format, lint, full coverage and type gates before delivery.
 
 After retention, Symphony rereads and revalidates the contract, verdict, issue identity and
 canonical repository binding before publishing a concise Discovery comment. SPLIT also
-binds its parent identity. Invalid or unbound output is never published; a host warning records
+binds its parent identity. Identity is read only from validated regions: the brief and
+handoff must both carry the issue identity, and the SPLIT parent identity is read
+exclusively from the validated `SPLIT PROPOSAL` region. Discarded narration and unrelated
+brief sections therefore cannot supply, inflate or spoof an identity — a `PARENT ISSUE`
+or `ISSUE` line outside the validated region is inert, and a proposal naming a different
+parent fails closed. Invalid or unbound output is never published; a host warning records
 the issue identity without logging raw output. The worker has no Linear write capability.
 The host publication path creates comments only: it never updates descriptions or lifecycle
 state and never dispatches implementation or Refinement.

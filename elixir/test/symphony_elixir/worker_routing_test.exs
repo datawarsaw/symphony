@@ -93,8 +93,8 @@ defmodule SymphonyElixir.WorkerRoutingTest do
 
     test "reviewer/provider-diversity route remains unchanged and distinct from worker default" do
       primary = DiscoverySession.primary()
-      assert primary.provider == "xai"
-      assert primary.model == "xai/grok-4.6"
+      assert primary.provider == "OpenDesign"
+      assert primary.model == "OpenDesign/deepseek-v4.1-flash"
       assert primary.reasoning == "medium"
 
       fallback = DiscoverySession.fallback()

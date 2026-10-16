@@ -114,9 +114,11 @@ defmodule SymphonyElixir.Discovery.Publication do
       "\nA separate lifecycle decision is required before implementation."
   end
 
-  defp handoff(%{verdict: "SPLIT", output: text}) do
+  # The published SPLIT excerpt comes from the same validated proposal region that
+  # authorized publication, so worker narration can never contribute published content.
+  defp handoff(%{verdict: "SPLIT", proposal: proposal}) when is_binary(proposal) do
     "SPLIT PROPOSAL — review and create bounded child issues separately.\n" <>
-      excerpt(text |> String.split("\nSPLIT PROPOSAL") |> List.last(), 1_200)
+      excerpt(proposal, 1_200)
   end
 
   defp handoff(parsed) do

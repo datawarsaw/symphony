@@ -1,7 +1,14 @@
 defmodule SymphonyElixir.DiscoveryIntegrationTest do
   use SymphonyElixir.TestSupport
-  alias SymphonyElixir.Discovery
+  alias SymphonyElixir.{Discovery, LaunchMarker, RetryStore, WorkerContainment, WorkerFence}
   @ready File.read!(Path.expand("../fixtures/discovery-ready.txt", __DIR__))
+
+  # Managed worker containment is a Windows-only launch class; on other hosts
+  # the Discovery launch fence has no managed worker to exercise.
+  @fence_skip if(match?({:win32, _}, :os.type()),
+                do: false,
+                else: "Managed worker containment is Windows-only; the Discovery launch fence is not exercised on this host"
+              )
 
   setup do
     root = Path.dirname(Workflow.workflow_file_path())
@@ -59,7 +66,12 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     {:ok, input} = Discovery.snapshot(issue)
     path = evidence_path(issue)
     File.mkdir_p!(Path.dirname(path))
-    File.write!(path, Jason.encode!(%{input_sha256: digest(input), status: status, output: output, provider: "xai", model: "xai/grok-4.6", reasoning: "medium", lane: "primary"}))
+
+    File.write!(
+      path,
+      Jason.encode!(%{input_sha256: digest(input), status: status, output: output, provider: "OpenDesign", model: "OpenDesign/deepseek-v4.1-flash", reasoning: "medium", lane: "primary"})
+    )
+
     path
   end
 
@@ -169,6 +181,103 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     assert {:error, :stale_discovery_handoff} = Discovery.implementation_issue(changed)
     retain(issue, "READY", String.replace(ready, ~r/^REPO: .+$/m, "REPO: /wrong/repo"))
     assert {:error, :invalid_discovery_handoff} = Discovery.implementation_issue(issue)
+  end
+
+  # Builds the immutable input the lane would have produced under a given primary route.
+  # Used to place receipts where an earlier provider/model route would have written them.
+  defp input_for_route(issue, route) do
+    skill = File.read!(Config.settings!().discovery.skill_path)
+    contract = File.read!(Path.join(Path.dirname(Config.settings!().discovery.skill_path), "references/discovery-contract.md"))
+    {:ok, resolved} = SymphonyElixir.RepositoryRouter.resolve(issue, Config.settings!().routing)
+    Discovery.immutable_input(issue, Map.from_struct(resolved), route, skill, contract)
+  end
+
+  defp old_route, do: %{provider: "xai", model: "xai/grok-4.6", reasoning: "medium"}
+
+  defp old_route_evidence_path(issue) do
+    input = input_for_route(issue, old_route())
+    Path.join([Config.local_workspace_root(), ".discovery-results", digest(issue.id), digest(input) <> ".json"])
+  end
+
+  # Simulates a receipt retained by an earlier provider/model route: it is a valid READY
+  # result, but it was generated for a different effective route.
+  defp retain_old_route_receipt(issue, output) do
+    input = input_for_route(issue, old_route())
+    path = old_route_evidence_path(issue)
+    File.mkdir_p!(Path.dirname(path))
+
+    File.write!(
+      path,
+      Jason.encode!(%{
+        input_sha256: digest(input),
+        status: "READY",
+        output: output,
+        provider: "xai",
+        model: "xai/grok-4.6",
+        reasoning: "medium",
+        lane: "primary"
+      })
+    )
+
+    path
+  end
+
+  test "a retained receipt from an earlier provider route is never reused as current evidence", %{issue: issue, ready: ready} do
+    old_path = retain_old_route_receipt(issue, ready)
+    old_bytes = File.read!(old_path)
+
+    # Route identity is part of the immutable input, so the current route resolves a
+    # different evidence path than the earlier route wrote.
+    {:ok, current_input} = Discovery.snapshot(issue)
+    refute current_input == input_for_route(issue, old_route())
+    refute evidence_path(issue) == old_path
+
+    # The existing stale-handoff safeguard stays effective: the issue's result directory
+    # holds evidence, but none matching the current input, so implementation fails closed
+    # instead of consuming the earlier route's handoff.
+    assert {:error, :stale_discovery_handoff} = Discovery.implementation_issue(%{issue | state: "Todo"})
+
+    # The lane must likewise find no current-route evidence, execute, and record a
+    # technical failure for the CURRENT route rather than returning the earlier READY.
+    # The deterministic peer swallows the handshake and exits 3, so the infrastructure
+    # failure is recorded without racing the handshake write: a command that cannot be
+    # launched at all dies before the initialize write and surfaces as an :epipe.
+    point_codex_command_at(technical_failure_command())
+
+    assert :ok = Discovery.run(issue, self())
+    assert_receive {:discovery_completed, "discovery-issue", "TECHNICAL_FAILURE"}, 5_000
+    refute_received {:discovery_completed, "discovery-issue", "READY"}
+    assert File.read!(old_path) == old_bytes
+  end
+
+  test "an earlier route receipt is never republished as current-route evidence", %{issue: issue, ready: ready} do
+    retain_old_route_receipt(issue, ready)
+    {peer, graphql} = publication_peer()
+
+    # The deterministic peer swallows the handshake and exits 3 instead of answering, so
+    # the current route provably re-executes and records its own technical failure. The
+    # default command cannot be launched at all, which would fail as an :epipe during the
+    # initialize write rather than as a classified infrastructure failure.
+    point_codex_command_at(technical_failure_command())
+
+    assert :ok = Discovery.run(issue, self(), publication_graphql: graphql)
+    refute_received {:discovery_completed, "discovery-issue", "READY"}
+
+    # The current route really re-executed and recorded its own failure: a lane that
+    # crashed or short-circuited would satisfy the negative assertion vacuously.
+    assert_receive {:discovery_completed, "discovery-issue", "TECHNICAL_FAILURE"}, 5_000
+    assert retained_receipt(issue)["status"] == "TECHNICAL_FAILURE"
+
+    assert Agent.get(peer, & &1.calls) == []
+    assert Agent.get(peer, &map_size(&1.comments)) == 0
+  end
+
+  test "the current route still reuses its own retained receipt unchanged", %{issue: issue, ready: ready} do
+    retain(issue, "READY", ready)
+    {peer, graphql} = publication_peer()
+    assert :ok = Discovery.run(issue, self(), publication_graphql: graphql)
+    assert_receive {:discovery_completed, "discovery-issue", "READY"}
+    assert Agent.get(peer, &map_size(&1.comments)) == 1
   end
 
   test "READY binding accepts a descriptive REPO field that names the canonical source once", %{issue: issue, ready: ready} do
@@ -283,6 +392,340 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     assert_receive {:discovery_completed, "discovery-issue", "READY"}, 5_000
   end
 
+  # MIC-223 Discovery launch fence over the real launch path: the deterministic
+  # protocol peer is wrapped in a probe that witnesses the durable launch marker
+  # from inside the worker process at its first instruction, binding these
+  # regressions to what the worker actually observed at launch time.
+
+  @tag skip: @fence_skip
+  @tag timeout: 120_000
+  test "Discovery's live-store launch writes the issue-keyed marker before the worker's first instruction",
+       %{issue: issue} do
+    reset_fence_env!()
+    fence_launch_helper!()
+    issue = fence_issue!(issue, "live")
+    witness_path = Path.join(Config.local_workspace_root(), "fence-witness-live.json")
+    marker_path = LaunchMarker.marker_path(issue.id)
+
+    point_codex_command_at(fence_probe_command(issue, marker_path, witness_path, "-"))
+
+    assert :ok = AgentRunner.run(issue, self())
+    assert_receive {:discovery_completed, issue_id, "READY"}, 5_000
+    assert issue_id == issue.id
+
+    witness = fence_witness!(witness_path)
+    marker = witnessed_marker!(witness, issue)
+    identity = marker["worker_identity"]
+
+    assert normalized_path(witness["marker_path"]) == normalized_path(marker_path)
+
+    assert String.starts_with?(normalized_path(marker_path), normalized_path(Config.local_workspace_root())),
+           "the live-store marker must resolve under the configured workspace root"
+
+    assert witness["receipt_exists_at_start"] == false
+
+    wait_until(10_000, fn -> match?({:ok, :dead}, WorkerFence.confirm_termination_receipt(identity)) end)
+  end
+
+  @tag skip: @fence_skip
+  @tag timeout: 120_000
+  test "Discovery pins the launch marker and receipt identity to the authority root, not live configuration",
+       %{issue: issue} do
+    reset_fence_env!()
+    fence_launch_helper!()
+    issue = fence_issue!(issue, "pinned")
+    root = fence_fixture_root!("discovery-fence-pinned")
+    witness_path = Path.join(root, "fence-witness-pinned.json")
+    marker_path = LaunchMarker.marker_path(issue.id, root: root)
+
+    fence_workflow!()
+    live = Config.local_workspace_root()
+    point_codex_command_at(fence_probe_command(issue, marker_path, witness_path, "-"))
+
+    assert :ok = AgentRunner.run(issue, self(), authority_root: root)
+    assert_receive {:discovery_completed, issue_id, "READY"}, 5_000
+    assert issue_id == issue.id
+
+    witness = fence_witness!(witness_path)
+    marker = witnessed_marker!(witness, issue)
+    identity = marker["worker_identity"]
+
+    assert normalized_path(witness["marker_path"]) == normalized_path(marker_path)
+    assert identity["authority_root"] == root
+    assert normalized_path(Path.dirname(identity["receipt_path"])) == normalized_path(WorkerContainment.receipt_dir(root))
+    assert Path.basename(identity["receipt_path"]) == identity["launch_id"] <> ".json"
+    assert witness["receipt_exists_at_start"] == false
+
+    # Live resolution finds nothing: an unpinned store would answer every fence
+    # from the wrong root — the fail-open trap the pinning closes.
+    refute File.exists?(marker_path_under(live, issue.id))
+    assert {:error, :not_found} = LaunchMarker.read(issue.id)
+    assert :allowed = LaunchMarker.reuse_gate(issue.id)
+
+    # The wrapper's drain proof lands under the pinned root and opens the gate.
+    wait_until(10_000, fn -> match?({:ok, :dead}, WorkerFence.confirm_termination_receipt(identity)) end)
+    wait_until(10_000, fn -> LaunchMarker.reuse_gate(issue.id, root: root) == :allowed end)
+    assert {:ok, receipt} = WorkerContainment.parse_receipt(identity["receipt_path"])
+    assert receipt["launch_id"] == identity["launch_id"]
+    assert WorkerContainment.classify_receipt(receipt) == :TERMINATED_CONFIRMED
+  end
+
+  @tag skip: @fence_skip
+  @tag timeout: 120_000
+  test "a pinned Discovery launch stays fenced at the authority root across an A to B workflow reload",
+       %{issue: issue} do
+    reset_fence_env!()
+    fence_launch_helper!()
+    issue = fence_issue!(issue, "reload")
+    root_a = fence_fixture_root!("discovery-fence-reload-a")
+    root_b = fence_fixture_root!("discovery-fence-reload-b")
+    witness_path = Path.join(root_a, "fence-witness-reload.json")
+    release_path = Path.join(root_a, "fence-release-reload")
+    marker_path = LaunchMarker.marker_path(issue.id, root: root_a)
+
+    fence_workflow!()
+    point_codex_command_at(fence_probe_command(issue, marker_path, witness_path, release_path))
+
+    test_pid = self()
+    task = Task.async(fn -> Discovery.run(issue, test_pid, authority_root: root_a) end)
+
+    witness = fence_witness!(witness_path)
+    marker = witnessed_marker!(witness, issue)
+    identity = marker["worker_identity"]
+
+    # The held worker is alive and its death unproven: the pinned fence refuses.
+    assert {:ok, disk_marker} = LaunchMarker.read(issue.id, root: root_a)
+    assert disk_marker["issue_id"] == issue.id
+    assert {:blocked, :worker_termination_unproven} = LaunchMarker.reuse_gate(issue.id, root: root_a)
+
+    # Configuration reloads A -> B while the launch is live.
+    point_workspace_root_at(root_b)
+
+    # Live reads now resolve under B where nothing exists (the unpinned gate
+    # fails open); the pinned gates still answer from A with the unproven launch.
+    assert {:error, :not_found} = LaunchMarker.read(issue.id)
+    assert :allowed = LaunchMarker.reuse_gate(issue.id)
+    assert {:blocked, :worker_termination_unproven} = LaunchMarker.reuse_gate(issue.id, root: root_a)
+    assert {:blocked, :worker_termination_unproven} = LaunchMarker.cleanup_gate(issue.id, root: root_a)
+    refute File.exists?(marker_path_under(root_b, issue.id))
+
+    # Release the worker; its pinned receipt proof opens the pinned gate.
+    File.write!(release_path, "release\n")
+    assert :ok = Task.await(task, 30_000)
+    assert_receive {:discovery_completed, issue_id, "READY"}, 5_000
+    assert issue_id == issue.id
+
+    wait_until(10_000, fn -> match?({:ok, :dead}, WorkerFence.confirm_termination_receipt(identity)) end)
+    wait_until(10_000, fn -> LaunchMarker.reuse_gate(issue.id, root: root_a) == :allowed end)
+  end
+
+  @tag skip: @fence_skip
+  @tag timeout: 120_000
+  test "an abruptly killed Discovery launcher leaves the pinned fence standing until receipt proof lands",
+       %{issue: issue} do
+    reset_fence_env!()
+    fence_launch_helper!()
+    issue = fence_issue!(issue, "kill")
+    root = fence_fixture_root!("discovery-fence-kill")
+    witness_path = Path.join(root, "fence-witness-kill.json")
+    # This path is never created: the worker stays held through the kill until
+    # its bounded hold deadline (kept short so the kill scenario stays quick).
+    hold_path = Path.join(root, "fence-hold-kill")
+    marker_path = LaunchMarker.marker_path(issue.id, root: root)
+
+    fence_workflow!()
+    point_codex_command_at(fence_probe_command(issue, marker_path, witness_path, hold_path, 5))
+
+    {:ok, supervisor} = Task.Supervisor.start_link()
+    task = Task.Supervisor.async_nolink(supervisor, fn -> Discovery.run(issue, nil, authority_root: root) end)
+
+    witness = fence_witness!(witness_path)
+    marker = witnessed_marker!(witness, issue)
+    identity = marker["worker_identity"]
+    receipt_path = identity["receipt_path"]
+
+    assert {:blocked, :worker_termination_unproven} = LaunchMarker.reuse_gate(issue.id, root: root)
+
+    # BEAM-side death of the launcher: the port owner is killed, not drained.
+    ref = Process.monitor(task.pid)
+    _ = Task.shutdown(task, :brutal_kill)
+    assert_receive {:DOWN, ^ref, :process, _, :killed}
+
+    # The abrupt death is not proof of worker death: the durable marker stands
+    # (no live code path clears it) and the fence keeps refusing.
+    assert File.regular?(marker_path)
+    assert {:ok, disk_marker} = LaunchMarker.read(issue.id, root: root)
+    assert disk_marker["launch_id"] == identity["launch_id"]
+
+    # Only durable receipt evidence opens the gate. The wrapper survives BEAM
+    # death, but the worker cannot see the broken pipe as EOF while the unread
+    # initialize request still sits in it; it exits at its bounded hold
+    # deadline, the wrapper drains the job tree, and its receipt lands under
+    # the pinned root.
+    wait_until(15_000, fn -> LaunchMarker.reuse_gate(issue.id, root: root) == :allowed end)
+    assert {:ok, receipt} = WorkerContainment.parse_receipt(receipt_path)
+    assert receipt["launch_id"] == identity["launch_id"]
+    assert WorkerContainment.classify_receipt(receipt) == :TERMINATED_CONFIRMED
+
+    # The gate opened on the receipt evidence while the marker still names the
+    # launch — never through deletion or a runtime restart.
+    assert {:ok, standing} = LaunchMarker.read(issue.id, root: root)
+    assert standing["launch_id"] == identity["launch_id"]
+  end
+
+  defp reset_fence_env! do
+    Application.delete_env(:symphony_elixir, :launch_marker_root)
+    Application.delete_env(:symphony_elixir, :worker_termination_receipt_root)
+    :ok
+  end
+
+  # Agent sandboxes on some hosts confine any process whose image lives under
+  # the workspace root to writes under that same root. The fence tests must
+  # launch the real helper while the worker writes its witness and receipt
+  # under fixture roots in the system temp directory, so point the launcher at
+  # a byte-identical copy of the verified helper outside the workspace. The
+  # copy carries the same .sha256 sidecar and is hash-verified by
+  # WorkerContainment.helper_path/0 exactly like the original, so the launch
+  # path, its checks, and every assertion stay unchanged.
+  defp fence_launch_helper! do
+    {:ok, helper} = WorkerContainment.helper_path()
+    dir = Path.join(System.tmp_dir!(), "symphony-fence-jobrun-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    copy = Path.join(dir, "jobrun.exe")
+    File.cp!(helper, copy)
+    File.cp!(helper <> ".sha256", copy <> ".sha256")
+    previous = Application.get_env(:symphony_elixir, :jobrun_helper_path)
+    Application.put_env(:symphony_elixir, :jobrun_helper_path, copy)
+
+    on_exit(fn ->
+      if is_binary(previous) do
+        Application.put_env(:symphony_elixir, :jobrun_helper_path, previous)
+      else
+        Application.delete_env(:symphony_elixir, :jobrun_helper_path)
+      end
+
+      File.rm_rf(dir)
+    end)
+
+    :ok
+  end
+
+  # A per-test issue id keeps the live store's Discovery evidence from turning
+  # these launches into cache hits of another test's retained evidence.
+  defp fence_issue!(issue, label) do
+    %{issue | id: "discovery-fence-#{label}-#{System.unique_integer([:positive])}"}
+  end
+
+  defp fence_fixture_root!(label) do
+    root = Path.join(System.tmp_dir!(), "#{label}-#{System.unique_integer([:positive])}")
+    File.rm_rf!(root)
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+    root
+  end
+
+  # Rewrites the per-test workflow into the pinned-containment shape the fence
+  # tests need. write_workflow_file!/2 regenerates the file and drops the
+  # discovery section the setup injected, so re-inject it before reloading.
+  defp fence_workflow! do
+    path = Workflow.workflow_file_path()
+    root = Path.dirname(path)
+    skill = Path.join(root, "skill/SKILL.md")
+
+    write_workflow_file!(path,
+      tracker_kind: "memory",
+      poll_interval_ms: 600_000,
+      workspace_root: Path.join(root, "workspaces"),
+      routing: %{"targets" => %{"symphony" => %{"source_path" => Path.join(root, "source")}}},
+      hooks_before_run: "exit 77",
+      hooks_after_run: "exit 78",
+      codex_read_timeout_ms: 30_000,
+      codex_worker_termination_grace_ms: 250,
+      codex_command: "must-not-launch-discovery-fence"
+    )
+
+    body = File.read!(path)
+
+    body =
+      String.replace(body, "---", "---\ndiscovery:\n  enabled: true\n  skill_path: #{Jason.encode!(skill)}", global: false)
+
+    File.write!(path, body)
+    WorkflowStore.force_reload()
+    :ok
+  end
+
+  # The Discovery codex command: the fence probe wrapping the deterministic
+  # protocol peer, with the issue-keyed marker path it must witness. A hold
+  # timeout keeps a held worker's bounded hold short for kill scenarios.
+  defp fence_probe_command(issue, marker_path, witness_path, hold_path, hold_timeout_seconds \\ nil) do
+    python = System.find_executable("python") || System.find_executable("python3")
+    assert is_binary(python), "Python is required for the deterministic protocol peer"
+    probe = Path.expand("../fixtures/discovery_fence_probe.py", __DIR__)
+    peer = Path.expand("../fixtures/discovery_app_server.py", __DIR__)
+    fixture = Path.expand("../fixtures/discovery-ready.txt", __DIR__)
+    {:ok, route} = SymphonyElixir.RepositoryRouter.resolve(issue, Config.settings!().routing)
+    args = [python, "-u", probe, marker_path, witness_path, hold_path, peer, fixture, route.source_path]
+    args = if hold_timeout_seconds, do: args ++ [to_string(hold_timeout_seconds)], else: args
+    Enum.map_join(args, " ", &shell_quote/1)
+  end
+
+  # Moves the workflow's workspace root (the A -> B reload) without disturbing
+  # the injected discovery section; mirrors TestSupport's YAML string quoting.
+  defp point_workspace_root_at(root) do
+    path = Workflow.workflow_file_path()
+
+    quoted =
+      "\"" <> (root |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")) <> "\""
+
+    workflow = Regex.replace(~r/^  root:.*$/m, File.read!(path), fn _ -> "  root: " <> quoted end)
+    File.write!(path, workflow)
+    WorkflowStore.force_reload()
+    :ok
+  end
+
+  # The probe's witness, recorded before any protocol activity: the marker
+  # content the worker process observed (or that it was absent).
+  defp fence_witness!(path) do
+    wait_until(15_000, fn -> File.regular?(path) end)
+    path |> File.read!() |> Jason.decode!()
+  end
+
+  defp witnessed_marker!(witness, issue) do
+    assert witness["exists"],
+           "the worker started without an issue-keyed launch marker at #{witness["marker_path"]}"
+
+    marker = Jason.decode!(witness["content"])
+    assert marker["schema_version"] == 1
+    assert marker["issue_id"] == issue.id
+    assert is_binary(marker["worker_identity"]["launch_id"])
+    assert marker["worker_identity"]["launch_id"] != ""
+    marker
+  end
+
+  defp marker_path_under(root, issue_id) do
+    Path.join([root, ".symphony-state", "launches", RetryStore.safe_issue_id(issue_id) <> ".json"])
+  end
+
+  defp normalized_path(path), do: path |> String.replace("\\", "/") |> String.downcase()
+
+  defp wait_until(timeout, fun) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_wait_until(deadline, fun)
+  end
+
+  defp do_wait_until(deadline, fun) do
+    if fun.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("condition not met in time")
+      else
+        Process.sleep(50)
+        do_wait_until(deadline, fun)
+      end
+    end
+  end
+
   test "protocol rate-limit exhaustion uses Gemini with identical input and discards partial output", %{issue: issue} do
     python = System.find_executable("python") || System.find_executable("python3")
     script = Path.expand("../fixtures/discovery_app_server.py", __DIR__)
@@ -305,8 +748,8 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     attempts = log |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
 
     assert Enum.map(attempts, & &1["model"]) == [
-             "xai/grok-4.6",
-             "xai/grok-4.6",
+             "OpenDesign/deepseek-v4.1-flash",
+             "OpenDesign/deepseek-v4.1-flash",
              "google-antigravity/gemini-3.8-flash"
            ]
 
@@ -380,8 +823,8 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     assert comment["body"] =~ "### Dependencies"
     assert comment["body"] =~ "### Acceptance criteria"
     assert comment["body"] =~ "TODO HANDOFF"
-    assert comment["body"] =~ "- Provider: xAI"
-    assert comment["body"] =~ "- Model: xai/grok-4.6"
+    assert comment["body"] =~ "- Provider: OpenDesign"
+    assert comment["body"] =~ "- Model: OpenDesign/deepseek-v4.1-flash"
     assert comment["body"] =~ "- Reasoning: medium"
     assert comment["body"] =~ "- Duration: unavailable"
     assert comment["body"] =~ "- Fallback: NO"
@@ -439,6 +882,47 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     end
 
     assert Agent.get(peer, & &1.calls) == []
+  end
+
+  test "narration echoing the issue identity never invalidates a legitimate READY receipt", %{issue: issue, ready: ready} do
+    # A worker that narrates the issue identity before emitting its brief. Identity
+    # binding must scan the validated contract region, not the raw output: an echoed
+    # "ISSUE" line in discarded narration otherwise inflates the two required identity
+    # matches and rejects a legitimate READY result.
+    narrated = "ISSUE\nMIC-TEST\n\n" <> ready
+    retain(issue, "READY", narrated)
+
+    assert {:ok, handed_off} = Discovery.implementation_issue(%{issue | state: "Todo"})
+    assert String.starts_with?(handed_off.description, "TODO HANDOFF")
+
+    # The same result still publishes: the briefing identity is read from the brief.
+    {peer, graphql} = publication_peer()
+    assert :ok = Discovery.run(issue, self(), publication_graphql: graphql)
+    assert Agent.get(peer, &map_size(&1.comments)) == 1
+  end
+
+  test "narration cannot spoof the parent identity that authorizes SPLIT publication", %{issue: issue, ready: ready} do
+    # The proposal itself belongs to MIC-OTHER. The leading narration claims the real
+    # parent issue, which under a first-match scan of the raw output would authorize
+    # publishing a proposal for a different parent.
+    foreign =
+      ready
+      |> String.split("TODO HANDOFF")
+      |> hd()
+      |> String.replace("VERDICT: READY", "VERDICT: SPLIT")
+      |> split_result()
+      |> String.replace("PARENT ISSUE\nMIC-TEST", "PARENT ISSUE\nMIC-OTHER")
+
+    spoofed = "PARENT ISSUE\nMIC-TEST\nWHY SPLIT\n" <> foreign
+    retain(issue, "SPLIT", spoofed)
+
+    {peer, graphql} = publication_peer()
+    assert :ok = Discovery.run(issue, self(), publication_graphql: graphql)
+
+    # Parent identity is read from the validated proposal region, so the spoof is inert
+    # and nothing is published for the foreign proposal.
+    assert Agent.get(peer, & &1.calls) == []
+    assert Agent.get(peer, &map_size(&1.comments)) == 0
   end
 
   test "failed publication retries retained result and recovers a lost create response", %{issue: issue, ready: ready} do

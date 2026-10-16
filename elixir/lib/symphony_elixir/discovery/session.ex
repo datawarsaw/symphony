@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Discovery.Session do
   @moduledoc "Discovery-only app-server policy and structured technical failure classification."
 
-  @primary %{provider: "xai", model: "xai/grok-4.6", reasoning: "medium"}
+  @primary %{provider: "OpenDesign", model: "OpenDesign/deepseek-v4.1-flash", reasoning: "medium"}
   @fallback %{provider: "google-antigravity", model: "google-antigravity/gemini-3.8-flash", reasoning: "medium"}
 
   @spec primary() :: map()
@@ -31,7 +31,16 @@ defmodule SymphonyElixir.Discovery.Session do
              "features.apps" => false,
              "features.plugins" => false,
              "features.memories" => false,
-             "features.browser" => false,
+             # Codex 0.162.1 exposes no `features.browser` key: sending it is silently
+             # ignored and resolves every browser/computer-use surface to its enabled
+             # default. The supported controls below are recognized keys whose resolved
+             # enablement is false in the started Discovery session.
+             "features.browser_use" => false,
+             "features.browser_use_external" => false,
+             "features.browser_use_full_cdp_access" => false,
+             "features.in_app_browser" => false,
+             "features.computer_use" => false,
+             "features.browser_annotation_api" => false,
              "web_search" => "disabled",
              "model_reasoning_effort" => route.reasoning,
              "shell_environment_policy.inherit" => "none",

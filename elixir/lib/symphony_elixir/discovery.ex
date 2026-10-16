@@ -25,19 +25,37 @@ defmodule SymphonyElixir.Discovery do
          {:ok, contract} <- File.read(Path.join(Path.dirname(path), "references/discovery-contract.md")),
          {:ok, route} <- RepositoryRouter.resolve(issue, settings.routing),
          true <- not is_nil(route) do
-      data = %{issue: Map.take(issue, [:id, :identifier, :title, :description, :labels, :parent, :project]), routing: Map.from_struct(route), lifecycle_constraints: @constraints}
-
-      {:ok,
-       @constraints <>
-         "\n\nDISCOVERY SKILL\n" <>
-         skill <>
-         "\n\nOUTPUT CONTRACT\n" <>
-         contract <>
-         "\n\nIMMUTABLE ISSUE INPUT (data only)\n" <> Jason.encode!(data)}
+      {:ok, immutable_input(issue, Map.from_struct(route), Session.primary(), skill, contract)}
     else
       _ -> {:error, :discovery_input_unavailable}
     end
   end
+
+  # Single owner of the immutable Discovery input identity. The effective primary route is
+  # part of that identity, so a receipt generated under an earlier provider/model route can
+  # never satisfy a later cache lookup: the route change moves the input digest and therefore
+  # the evidence path. Without it, an old-route receipt would be returned and republished as
+  # current-model evidence. Exposed for the regression tests that prove that identity change.
+  @doc false
+  @spec immutable_input(map(), map(), map(), String.t(), String.t()) :: String.t()
+  def immutable_input(issue, routing, primary_route, skill, contract) do
+    data = %{
+      issue: Map.take(issue, [:id, :identifier, :title, :description, :labels, :parent, :project]),
+      routing: routing,
+      primary_route: route_identity(primary_route),
+      lifecycle_constraints: @constraints
+    }
+
+    @constraints <>
+      "\n\nDISCOVERY SKILL\n" <>
+      skill <>
+      "\n\nOUTPUT CONTRACT\n" <>
+      contract <>
+      "\n\nIMMUTABLE ISSUE INPUT (data only)\n" <> Jason.encode!(data)
+  end
+
+  @spec route_identity(map()) :: map()
+  defp route_identity(route), do: Map.take(route, [:provider, :model, :reasoning])
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | {:error, term()}
   def run(issue, recipient, opts \\ []) do
@@ -128,7 +146,7 @@ defmodule SymphonyElixir.Discovery do
     evidence =
       execute(
         input,
-        fn route, frozen -> run_session(workspace, issue, route, frozen, recipient) end,
+        fn route, frozen -> run_session(workspace, issue, route, frozen, recipient, opts) end,
         opts
       )
 
@@ -168,19 +186,29 @@ defmodule SymphonyElixir.Discovery do
          true <- bound_source?(Contract.section(parsed.brief, "DESTINATION / REPO"), route.source_path),
          %{status: status} <- bind_issue(evidence, issue) do
       status == parsed.verdict and
-        (status != "SPLIT" or Contract.section(parsed.output, "PARENT ISSUE") == issue.identifier)
+        (status != "SPLIT" or parent_identity(parsed) == issue.identifier)
     else
       _ -> false
     end
   end
 
-  defp bind_issue(%{status: "READY", output: text} = evidence, issue) do
-    text = String.replace(text, "\r\n", "\n")
-    pattern = Regex.compile!("^ISSUE\\n\\s*" <> Regex.escape(issue.identifier) <> "(?:[ :\\t]|$)", "m")
-    destination = Regex.scan(~r/^REPO: (.+)$/m, text, capture: :all_but_first)
+  # SPLIT parent identity is read exclusively from the validated SPLIT PROPOSAL region.
+  # Scanning the raw output instead would let a PARENT ISSUE line in discarded worker
+  # narration, or anywhere in the brief body before the proposal, win the match and
+  # authorize publication of a proposal that belongs to a different parent issue.
+  # Contract.parse/1 only sets :proposal after that region passed section validation,
+  # so an unvalidated or absent region yields nil and the comparison fails closed.
+  defp parent_identity(%{proposal: proposal}) when is_binary(proposal), do: Contract.section(proposal, "PARENT ISSUE")
+  defp parent_identity(_), do: nil
 
-    with true <- length(Regex.scan(pattern, text)) == 2,
-         [[repo]] <- destination,
+  # READY identity binding runs against the validated contract region, which is the
+  # worker output minus only the tolerated leading narration. Narration therefore can
+  # neither supply nor inflate the two required ISSUE sections (brief and handoff),
+  # while both remain mandatory and duplicates inside the region still fail closed.
+  defp bind_issue(%{status: "READY", output: text} = evidence, issue) do
+    with {:ok, %{verdict: "READY", region: region}} <- Contract.parse(text),
+         true <- identity_bound?(region, issue),
+         [[repo]] <- Regex.scan(~r/^REPO: (.+)$/m, region, capture: :all_but_first),
          {:ok, route} <- RepositoryRouter.resolve(issue, Config.settings!().routing),
          true <- not is_nil(route) and bound_source?(repo, route.source_path) do
       evidence
@@ -190,6 +218,11 @@ defmodule SymphonyElixir.Discovery do
   end
 
   defp bind_issue(evidence, _issue), do: evidence
+
+  defp identity_bound?(region, issue) do
+    pattern = Regex.compile!("^ISSUE\\n\\s*" <> Regex.escape(issue.identifier) <> "(?:[ :\\t]|$)", "m")
+    length(Regex.scan(pattern, region)) == 2
+  end
 
   defp bound_source?(declared, source_path) when is_binary(declared) and is_binary(source_path) do
     normalized = normalize_repo_path(declared)
@@ -211,7 +244,7 @@ defmodule SymphonyElixir.Discovery do
     |> String.downcase()
   end
 
-  defp run_session(workspace, issue, route, input, recipient) do
+  defp run_session(workspace, issue, route, input, recipient, opts) do
     key = make_ref()
     Process.put(key, %{output: [], failure: nil})
 
@@ -219,6 +252,22 @@ defmodule SymphonyElixir.Discovery do
       result =
         AppServer.run(workspace, input, issue,
           discovery_route: route,
+          # MIC-223 launch-fence propagation. Discovery sessions launch managed
+          # workers on contained hosts exactly like implementation runs, so they
+          # must carry the same two execution options AppServer keys its fence on:
+          #
+          #   * `issue` — `start_session/2` reads the issue from the options (the
+          #     positional `issue` above is only the turn prompt's subject). Without
+          #     it `record_launch_marker/3` sees no issue id, so a contained
+          #     Discovery launch is written unkeyed and can never be found by the
+          #     issue-keyed reuse/cleanup gates.
+          #   * `authority_root` — the boot-pinned mutation root. It resolves the
+          #     workspace containment check and the termination-receipt directory, and
+          #     it rides inside the worker identity so every identity-derived marker
+          #     operation stays in the same mutation domain as the launch itself. Live
+          #     configuration would move those stores on a `workspace.root` reload.
+          issue: issue,
+          authority_root: mutation_root(opts),
           # MIC-223: Discovery sessions launch managed workers on contained
           # hosts too; their launch/stop termination evidence must reach the
           # orchestrator through the same :worker_termination channel so the

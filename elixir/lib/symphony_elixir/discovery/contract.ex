@@ -2,6 +2,10 @@ defmodule SymphonyElixir.Discovery.Contract do
   @moduledoc "Validates the installed Discovery Gate text contract without interpreting verdicts as failures."
 
   @verdicts ~w(READY NEEDS_RESEARCH NEEDS_DECISION SPLIT BLOCKED DROP)
+  # Workers stream short progress narration before emitting the brief heading. Only a
+  # bounded leading prefix is tolerated, so a heading buried arbitrarily deep in
+  # unrelated output still fails. Observed real narration is under 801 bytes.
+  @max_narration_bytes 4_000
   @brief [
     "ISSUE",
     "PROBLEM",
@@ -38,8 +42,8 @@ defmodule SymphonyElixir.Discovery.Contract do
     text = String.replace(text, "\r\n", "\n") |> String.trim()
 
     with true <- occurrences(text, "DISCOVERY BRIEF") == 1,
-         true <- String.starts_with?(text, "DISCOVERY BRIEF\n"),
-         [brief | tail] <- Regex.split(~r/^TODO HANDOFF$|^SPLIT PROPOSAL$/m, text),
+         {:ok, region} <- contract_region(text),
+         [brief | tail] <- Regex.split(~r/^TODO HANDOFF$|^SPLIT PROPOSAL$/m, region),
          :ok <- sections(brief, @brief),
          {:ok, verdict} <- field(brief, "VERDICT", @verdicts),
          {:ok, split} <- field(brief, "SPLIT REQUIRED", ~w(YES NO)),
@@ -53,7 +57,22 @@ defmodule SymphonyElixir.Discovery.Contract do
          :ok <- attachment(verdict, split, text, tail),
          true <- verdict != "READY" or (not (size == "LARGE" and surface == "BROAD") and research == "NO"),
          true <- verdict != "READY" or (same_identity?(brief, hd(tail)) and same_shape?(brief, hd(tail))) do
-      {:ok, %{verdict: verdict, brief: String.trim(brief), output: text, handoff: if(verdict == "READY", do: "TODO HANDOFF" <> hd(tail), else: nil)}}
+      {:ok,
+       %{
+         verdict: verdict,
+         brief: String.trim(brief),
+         # The validated SPLIT attachment region, with narration and the brief body
+         # excluded. Parent identity must be read from here, never from :output: a
+         # spoofed PARENT ISSUE line before this region would otherwise win the
+         # first-match search. :proposal is nil for every non-SPLIT verdict.
+         proposal: if(verdict == "SPLIT", do: hd(tail), else: nil),
+         # The contract region: the full output minus only the tolerated leading
+         # narration. Identity binding scans this, never :output, so narration can
+         # neither satisfy nor disturb a required identity match.
+         region: region,
+         output: text,
+         handoff: if(verdict == "READY", do: "TODO HANDOFF" <> hd(tail), else: nil)
+       }}
     else
       _ -> {:error, :invalid_discovery_contract}
     end
@@ -88,6 +107,24 @@ defmodule SymphonyElixir.Discovery.Contract do
 
   defp attachment(verdict, _split, _text, []) when verdict in @verdicts and verdict not in ["READY", "SPLIT"], do: :ok
   defp attachment(_, _, _, _), do: :error
+
+  # Returns the contract region, discarding only a bounded span of leading worker
+  # narration. Slicing from the heading means every downstream `^`-anchored field,
+  # section and trailer pattern keeps its original meaning; the full text is still
+  # what `parse/1` reports as :output.
+  defp contract_region(text) do
+    case Regex.run(~r/^DISCOVERY BRIEF$/m, text, return: :index) do
+      [{start, _length}] ->
+        narration = binary_part(text, 0, start)
+
+        if byte_size(narration) <= @max_narration_bytes,
+          do: {:ok, binary_part(text, start, byte_size(text) - start)},
+          else: :error
+
+      _ ->
+        :error
+    end
+  end
 
   defp occurrences(text, heading), do: length(Regex.scan(Regex.compile!("^" <> Regex.escape(heading) <> "$", "m"), text))
 
