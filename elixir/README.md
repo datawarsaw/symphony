@@ -92,7 +92,10 @@ At startup Symphony acquires a durable single-instance lease over the configured
 (`<state_root>/.symphony-state/runtime/authority.json`) before any lifecycle processing starts.
 A second runtime pointed at the same root fails closed instead of becoming a second lifecycle
 authority, crash residue keeps fresh runtimes fail closed until explicit operator recovery, and
-normal shutdown releases the lease. See [runtime authority](docs/runtime_authority.md).
+normal shutdown releases the lease. A supported graceful stop exists for foreground runtimes:
+write an attributable stop request (`mix symphony.stop_request`) and the runtime drains,
+terminates under supervision, and releases the lease itself. See
+[runtime authority](docs/runtime_authority.md).
 
 ## Launch diagnostics
 
@@ -290,6 +293,61 @@ hooks:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+
+### OpenCode worker pilot profile
+
+`OpenCode.Parser` validates JSONL event shapes before session extraction and event storage.
+Non-object records and invalid traversed fields fail closed with the existing
+`{:malformed_json_line, line, %{reason: "invalid_event_shape: <field>"}}` evidence.
+Invalid objects retain a fixed diagnostic string rather than their payload; decoded string
+records pass through `OpenCode.Redactor` with its 4,096-byte UTF-8 bound. The line and detail
+are JSON-encodable; the enclosing tuple retains the existing Elixir failure convention.
+Later valid records remain readable and cannot clear the failed state. Existing optional
+usage defaults, terminal reasons and unknown event types remain supported.
+
+`opencode` is an optional extension section for the harness-selection pilot. It is
+disabled by default, and no dispatch path consumes it yet: Symphony still launches Codex for
+every issue.
+
+```yaml
+opencode:
+  enabled: false                        # default; must be true to make the harness eligible
+  provider: "opencode-go"               # required while enabled; explicit provider identity
+  model: "muse-spark-1.3-contributor"   # required while enabled; explicit model identity
+  timeout_ms: 900000                    # default; max 3600000 for one bounded run
+  allowed_tools: ["read", "grep"]       # required while enabled; OpenCode adapter tool names
+  allowed_issues: ["MIC-300"]           # optional; the only issues the pilot authorizes
+```
+
+Fields:
+
+- `enabled` (boolean, default `false`).
+- `provider`, `model` (strings). Required and non-blank while `enabled` is `true`. There is no
+  provider or model inference, and no provider fallback.
+- `timeout_ms` (integer, default `900000`, maximum `3600000`). Bounds one OpenCode execution. The
+  default is the practical M1 pilot budget; the maximum keeps a single run inside the one-hour Codex
+  turn budget, so the pilot cannot outlive the surrounding worker.
+- `allowed_tools` (list of strings). Required and non-empty while `enabled` is `true`. Blank entries
+  fail validation, and wildcard or unrestricted grants (`*`, `all`, `any`, `auto`, `auto_approve`,
+  `unrestricted`, case-insensitive) are rejected whether or not the section is enabled. Names outside
+  the OpenCode adapter contract (`SymphonyElixir.OpenCode.Config`, the tool set the adapter accepts
+  at launch) are rejected too. The accepted names are declared once in
+  `SymphonyElixir.Config.Schema.OpenCode` (`known_tool_names/0`): integration removes the adapter's
+  private copy and reads that contract, and the focused contract test compares both sets whenever the
+  adapter is present.
+- `allowed_issues` (list of strings). Optional pilot scope compared case-insensitively after
+  trimming. An empty or missing list authorizes no issue, so an enabled section without one never
+  selects OpenCode.
+
+Changes apply on the next workflow reload. Selection is a pure decision owned by
+`SymphonyElixir.HarnessSelection.select/2`, which re-validates the section - maps and hand-built
+structs alike - before deciding: `{:opencode, :opencode_selected}` when the section is enabled,
+valid, and the issue is listed; `{:codex, :opencode_disabled}` when no section is configured or it is
+disabled; `{:codex, :issue_not_authorized}` when a valid section does not list the issue;
+`{:codex, :invalid_opencode_config}` for an invalid section that does not list the issue; and
+`{:error, :invalid_opencode_config}` when an invalid section still lists the issue, so an intended
+OpenCode pilot is never silently replaced by Codex. It launches no process, writes no state, and
+leaves dispatch, retry, and containment gates untouched.
 
 ### Linear adapter profile
 
@@ -499,3 +557,20 @@ This project is licensed under the [Apache License 2.0](../LICENSE).
 ## Dedicated Discovery lane
 
 See [configuration, safety and evidence handling](../docs/discovery-worker-lane.md). Discovery is disabled by default, runs locally, and never changes issue state. READY handoffs are consumed only on a separately scheduled implementation run.
+
+## OpenCode provider failures
+
+OpenCode 1.18.28 `APIError.data.statusCode` and `isRetryable` are classified from structured
+metadata: 401 is `auth_unavailable`; 403 and 404 are `persistent_worker_failure`. A consistent
+429 or 500–599 requires explicit boolean `isRetryable: true` to become `provider_rate_limit`
+or `provider_outage`. Missing, malformed or conflicting metadata, `UnknownError`, and
+`MessageAbortedError` fail closed as persistent failures; valid 401 evidence still parks auth
+immediately. A generic 404 does not prove model unavailability. Legacy `status` / `data.status`
+payloads without modern metadata retain their existing classifications.
+
+The shared retry policy is unchanged: auth parks immediately; persistent failures permit bounded
+retry (three identical failures, ten total attempts or two hours) and cannot trigger provider
+fallback. `isRetryable: false` therefore prevents provider retry/fallback classification, rather
+than introducing a new no-retry class. Fixtures derive from the public
+[v1.18.28 schema](https://github.com/anomalyco/opencode/blob/v1.18.28/packages/schema/src/v1/session.ts);
+they are not captured live traffic.

@@ -10,7 +10,7 @@ defmodule SymphonyElixir.WorkerContainment do
   ```
 
   One worker launch maps to one anonymous Job Object (`KILL_ON_JOB_CLOSE`,
-  breakaway denied, child assigned before first instruction) owned by the
+  breakaway denied, child created inside the Job atomically) owned by the
   `jobrun` wrapper under `priv/windows/jobrun`. `Port.close` only breaks the
   wrapper's stdin; the wrapper grants a bounded cooperative grace interval and
   then hard-terminates the Job, and positively verifies `ActiveProcesses == 0`
@@ -255,13 +255,18 @@ defmodule SymphonyElixir.WorkerContainment do
   through the RetryStore JSON records unchanged. `root_pid`/`root_creation_time`
   stay nil until the termination receipt supplies them; PID fields are evidence
   mirrors only and never authoritative.
+
+  M1-D audit metadata: `:harness` names the dispatch-time harness decision that
+  owns the launch (`:opencode`; Codex callers omit it). The key is additive —
+  existing markers and fence verdicts read only the receipt evidence, so
+  identities without it stay byte-identical and fully compatible.
   """
   @spec new_identity(keyword()) :: map()
   def new_identity(opts) do
     launch_id =
       "#{System.system_time(:millisecond)}-#{:erlang.unique_integer([:positive])}"
 
-    %{
+    identity = %{
       "schema_version" => @schema_version,
       "launch_id" => launch_id,
       "issue_id" => opts[:issue_id],
@@ -277,6 +282,11 @@ defmodule SymphonyElixir.WorkerContainment do
       "root_creation_time" => nil,
       "receipt_path" => Path.join(receipt_dir(opts[:authority_root]), launch_id <> ".json")
     }
+
+    case opts[:harness] do
+      harness when is_atom(harness) and not is_nil(harness) -> Map.put(identity, "harness", Atom.to_string(harness))
+      _absent -> identity
+    end
   end
 
   @doc """

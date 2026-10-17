@@ -1,0 +1,906 @@
+Compiling 2 files (.ex)
+warning: Failed to symlink node_modules folder for Phoenix.LiveView.ColocatedJS: :eperm
+
+On Windows, you can address this issue by starting your Windows terminal at least once
+with "Run as Administrator" and then running your Phoenix application.
+
+If you don't use colocated hooks / js or you don't need to import files from "assets/node_modules"
+in your hooks, you can simply disable this warning by setting
+
+    config :phoenix_live_view, :colocated_js,
+      disable_symlink_warning: true
+
+
+  (phoenix_live_view 1.1.33) lib/mix/tasks/compile/phoenix_live_view.ex:24: anonymous fn/1 in Mix.Tasks.Compile.PhoenixLiveView.run/1
+  (elixir 1.19.5) lib/enum.ex:2520: Enum."-reduce/3-lists^foldl/2-0-"/3
+  (mix 1.19.5) lib/mix/task.compiler.ex:287: Mix.Task.Compiler.run/4
+  (mix 1.19.5) lib/mix/tasks/compile.all.ex:75: Mix.Tasks.Compile.All.do_run/2
+  (mix 1.19.5) lib/mix/sync/lock.ex:122: Mix.Sync.Lock.with_lock/3
+  (mix 1.19.5) lib/mix/task.ex:499: anonymous fn/3 in Mix.Task.run_task/5
+
+Generated symphony_elixir app
+warning: the following files do not match any of the configured `:test_load_filters` / `:test_ignore_filters`:
+
+test/support/beam_death/beam_child.exs
+test/support/delivery_fixtures.exs
+test/support/fake_ssh.exs
+test/support/mock_opencode.exs
+test/support/opencode_worker_fixture.exs
+test/support/scratch_process.exs
+
+This might indicate a typo in a test file name (for example, using "foo_tests.exs" instead of "foo_test.exs").
+
+See the configuration for `:test_pattern` under `mix help test` for more information.
+
+     warning: clauses with the same name and arity (number of arguments) should be grouped together, "defp containment_yaml/1" was previously defined (test/support/test_support.exs:712)
+     │
+ 720 │   defp containment_yaml(nil), do: nil
+     │        ~
+     │
+     └─ test/support/test_support.exs:720:8
+
+     warning: clauses with the same name and arity (number of arguments) should be grouped together, "defp worker_yaml/2" was previously defined (test/support/test_support.exs:716)
+     │
+ 724 │   defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host) do
+     │        ~
+     │
+     └─ test/support/test_support.exs:724:8
+
+     warning: this clause for containment_yaml/1 cannot match because a previous clause at line 714 always matches
+     │
+ 720 │   defp containment_yaml(nil), do: nil
+     │        ~
+     │
+     └─ test/support/test_support.exs:720:8
+
+     warning: this clause for containment_yaml/1 cannot match because a previous clause at line 714 always matches
+     │
+ 722 │   defp containment_yaml(enabled), do: "  worker_containment_enabled: #{yaml_value(enabled)}"
+     │        ~
+     │
+     └─ test/support/test_support.exs:722:8
+
+Running ExUnit with seed: 203150, max_cases: 32
+
+     warning: variable "ledger" is unused (there is a variable with the same name in the context, use the pin operator (^) to match on it or prefix this variable with underscore if it is not meant to be used)
+     │
+ 223 │       {ledger, :ok} = Ledger.mark_handled(ledger, receipt.event_id)
+     │        ~~~~~~
+     │
+     └─ test/symphony_elixir/wake_test.exs:223:8: SymphonyElixir.WakeTest."test restart reconciliation restart does not duplicate an already handled event"/1
+
+     warning: variable "ledger" is unused (there is a variable with the same name in the context, use the pin operator (^) to match on it or prefix this variable with underscore if it is not meant to be used)
+     │
+ 238 │       {ledger, {:wake, receipt}} = Ledger.observe(ledger, :worker_failed, "ISS-1", @failed_opts)
+     │        ~~~~~~
+     │
+     └─ test/symphony_elixir/wake_test.exs:238:8: SymphonyElixir.WakeTest."test restart reconciliation unhandled actionable event survives restart and stays recoverable"/1
+
+     warning: variable "ledger" is unused (there is a variable with the same name in the context, use the pin operator (^) to match on it or prefix this variable with underscore if it is not meant to be used)
+     │
+ 255 │       {ledger, {:wake, parked}} =
+     │        ~~~~~~
+     │
+     └─ test/symphony_elixir/wake_test.exs:255:8: SymphonyElixir.WakeTest."test restart reconciliation restart rehydration does not displace a pending wake, and cross-kind events stay distinct"/1
+
+    warning: variable "context" is unused (if the variable is not meant to be used, prefix it with an underscore)
+    │
+ 36 │   setup context do
+    │         ~~~~~~~
+    │
+    └─ test/symphony_elixir/opencode_dispatch_test.exs:36:9: SymphonyElixir.OpenCodeDispatchTest.__ex_unit_setup_1/1
+
+................................................    warning: variable "base" is unused (if the variable is not meant to be used, prefix it with an underscore)
+    │
+ 71 │   test "a conflicting replay reports the conflict and leaves no scratch behind", %{repo: repo, base: base, feature: feature} do
+    │                                                                                                      ~~~~
+    │
+    └─ test/symphony_elixir/delivery/replay_test.exs:71:102: SymphonyElixir.Delivery.ReplayTest."test a conflicting replay reports the conflict and leaves no scratch behind"/1
+
+........................................................................................................................     warning: default values for the optional arguments in the private function wait_until/2 are never used
+     │
+ 520 │   defp wait_until(fun, timeout \\ 2_000) do
+     │        ~
+     │
+     └─ test/symphony_elixir/workspace_viability_launch_fence_test.exs:520:8: SymphonyElixir.WorkspaceViabilityLaunchFenceTest (module)
+
+...............................................................................     warning: function workpad/1 is unused
+     │
+ 441 │   defp workpad(workspace), do: File.read!(Path.join(workspace, "workpad.md"))
+     │        ~
+     │
+     └─ test/symphony_elixir/launch_fence_test.exs:441:8: SymphonyElixir.LaunchFenceTest (module)
+
+     warning: default values for the optional arguments in the private function wait_until/2 are never used
+     │
+ 553 │   defp wait_until(fun, timeout \\ 2_000) do
+     │        ~
+     │
+     └─ test/symphony_elixir/launch_fence_test.exs:553:8: SymphonyElixir.LaunchFenceTest (module)
+
+........*................................................................................................................................................................................*........................jobrun: receipt write failed: Cannot create "C:\Users\micha\AppData\Local\Temp\m1pn-workspace-7362\authority-not-a-directory" because a file or directory with the same name already exists.
+.....................................................................................................................***.......................................................................warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-reuse-same-repo-30146/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-reuse-same-repo-30146/publisher'...
+done.
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-reuse-other-repo-a-30210/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-reuse-other-repo-a-30210/publisher'...
+done.
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-reuse-other-repo-b-30274/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-reuse-other-repo-b-30274/publisher'...
+done.
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-diverged-branch-30338/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-diverged-branch-30338/publisher'...
+done.
+warning: in the working copy of 'local_file.txt', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-diverged-branch-30338/remote.git
+   24c0c7b..db755b9  main -> main
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-binary-path-missing-branch-30402/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-binary-path-missing-branch-30402/publisher'...
+done.
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-binary-path-ff-30466/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-binary-path-ff-30466/publisher'...
+done.
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-binary-path-ff-30466/remote.git
+   9592152..e8de9b2  main -> main
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-local-ahead-30530/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-local-ahead-30530/publisher'...
+done.
+warning: in the working copy of 'local_file.txt', LF will be replaced by CRLF the next time Git touches it
+..warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-staged-dirty-30658/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-staged-dirty-30658/publisher'...
+done.
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-staged-dirty-30658/remote.git
+   f3b0e11..2c54cc3  main -> main
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-create-default-branch-30722/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-create-default-branch-30722/publisher'...
+done.
+Switched to a new branch 'topic'
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-create-default-branch-30722/remote.git
+   bb25d22..d60b7c0  main -> main
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-untracked-preserved-30786/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-untracked-preserved-30786/publisher'...
+done.
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-untracked-preserved-30786/remote.git
+   00ea483..08eb449  main -> main
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-off-branch-fast-forward-30978/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-off-branch-fast-forward-30978/publisher'...
+done.
+Switched to a new branch 'topic'
+warning: in the working copy of 'topic_file.txt', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-off-branch-fast-forward-30978/remote.git
+   cf66440..d228a96  main -> main
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-diverged-state-preserved-31042/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-diverged-state-preserved-31042/publisher'...
+done.
+warning: in the working copy of 'local_file.txt', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-diverged-state-preserved-31042/remote.git
+   4c568c3..fd861c9  main -> main
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-retry-diff-31106/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-retry-diff-31106/publisher'...
+done.
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-retry-diff-31106/remote.git
+   26ea9d1..d2c517d  main -> main
+..warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-remote-failure-31170/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-remote-failure-31170/publisher'...
+done.
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-post-sync-workspace-31234/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-post-sync-workspace-31234/publisher'...
+done.
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-post-sync-workspace-31234/remote.git
+   31a0bf4..70120b7  main -> main
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-unmerged-state-preserved-31298/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-unmerged-state-preserved-31298/publisher'...
+done.
+warning: in the working copy of 'conflict.txt', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-unmerged-state-preserved-31298/remote.git
+   4c4dc42..f1daf66  main -> main
+warning: in the working copy of 'conflict.txt', LF will be replaced by CRLF the next time Git touches it
+Switched to branch 'feature-conflict'
+warning: in the working copy of 'conflict.txt', LF will be replaced by CRLF the next time Git touches it
+Switched to branch 'main'
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-fast-forward-blocked-by-worktree-31362/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-fast-forward-blocked-by-worktree-31362/publisher'...
+done.
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-fast-forward-blocked-by-worktree-31362/remote.git
+   9dbd2d4..851c9db  main -> main
+Switched to a new branch 'topic'
+Preparing worktree (checking out 'main')
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-fast-forward-blocked-by-worktree-31362/remote.git
+   851c9db..52cab8f  main -> main
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-fetch-failure-31426/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-fetch-failure-31426/publisher'...
+done.
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-already-current-31490/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-already-current-31490/publisher'...
+done.
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-tracked-dirty-31554/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-tracked-dirty-31554/publisher'...
+done.
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-tracked-dirty-31554/remote.git
+   58e9131..df75386  main -> main
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-reuse-non-git-31618/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-reuse-non-git-31618/publisher'...
+done.
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-clean-behind-31682/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-clean-behind-31682/publisher'...
+done.
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-clean-behind-31682/remote.git
+   8852252..8e4d1e3  main -> main
+.warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-unmerged-conflict-31746/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:/Users/micha/AppData/Local/Temp/symphony-source-sync-unmerged-conflict-31746/publisher'...
+done.
+warning: in the working copy of 'conflict.txt', LF will be replaced by CRLF the next time Git touches it
+To C:/Users/micha/AppData/Local/Temp/symphony-source-sync-unmerged-conflict-31746/remote.git
+   392a3c6..3f3f632  main -> main
+warning: in the working copy of 'conflict.txt', LF will be replaced by CRLF the next time Git touches it
+Switched to branch 'feature-conflict'
+warning: in the working copy of 'conflict.txt', LF will be replaced by CRLF the next time Git touches it
+Switched to branch 'main'
+..............................
+
+  1) test disabled lane retains default active states and rejects Discovery dispatch (SymphonyElixir.DiscoveryIntegrationTest)
+     test/symphony_elixir/discovery_integration_test.exs:234
+     Expected exception RuntimeError but got SymphonyElixir.AgentRunner.FailureError (Agent run failed for issue_id=discovery-issue issue_identifier=MIC-TEST: :discovery_lane_unavailable)
+     code: assert_raise RuntimeError, ~r/discovery_lane_unavailable/, fn -> AgentRunner.run(issue, self()) end
+     stacktrace:
+       (symphony_elixir 0.0.2) lib/symphony_elixir/agent_runner.ex:80: SymphonyElixir.AgentRunner.run/3
+       test/symphony_elixir/discovery_integration_test.exs:238: (test)
+
+.................................................................***.........
+
+  2) test first abnormal worker exit waits before retrying (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:1114
+     match (=) failed
+     code:  assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
+              state.retry_attempts[issue_id]
+     left:  %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"}
+     right: nil
+     stacktrace:
+       test/symphony_elixir/core_test.exs:1147: (test)
+
+.....
+
+  3) test agent runner continues with a follow-up turn while the issue remains active (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:1776
+     ** (SymphonyElixir.AgentRunner.FailureError) Agent run failed for issue_id=issue-continue issue_identifier=MT-247: {:workspace_hook_failed, "after_create", 1, "cp: cannot stat 'C:UsersmichaAppDataLocalTemp/symphony-elixir-agent-runner-continuation-43330/source/README.md': No such file or directory\n"}
+     code: assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+     stacktrace:
+       (symphony_elixir 0.0.2) lib/symphony_elixir/agent_runner.ex:80: SymphonyElixir.AgentRunner.run/3
+       test/symphony_elixir/core_test.exs:1877: (test)
+
+.....
+
+  4) test agent runner stops continuing once agent.max_turns is reached (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:1908
+     ** (SymphonyElixir.AgentRunner.FailureError) Agent run failed for issue_id=issue-max-turns issue_identifier=MT-248: {:workspace_hook_failed, "after_create", 1, "cp: cannot stat 'C:UsersmichaAppDataLocalTemp/symphony-elixir-agent-runner-max-turns-43458/source/README.md': No such file or directory\n"}
+     code: assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+     stacktrace:
+       (symphony_elixir 0.0.2) lib/symphony_elixir/agent_runner.ex:80: SymphonyElixir.AgentRunner.run/3
+       test/symphony_elixir/core_test.exs:1995: (test)
+
+....
+
+  5) test abnormal worker exit increments retry attempt progressively (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:1074
+     match (=) failed
+     code:  assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
+              state.retry_attempts[issue_id]
+     left:  %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"}
+     right: nil
+     stacktrace:
+       test/symphony_elixir/core_test.exs:1108: (test)
+
+.
+
+  6) test app server startup payload uses configurable approval and sandbox settings from workflow config (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:2237
+     ** (EXIT from #PID<0.3951.0>) :epipe
+
+.............
+
+  7) test normal worker exit schedules active-state continuation retry (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:1034
+     Assertion with >= failed
+     code:  assert remaining_ms >= min_remaining_ms
+     left:  409
+     right: 500
+     stacktrace:
+       test/symphony_elixir/core_test.exs:1273: SymphonyElixir.CoreTest.assert_due_in_range/3
+       test/symphony_elixir/core_test.exs:1071: (test)
+
+..
+
+  8) test agent runner keeps workspace after successful codex run (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:1552
+     ** (SymphonyElixir.AgentRunner.FailureError) Agent run failed for issue_id= issue_identifier=S-99: {:workspace_hook_failed, "after_create", 1, "cp: cannot stat 'C:UsersmichaAppDataLocalTemp/symphony-elixir-agent-runner-retain-workspace-44802/source/README.md': No such file or directory\n"}
+     code: assert :ok = AgentRunner.run(issue)
+     stacktrace:
+       (symphony_elixir 0.0.2) lib/symphony_elixir/agent_runner.ex:80: SymphonyElixir.AgentRunner.run/3
+       test/symphony_elixir/core_test.exs:1616: (test)
+
+
+
+  9) test app server startup command supports codex args override from workflow config (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:2152
+     ** (EXIT from #PID<0.4051.0>) :epipe
+
+.
+
+ 10) test app server starts with workspace cwd and expected startup command (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:2006
+     ** (EXIT from #PID<0.4087.0>) :epipe
+
+
+
+ 11) test agent runner surfaces ssh startup failures instead of silently hopping hosts (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:1724
+     Expected exception RuntimeError but got SymphonyElixir.AgentRunner.FailureError (Agent run failed for issue_id=issue-ssh-failover issue_identifier=MT-SSH-FAILOVER: {:workspace_prepare_failed, "worker-a", 75, "worker-a prepare failed\r\n"})
+     code: assert_raise RuntimeError, ~r/workspace_prepare_failed/, fn ->
+     stacktrace:
+       (symphony_elixir 0.0.2) lib/symphony_elixir/agent_runner.ex:80: SymphonyElixir.AgentRunner.run/3
+       test/symphony_elixir/core_test.exs:1764: (test)
+
+........
+
+ 12) test agent runner forwards timestamped codex updates to recipient (SymphonyElixir.CoreTest)
+     test/symphony_elixir/core_test.exs:1636
+     ** (SymphonyElixir.AgentRunner.FailureError) Agent run failed for issue_id=issue-live-updates issue_identifier=MT-99: {:workspace_hook_failed, "after_create", 1, "cp: cannot stat 'C:UsersmichaAppDataLocalTemp/symphony-elixir-agent-runner-updates-46530/source/README.md': No such file or directory\n"}
+     code: AgentRunner.run(
+     stacktrace:
+       (symphony_elixir 0.0.2) lib/symphony_elixir/agent_runner.ex:80: SymphonyElixir.AgentRunner.run/3
+       test/symphony_elixir/core_test.exs:1704: (test)
+
+..........*...................***..........................................................................................***..................symphony.delivery_preflight: STOP ({:lineage_broken, "ef4a8b8284534ac44cafdaf6c5fcff2aba06dd4d"})
+..symphony.delivery_preflight: STOP (changed_path_overlap)
+........symphony.workspace_repair: repair issue=MT-941 workspace=c:/Users/micha/AppData/Local/Temp/symphony-viability-fence-fixture-repair-missing-origin-tpyn6uHobVpB73QO/workspaces/MT-941 source=c:/Users/micha/AppData/Local/Temp/symphony-viability-fence-fixture-repair-missing-origin-tpyn6uHobVpB73QO/source branch=symphony/MT-941 default_branch=main
+symphony.workspace_repair: observed state: workspace_exists=false viability=workspace absent registration=registered (prunable=true reason=gitdir file points to non-existent location) branch=present 2efba24e2c88
+symphony.workspace_repair: pruning stale worktree registration (gitdir file points to non-existent location)
+symphony.workspace_repair: git: Removing worktrees/MT-941: gitdir file points to non-existent location
+...........................
+
+ 13) test app server auto-approves command execution approval requests when approval policy is never (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:687
+     ** (EXIT from #PID<0.5070.0>) :epipe
+
+.
+
+ 14) test app server auto-approves MCP tool approval prompts when approval policy is never (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:824
+     ** (EXIT from #PID<0.5090.0>) :epipe
+
+
+
+ 15) test turn timeout resets on stream updates and fires after silence (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:284
+     ** (EXIT from #PID<0.5105.0>) :epipe
+
+.
+
+ 16) test app server blocks option-based tool input prompts (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:993
+     ** (EXIT from #PID<0.5146.0>) :epipe
+
+.
+
+ 17) test app server rejects unsupported dynamic tool calls without stalling (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:1063
+     ** (EXIT from #PID<0.5165.0>) :epipe
+
+..
+
+ 18) test app server executes supported dynamic tool calls and returns the tool result (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:1164
+     ** (EXIT from #PID<0.5199.0>) :epipe
+
+.
+
+ 19) test app server passes explicit turn sandbox policies through unchanged (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:373
+     ** (EXIT from #PID<0.5231.0>) :epipe
+
+
+
+ 20) test app server emits tool_call_failed for supported tool failures (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:1286
+     ** (EXIT from #PID<0.5246.0>) :epipe
+
+
+
+ 21) test app server buffers partial JSON lines until newline terminator (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:1392
+     ** (EXIT from #PID<0.5261.0>) :epipe
+
+
+
+ 22) test app server fails when command execution approval is required under safer defaults (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:624
+     ** (EXIT from #PID<0.5276.0>) :epipe
+
+.
+
+ 23) test app server marks request-for-input events as a hard failure (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:480
+     ** (EXIT from #PID<0.5296.0>) :epipe
+
+
+
+ 24) test app server treats MCP elicitation requests as hard input blockers (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:559
+     ** (EXIT from #PID<0.5311.0>) :epipe
+
+
+
+ 25) test app server captures codex side output and logs it through Logger (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:1456
+     ** (EXIT from #PID<0.5326.0>) :epipe
+
+
+
+ 26) test app server does not pass tracker credentials to the local Codex child (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:1602
+     ** (EXIT from #PID<0.5346.0>) :epipe
+
+..
+
+ 27) test app server emits malformed events for JSON-like protocol lines that fail to decode (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:1531
+     ** (EXIT from #PID<0.5380.0>) :epipe
+
+...
+
+ 28) test app server blocks freeform tool input prompts (SymphonyElixir.AppServerTest)
+     test/symphony_elixir/app_server_test.exs:923
+     ** (EXIT from #PID<0.5409.0>) :epipe
+
+........................jobrun: receipt write failed: Cannot create "C:\Users\micha\AppData\Local\Temp\opencode-test-workspace-80706\authority-not-a-directory" because a file or directory with the same name already exists.
+..............................................jobrun: receipt write failed: Cannot create "C:\Users\micha\AppData\Local\Temp\opencode-launchmarker-CiIlhIL-q439x7ZL\receipts" because a file or directory with the same name already exists.
+.................................................
+
+ 29) test formats close failures without command stderr output (Mix.Tasks.Workspace.BeforeRemoveTest)
+     test/mix/tasks/workspace_before_remove_test.exs:133
+     Assertion with =~ failed
+     code:  assert error_output =~ "Failed to close PR #102 for branch feature/no-output: exit 17"
+     left:  ""
+     right: "Failed to close PR #102 for branch feature/no-output: exit 17"
+     stacktrace:
+       test/mix/tasks/workspace_before_remove_test.exs:161: anonymous fn/1 in Mix.Tasks.Workspace.BeforeRemoveTest."test formats close failures without command stderr output"/1
+       test/mix/tasks/workspace_before_remove_test.exs:340: Mix.Tasks.Workspace.BeforeRemoveTest.with_env/2
+       test/mix/tasks/workspace_before_remove_test.exs:316: Mix.Tasks.Workspace.BeforeRemoveTest.with_fake_binaries/2
+       test/mix/tasks/workspace_before_remove_test.exs:134: (test)
+
+
+
+ 30) test closes open pull requests for the branch and tolerates close failures (Mix.Tasks.Workspace.BeforeRemoveTest)
+     test/mix/tasks/workspace_before_remove_test.exs:103
+     Assertion with =~ failed
+     code:  assert output =~ "Closed PR #101 for branch feature/workpad"
+     left:  ""
+     right: "Closed PR #101 for branch feature/workpad"
+     stacktrace:
+       test/mix/tasks/workspace_before_remove_test.exs:112: anonymous fn/1 in Mix.Tasks.Workspace.BeforeRemoveTest."test closes open pull requests for the branch and tolerates close failures"/1
+       test/mix/tasks/workspace_before_remove_test.exs:340: Mix.Tasks.Workspace.BeforeRemoveTest.with_env/2
+       test/mix/tasks/workspace_before_remove_test.exs:316: Mix.Tasks.Workspace.BeforeRemoveTest.with_fake_binaries/2
+       test/mix/tasks/workspace_before_remove_test.exs:104: (test)
+
+.
+
+ 31) test no-ops when PR list fails for current branch (Mix.Tasks.Workspace.BeforeRemoveTest)
+     test/mix/tasks/workspace_before_remove_test.exs:170
+     Assertion with =~ failed
+     code:  assert log =~ "auth status"
+     left:  ""
+     right: "auth status"
+     stacktrace:
+       test/mix/tasks/workspace_before_remove_test.exs:195: anonymous fn/1 in Mix.Tasks.Workspace.BeforeRemoveTest."test no-ops when PR list fails for current branch"/1
+       test/mix/tasks/workspace_before_remove_test.exs:340: Mix.Tasks.Workspace.BeforeRemoveTest.with_env/2
+       test/mix/tasks/workspace_before_remove_test.exs:316: Mix.Tasks.Workspace.BeforeRemoveTest.with_fake_binaries/2
+       test/mix/tasks/workspace_before_remove_test.exs:171: (test)
+
+.
+
+ 32) test no-ops when gh auth is unavailable (Mix.Tasks.Workspace.BeforeRemoveTest)
+     test/mix/tasks/workspace_before_remove_test.exs:237
+     Assertion with =~ failed
+     code:  assert log =~ "auth status"
+     left:  ""
+     right: "auth status"
+     stacktrace:
+       test/mix/tasks/workspace_before_remove_test.exs:251: anonymous fn/1 in Mix.Tasks.Workspace.BeforeRemoveTest."test no-ops when gh auth is unavailable"/1
+       test/mix/tasks/workspace_before_remove_test.exs:340: Mix.Tasks.Workspace.BeforeRemoveTest.with_env/2
+       test/mix/tasks/workspace_before_remove_test.exs:316: Mix.Tasks.Workspace.BeforeRemoveTest.with_fake_binaries/2
+       test/mix/tasks/workspace_before_remove_test.exs:238: (test)
+
+...
+
+ 33) test uses current branch for lookup when branch option is omitted (Mix.Tasks.Workspace.BeforeRemoveTest)
+     test/mix/tasks/workspace_before_remove_test.exs:52
+     Assertion with =~ failed
+     code:  assert output =~ "Closed PR #101 for branch feature/workpad"
+     left:  ""
+     right: "Closed PR #101 for branch feature/workpad"
+     stacktrace:
+       test/mix/tasks/workspace_before_remove_test.exs:89: anonymous fn/1 in Mix.Tasks.Workspace.BeforeRemoveTest."test uses current branch for lookup when branch option is omitted"/1
+       test/mix/tasks/workspace_before_remove_test.exs:340: Mix.Tasks.Workspace.BeforeRemoveTest.with_env/2
+       test/mix/tasks/workspace_before_remove_test.exs:316: Mix.Tasks.Workspace.BeforeRemoveTest.with_fake_binaries/2
+       test/mix/tasks/workspace_before_remove_test.exs:53: (test)
+
+...........................................................................................................................................................
+
+ 34) test route decision on classified failures PROVIDER_RATE_LIMIT switches only after the second consecutive eligible failure (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:470
+     ** (KeyError) key "ISS-FB-RATE" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(first.retry_attempts, issue.id).route == :primary
+     stacktrace:
+       :erlang.map_get("ISS-FB-RATE", %{})
+       test/symphony_elixir/fallback_routing_test.exs:475: (test)
+
+.
+
+ 35) test route decision on classified failures PROVIDER_OUTAGE switches only after the second consecutive eligible failure (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:484
+     ** (KeyError) key "ISS-FB-OUTAGE" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(first.retry_attempts, issue.id).route == :primary
+     stacktrace:
+       :erlang.map_get("ISS-FB-OUTAGE", %{})
+       test/symphony_elixir/fallback_routing_test.exs:489: (test)
+
+
+
+ 36) test retry-poll failures never fold route state a poll error on a latched fallback sequence preserves the latch and the durable record (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:334
+     ** (KeyError) key "ISS-FB-POLLLATCH" not found in:
+
+         %{}
+
+     code: latched = latched_state(issue)
+     stacktrace:
+       :erlang.map_get("ISS-FB-POLLLATCH", %{})
+       test/symphony_elixir/fallback_routing_test.exs:111: SymphonyElixir.FallbackRoutingTest.latched_state/1
+       test/symphony_elixir/fallback_routing_test.exs:338: (test)
+
+
+
+ 37) test config and pin gates an explicit fallback:true opt-in permits threshold-based fallback despite the pin (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:661
+     ** (KeyError) key "ISS-FB-OPTIN" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(next.retry_attempts, issue.id).route == :fallback
+     stacktrace:
+       :erlang.map_get("ISS-FB-OPTIN", %{})
+       test/symphony_elixir/fallback_routing_test.exs:668: (test)
+
+.
+
+ 38) test route decision on classified failures fallback failures do not increment primary_failure_count and the route stays latched (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:519
+     ** (KeyError) key "ISS-FB-LATCH" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(first.retry_attempts, issue.id).route == :fallback
+     stacktrace:
+       :erlang.map_get("ISS-FB-LATCH", %{})
+       test/symphony_elixir/fallback_routing_test.exs:524: (test)
+
+.
+
+ 39) test retry-poll failures never fold route state an opaque poll error does not reset primary_failure_count (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:311
+     ** (KeyError) key "ISS-FB-POLLOPAQUE" not found in:
+
+         %{}
+
+     code: metadata = retry_entry_metadata(first, issue.id)
+     stacktrace:
+       :erlang.map_get("ISS-FB-POLLOPAQUE", %{})
+       test/symphony_elixir/fallback_routing_test.exs:262: SymphonyElixir.FallbackRoutingTest.retry_entry_metadata/2
+       test/symphony_elixir/fallback_routing_test.exs:318: (test)
+
+.
+
+ 40) test reconcile-driven termination ends the failure sequence stall restart preserves the latched fallback route, count, and envelope (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:216
+     ** (KeyError) key "ISS-FB-STALL" not found in:
+
+         %{}
+
+     code: latched = latched_state(issue)
+     stacktrace:
+       :erlang.map_get("ISS-FB-STALL", %{})
+       test/symphony_elixir/fallback_routing_test.exs:111: SymphonyElixir.FallbackRoutingTest.latched_state/1
+       test/symphony_elixir/fallback_routing_test.exs:220: (test)
+
+...
+
+ 41) test retry-poll failures never fold route state the next eligible worker failure after a poll hiccup still switches at the exact threshold (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:357
+     ** (KeyError) key "ISS-FB-POLLSEQ" not found in:
+
+         %{}
+
+     code: metadata = retry_entry_metadata(first, issue.id)
+     stacktrace:
+       :erlang.map_get("ISS-FB-POLLSEQ", %{})
+       test/symphony_elixir/fallback_routing_test.exs:262: SymphonyElixir.FallbackRoutingTest.retry_entry_metadata/2
+       test/symphony_elixir/fallback_routing_test.exs:366: (test)
+
+.
+
+ 42) test config and pin gates fallback disabled in config never switches (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:607
+     ** (KeyError) key "ISS-FB-DISABLED" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(next.retry_attempts, issue.id).route == :primary
+     stacktrace:
+       :erlang.map_get("ISS-FB-DISABLED", %{})
+       test/symphony_elixir/fallback_routing_test.exs:614: (test)
+
+
+
+ 43) test route decision on classified failures PROVIDER_QUOTA stays primary after failure #1 and switches after the second consecutive failure (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:446
+     ** (KeyError) key "ISS-FB-QUOTA" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(first.retry_attempts, issue.id).route == :primary
+     stacktrace:
+       :erlang.map_get("ISS-FB-QUOTA", %{})
+       test/symphony_elixir/fallback_routing_test.exs:454: (test)
+
+
+
+ 44) test config and pin gates an ambiguous fallback label fails closed for a pinned issue (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:674
+     ** (KeyError) key "ISS-FB-AMBIG" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(next.retry_attempts, issue.id).route == :primary
+     stacktrace:
+       :erlang.map_get("ISS-FB-AMBIG", %{})
+       test/symphony_elixir/fallback_routing_test.exs:681: (test)
+
+
+
+ 45) test success and continuation semantics normal completion resets the route state so the next sequence starts primary (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:385
+     ** (KeyError) key "ISS-FB-DONE" not found in:
+
+         %{}
+
+     code: latched = latched_state(issue)
+     stacktrace:
+       :erlang.map_get("ISS-FB-DONE", %{})
+       test/symphony_elixir/fallback_routing_test.exs:111: SymphonyElixir.FallbackRoutingTest.latched_state/1
+       test/symphony_elixir/fallback_routing_test.exs:389: (test)
+
+
+
+ 46) test route decision on classified failures MODEL_UNAVAILABLE switches the next attempt to fallback after the first failure (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:422
+     ** (KeyError) key "ISS-FB-MODEL" not found in:
+
+         %{}
+
+     code: retry = Map.fetch!(next.retry_attempts, issue.id)
+     stacktrace:
+       :erlang.map_get("ISS-FB-MODEL", %{})
+       test/symphony_elixir/fallback_routing_test.exs:429: (test)
+
+
+
+ 47) test config and pin gates missing fallback model never switches (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:621
+     ** (KeyError) key "ISS-FB-NOMODEL" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(next.retry_attempts, issue.id).route == :primary
+     stacktrace:
+       :erlang.map_get("ISS-FB-NOMODEL", %{})
+       test/symphony_elixir/fallback_routing_test.exs:628: (test)
+
+
+
+ 48) test config and pin gates an explicit model pin blocks fallback (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:647
+     ** (KeyError) key "ISS-FB-PIN" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(next.retry_attempts, issue.id).route == :primary
+     stacktrace:
+       :erlang.map_get("ISS-FB-PIN", %{})
+       test/symphony_elixir/fallback_routing_test.exs:654: (test)
+
+..
+
+ 49) test config and pin gates invalid fallback reasoning effort never switches (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:634
+     ** (KeyError) key "ISS-FB-BADEFFORT" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(next.retry_attempts, issue.id).route == :primary
+     stacktrace:
+       :erlang.map_get("ISS-FB-BADEFFORT", %{})
+       test/symphony_elixir/fallback_routing_test.exs:641: (test)
+
+.
+
+ 50) test reconcile-driven termination ends the failure sequence terminal issue: the latched fallback sequence is cleared and the next dispatch starts primary (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:131
+     ** (KeyError) key "ISS-FB-TERM" not found in:
+
+         %{}
+
+     code: latched = latched_state(issue)
+     stacktrace:
+       :erlang.map_get("ISS-FB-TERM", %{})
+       test/symphony_elixir/fallback_routing_test.exs:111: SymphonyElixir.FallbackRoutingTest.latched_state/1
+       test/symphony_elixir/fallback_routing_test.exs:135: (test)
+
+
+
+ 51) test reconcile-driven termination ends the failure sequence disappeared issue: the latched fallback sequence is cleared (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:194
+     ** (KeyError) key "ISS-FB-MISSING" not found in:
+
+         %{}
+
+     code: latched = latched_state(issue)
+     stacktrace:
+       :erlang.map_get("ISS-FB-MISSING", %{})
+       test/symphony_elixir/fallback_routing_test.exs:111: SymphonyElixir.FallbackRoutingTest.latched_state/1
+       test/symphony_elixir/fallback_routing_test.exs:198: (test)
+
+
+
+ 52) test route decision on classified failures ineligible failures never switch and reset the consecutive eligible count (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:498
+     ** (KeyError) key "ISS-FB-RESET" not found in:
+
+         %{}
+
+     code: assert Map.fetch!(again.retry_attempts, issue.id).route == :primary
+     stacktrace:
+       :erlang.map_get("ISS-FB-RESET", %{})
+       test/symphony_elixir/fallback_routing_test.exs:511: (test)
+
+.
+
+ 53) test reconcile-driven termination ends the failure sequence unroutable issue: the latched fallback sequence is cleared (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:173
+     ** (KeyError) key "ISS-FB-UNROUTABLE" not found in:
+
+         %{}
+
+     code: latched = latched_state(issue)
+     stacktrace:
+       :erlang.map_get("ISS-FB-UNROUTABLE", %{})
+       test/symphony_elixir/fallback_routing_test.exs:111: SymphonyElixir.FallbackRoutingTest.latched_state/1
+       test/symphony_elixir/fallback_routing_test.exs:177: (test)
+
+
+
+ 54) test retry-poll failures never fold route state a provider-shaped poll error does not increment primary_failure_count or latch fallback (SymphonyElixir.FallbackRoutingTest)
+     test/symphony_elixir/fallback_routing_test.exs:280
+     ** (KeyError) key "ISS-FB-POLL429" not found in:
+
+         %{}
+
+     code: metadata = retry_entry_metadata(first, issue.id)
+     stacktrace:
+       :erlang.map_get("ISS-FB-POLL429", %{})
+       test/symphony_elixir/fallback_routing_test.exs:262: SymphonyElixir.FallbackRoutingTest.retry_entry_metadata/2
+       test/symphony_elixir/fallback_routing_test.exs:287: (test)
+
+.................warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:\Users\micha\AppData\Local\Temp/symphony-elixir-repository-routing-125186/remote.git
+ * [new branch]      main -> main
+.......warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:\Users\micha\AppData\Local\Temp/symphony-elixir-staged-source-state-125570/remote.git
+ * [new branch]      main -> main
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+......
+
+ 55) test config resolves $VAR references for env-backed secret and path values (SymphonyElixir.WorkspaceAndConfigTest)
+     test/symphony_elixir/workspace_and_config_test.exs:1754
+     Assertion with == failed
+     code:  assert config.workspace.root == Path.expand(workspace_root)
+     left:  "/tmp/symphony-workspace-root"
+     right: "c:/tmp/symphony-workspace-root"
+     stacktrace:
+       test/symphony_elixir/workspace_and_config_test.exs:1782: (test)
+
+...............................warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:\Users\micha\AppData\Local\Temp/symphony-elixir-untracked-source-state-127426/remote.git
+ * [new branch]      main -> main
+.....warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:\Users\micha\AppData\Local\Temp/symphony-elixir-remote-task-branch-collision-127554/remote.git
+ * [new branch]      main -> main
+Cloning into 'C:\Users\micha\AppData\Local\Temp/symphony-elixir-remote-task-branch-collision-127554/publisher'...
+done.
+warning: remote HEAD refers to nonexistent ref, unable to checkout
+Switched to a new branch 'symphony/MIC-REMOTE-COLLISION'
+warning: in the working copy of 'branch-marker.txt', LF will be replaced by CRLF the next time Git touches it
+To C:\Users\micha\AppData\Local\Temp/symphony-elixir-remote-task-branch-collision-127554/remote.git
+ * [new branch]      symphony/MIC-REMOTE-COLLISION -> symphony/MIC-REMOTE-COLLISION
+...warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+.......warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+To C:\Users\micha\AppData\Local\Temp/symphony-elixir-tracked-source-state-128002/remote.git
+ * [new branch]      main -> main
+.........
+Finished in 710.4 seconds (17.5s async, 692.8s sync)
+1441 tests, 55 failures, 15 skipped

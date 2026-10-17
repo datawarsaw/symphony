@@ -173,8 +173,12 @@ defmodule SymphonyElixir.RuntimeLeaseTest do
     # late release attempt by the previous owner must not touch the successor
     assert {:error, :not_owner} = RuntimeLease.release(root, stale_token)
     assert raw_lease(root)["instance_id"] == String.duplicate("9", 32)
-    assert File.exists?(Path.join(RuntimeLease.authority_dir(root), "authority.recovery.json"))
-    assert record["prior_state"]["owner_token"] == stale_token
+    assert File.exists?(recovery_path(root))
+
+    # the audit artifact identifies the cleared lease without carrying its token
+    refute Map.has_key?(record["prior_state"], "owner_token")
+    assert record["prior_state"]["owner_token_redacted"] == true
+    refute File.read!(recovery_path(root)) =~ stale_token
   end
 
   # -- classification: staleness never authorizes takeover --
@@ -308,11 +312,12 @@ defmodule SymphonyElixir.RuntimeLeaseTest do
     assert record["forced_by"] == "operator-console"
     assert record["force_active"] == true
     assert record["prior_class"] == "active"
-    assert record["prior_state"]["owner_token"] == lease["owner_token"]
     assert record["prior_state"]["instance_id"] == foreign_instance_id()
+    assert record["prior_state"]["started_at"] == lease["started_at"]
+    refute Map.has_key?(record["prior_state"], "owner_token")
 
-    recovery_path = Path.join(RuntimeLease.authority_dir(root), "authority.recovery.json")
-    assert File.exists?(recovery_path)
+    assert File.exists?(recovery_path(root))
+    refute File.read!(recovery_path(root)) =~ lease["owner_token"]
     assert {:error, :not_found} = RuntimeLease.observe(root)
 
     assert {:ok, _} = RuntimeLease.claim(root, instance_id: String.duplicate("b", 32))
@@ -340,7 +345,9 @@ defmodule SymphonyElixir.RuntimeLeaseTest do
              RuntimeLease.force_release(root, confirm: true, reason: "operator: host lost", force_active: true)
 
     assert record["remove_error"] == :eacces
-    assert record["prior_state"]["owner_token"] == lease["owner_token"]
+    assert record["prior_state"]["instance_id"] == foreign_instance_id()
+    refute Map.has_key?(record["prior_state"], "owner_token")
+    assert record["prior_state"]["owner_token_redacted"] == true
 
     assert raw_lease(root)["owner_token"] == lease["owner_token"]
     assert {:ok, _} = RuntimeLease.renew(root, lease["owner_token"])
@@ -646,6 +653,517 @@ defmodule SymphonyElixir.RuntimeLeaseTest do
     else
       Process.sleep(50)
       wait_until(timeout - 50, fun)
+    end
+  end
+
+  # -- root spelling is not a domain boundary ---------------------------------
+
+  # Spellings of the SAME physical root, each usable as a real path without any
+  # symlink privilege: `Path.expand/1` normalizes separators and `..` lexically,
+  # and the nested directory exists so POSIX resolution succeeds too. Only
+  # spellings that really differ from the claimed root are returned.
+  defp root_alias_spellings(root) do
+    sub = Path.join(root, "alias-sub")
+    File.mkdir_p!(sub)
+
+    ([{"dotted_parent", sub <> "/.."}, {"forward_slash", String.replace(root, "\\", "/")}] ++
+       windows_drive_spellings(root))
+    |> Enum.filter(fn {_label, spelling} -> spelling != root end)
+  end
+
+  defp windows_drive_spellings(root) do
+    case :os.type() do
+      {:win32, _} ->
+        <<drive::binary-size(1), rest::binary>> = root
+        [{"drive_case", String.downcase(drive) <> rest}]
+
+      _ ->
+        []
+    end
+  end
+
+  defp recovery_path(root), do: Path.join(RuntimeLease.authority_dir(root), "authority.recovery.json")
+
+  defp unique_temp_root(label) do
+    path = Path.join(System.tmp_dir!(), "mic-runtime-lease-#{label}-#{:erlang.unique_integer([:positive])}")
+    File.mkdir_p!(path)
+    on_exit(fn -> File.rm_rf(path) end)
+    path
+  end
+
+  test "force_release refuses an ACTIVE lease reached through an equivalent root spelling", %{root: root} do
+    {:ok, lease} = RuntimeLease.claim(root, instance_id: foreign_instance_id())
+    claimed = File.read!(RuntimeLease.authority_path(root))
+    spellings = root_alias_spellings(root)
+    assert spellings != []
+
+    for {label, spelling} <- spellings do
+      assert {:error, {:active_lease, evidence}} =
+               RuntimeLease.force_release(spelling,
+                 confirm: true,
+                 reason: "operator: routine cleanup",
+                 forced_by: "operator-console"
+               ),
+             label
+
+      assert evidence["class"] == "active", label
+      assert evidence["instance_id"] == foreign_instance_id(), label
+      refute Map.has_key?(evidence, "owner_token"), label
+
+      # a refused recovery destroys nothing: no removal, no artifact
+      assert File.read!(RuntimeLease.authority_path(root)) == claimed, label
+      refute File.exists?(recovery_path(root)), label
+      assert {:ok, _} = RuntimeLease.observe(root), label
+    end
+
+    assert {:ok, _} = RuntimeLease.renew(root, lease["owner_token"])
+  end
+
+  test "force_release clears an ACTIVE lease through an equivalent spelling when authorized", %{root: root} do
+    spellings = root_alias_spellings(root)
+    assert spellings != []
+
+    for {label, spelling} <- spellings do
+      {:ok, _lease} = RuntimeLease.claim(root, instance_id: foreign_instance_id())
+
+      assert {:ok, record} =
+               RuntimeLease.force_release(spelling,
+                 confirm: true,
+                 reason: "operator: host lost mid-run",
+                 forced_by: "operator-console",
+                 force_active: true
+               ),
+             label
+
+      assert record["prior_class"] == "active", label
+      assert record["force_active"] == true, label
+      assert record["forced_by"] == "operator-console", label
+      refute Map.has_key?(record["prior_state"], "owner_token"), label
+      assert record["prior_state"]["owner_token_redacted"] == true, label
+      assert {:error, :not_found} = RuntimeLease.observe(root), label
+
+      # the artifact landed in the one physical authority directory
+      assert File.exists?(recovery_path(root)), label
+
+      # the next spelling starts from a clean physical authority directory
+      :ok = File.rm!(recovery_path(root))
+    end
+  end
+
+  test "force_release refuses an ACTIVE lease whose stored root is an equivalent spelling", %{root: root} do
+    spellings = root_alias_spellings(root)
+    assert spellings != []
+
+    for {label, spelling} <- spellings do
+      stored = valid_lease(spelling)
+      write_raw_lease(spelling, stored)
+
+      # the spelling is this root's own lease as far as every read is concerned
+      assert {:ok, evidence} = RuntimeLease.observe(root), label
+      assert evidence["class"] == "active", label
+      assert evidence["instance_id"] == foreign_instance_id(), label
+
+      assert {:error, {:active_lease, _evidence}} =
+               RuntimeLease.force_release(root, confirm: true, reason: "operator: routine cleanup"),
+             label
+
+      assert File.read!(RuntimeLease.authority_path(root)) == Jason.encode!(stored, pretty: true), label
+      assert {:ok, _} = RuntimeLease.renew(spelling, stored["owner_token"]), label
+      :ok = File.rm!(RuntimeLease.authority_path(root))
+    end
+  end
+
+  test "force_release recovers a STALE lease through an equivalent root spelling", %{root: root} do
+    spellings = root_alias_spellings(root)
+    assert spellings != []
+
+    for {label, spelling} <- spellings do
+      write_raw_lease(root, valid_lease(root, %{"heartbeat_at" => iso(60 * 60)}))
+
+      assert {:ok, record} =
+               RuntimeLease.force_release(spelling, confirm: true, reason: "operator: abandoned runtime"),
+             label
+
+      assert record["prior_class"] == "stale_unconfirmed", label
+      assert record["prior_state"]["owner_token_redacted"] == true, label
+      assert {:error, :not_found} = RuntimeLease.observe(root), label
+    end
+  end
+
+  test "observe and claim treat an equivalent spelling as the same domain", %{root: root} do
+    spellings = root_alias_spellings(root)
+    assert spellings != []
+
+    for {label, spelling} <- spellings do
+      assert {:error, :not_found} = RuntimeLease.observe(root), label
+
+      {:ok, lease} = RuntimeLease.claim(root, instance_id: foreign_instance_id())
+
+      # a held root is HELD through the alias: the lease is visible and a second
+      # claim fails closed with the owner's evidence instead of minting a domain
+      assert {:ok, evidence} = RuntimeLease.observe(spelling), label
+      assert evidence["class"] == "active", label
+      assert evidence["instance_id"] == foreign_instance_id(), label
+
+      assert {:error, {:runtime_authority_held, held}} = RuntimeLease.claim(spelling), label
+      assert held["instance_id"] == foreign_instance_id(), label
+      assert raw_lease(root)["owner_token"] == lease["owner_token"], label
+
+      # and claiming through the spelling lands on the one physical authority
+      :ok = RuntimeLease.release(root, lease["owner_token"])
+      assert {:ok, claimed} = RuntimeLease.claim(spelling), label
+      assert File.exists?(RuntimeLease.authority_path(root)), label
+      assert RuntimeLease.roots_match?(claimed["state_root"], root), label
+      assert {:ok, _} = RuntimeLease.renew(root, claimed["owner_token"]), label
+      :ok = RuntimeLease.release(root, claimed["owner_token"])
+    end
+  end
+
+  test "a record whose stored root differs stays protected while it classifies active", %{root: root} do
+    foreign_root = unique_temp_root("foreign-root")
+    write_raw_lease(root, valid_lease(foreign_root))
+
+    assert {:error, {:lease_state_invalid, :root_mismatch}} = RuntimeLease.observe(root)
+
+    # a foreign-looking ACTIVE record cannot be proven foreign: any spelling of
+    # this root could be hiding behind it, so the operator must say so explicitly
+    assert {:error, {:active_lease, evidence}} =
+             RuntimeLease.force_release(root, confirm: true, reason: "operator: foreign residue")
+
+    assert evidence["class"] == "active"
+    assert File.exists?(RuntimeLease.authority_path(root))
+
+    assert {:ok, record} =
+             RuntimeLease.force_release(root, confirm: true, reason: "operator: foreign residue", force_active: true)
+
+    assert record["prior_class"] == "root_mismatch"
+    assert record["prior_state"]["state_root"] == foreign_root
+    assert {:error, :not_found} = RuntimeLease.observe(root)
+  end
+
+  test "an invalid record that cannot be proven foreign keeps the ACTIVE guard", %{root: root} do
+    # schema-invalid (no `node`) with a live heartbeat: the record is not readable
+    # as a lease, so only the alias-aware guard can tell that it is an active
+    # lease of THIS root
+    invalid_active = Map.delete(valid_lease(root), "node")
+    write_raw_lease(root, invalid_active)
+
+    assert {:error, {:lease_state_invalid, :schema_invalid}} = RuntimeLease.observe(root)
+
+    assert {:error, {:active_lease, evidence}} =
+             RuntimeLease.force_release(root, confirm: true, reason: "operator: probe")
+
+    assert evidence["class"] == "active"
+    refute Map.has_key?(evidence, "owner_token")
+    assert File.read!(RuntimeLease.authority_path(root)) == Jason.encode!(invalid_active, pretty: true)
+
+    # the operator's explicit override is still the way through
+    assert {:ok, record} =
+             RuntimeLease.force_release(root, confirm: true, reason: "operator: probe", force_active: true)
+
+    assert record["prior_class"] == "schema_invalid"
+    assert {:error, :not_found} = RuntimeLease.observe(root)
+  end
+
+  test "an invalid ACTIVE record with no usable stored root keeps the guard", %{root: root} do
+    for {label, stored} <- [
+          {"missing_root", Map.delete(valid_lease(root), "state_root")},
+          {"empty_root", valid_lease(root, %{"state_root" => ""})}
+        ] do
+      write_raw_lease(root, stored)
+
+      assert {:error, {:lease_state_invalid, :schema_invalid}} = RuntimeLease.observe(root), label
+
+      assert {:error, {:active_lease, _evidence}} =
+               RuntimeLease.force_release(root, confirm: true, reason: "operator: probe"),
+             label
+
+      assert File.exists?(RuntimeLease.authority_path(root)), label
+      :ok = File.rm!(RuntimeLease.authority_path(root))
+    end
+  end
+
+  test "an invalid record recovers without override only when it is not active", %{root: root} do
+    foreign_root = unique_temp_root("invalid-foreign-root")
+    write_raw_lease(root, Map.delete(valid_lease(foreign_root), "node"))
+
+    assert {:error, {:lease_state_invalid, :schema_invalid}} = RuntimeLease.observe(root)
+
+    assert {:error, {:active_lease, _evidence}} =
+             RuntimeLease.force_release(root, confirm: true, reason: "operator: foreign residue")
+
+    # the pre-existing path is kept for state that cannot be active
+    write_raw_lease(root, valid_lease(foreign_root, %{"heartbeat_at" => iso(60 * 60)}) |> Map.delete("node"))
+
+    assert {:ok, record} = RuntimeLease.force_release(root, confirm: true, reason: "operator: foreign residue")
+
+    assert record["prior_class"] == "schema_invalid"
+    assert record["prior_state"]["state_root"] == foreign_root
+    refute Map.has_key?(record["prior_state"], "owner_token")
+    assert record["prior_state"]["owner_token_redacted"] == true
+    assert {:error, :not_found} = RuntimeLease.observe(root)
+  end
+
+  test "recovery audit evidence keeps forensics and never the owner token", %{root: root} do
+    {:ok, lease} = RuntimeLease.claim(root, instance_id: foreign_instance_id())
+
+    assert {:ok, record} =
+             RuntimeLease.force_release(root,
+               confirm: true,
+               reason: "operator: owner host lost mid-run",
+               forced_by: "operator-console",
+               force_active: true
+             )
+
+    prior = record["prior_state"]
+    refute Map.has_key?(prior, "owner_token")
+    assert prior["owner_token_redacted"] == true
+    assert prior["instance_id"] == foreign_instance_id()
+    assert prior["state_root"] == root
+    assert prior["node"] == to_string(node())
+    assert prior["os_pid"] == to_string(:os.getpid())
+    assert prior["hostname"] == lease["hostname"]
+    assert prior["started_at"] == lease["started_at"]
+    assert prior["heartbeat_at"] == lease["heartbeat_at"]
+
+    assert File.exists?(recovery_path(root))
+    refute Jason.encode!(record) =~ lease["owner_token"]
+    refute File.read!(recovery_path(root)) =~ lease["owner_token"]
+  end
+
+  test "an ACTIVE record with a relative stored root keeps the guard", %{root: root} do
+    for {label, stored_root} <- [
+          {"current_directory", "."},
+          {"relative_name", "mic-runtime-lease-relative-#{:erlang.unique_integer([:positive])}"}
+        ] do
+      # a relative stored root resolves against the BEAM's current directory, so
+      # it can never prove that this root is a different domain
+      write_raw_lease(root, valid_lease(stored_root))
+
+      assert {:error, {:lease_state_invalid, :root_mismatch}} = RuntimeLease.observe(root), label
+
+      assert {:error, {:active_lease, evidence}} =
+               RuntimeLease.force_release(root, confirm: true, reason: "operator: probe"),
+             label
+
+      assert evidence["class"] == "active", label
+      assert File.exists?(RuntimeLease.authority_path(root)), label
+
+      # the operator's explicit override is still the way through
+      assert {:ok, record} =
+               RuntimeLease.force_release(root, confirm: true, reason: "operator: probe", force_active: true),
+             label
+
+      assert record["prior_class"] == "root_mismatch", label
+      assert {:error, :not_found} = RuntimeLease.observe(root), label
+    end
+  end
+
+  test "recovery evidence redacts a token that survives in unparseable bytes", %{root: root} do
+    {:ok, lease} = RuntimeLease.claim(root, instance_id: foreign_instance_id())
+    token = lease["owner_token"]
+    torn = File.read!(RuntimeLease.authority_path(root)) <> "\nTRAILER torn write"
+    write_raw_lease(root, torn)
+
+    assert {:error, {:lease_state_invalid, :corrupt_state}} = RuntimeLease.observe(root)
+
+    assert {:ok, record} = RuntimeLease.force_release(root, confirm: true, reason: "operator: torn state")
+
+    assert record["prior_class"] == "corrupt_state"
+    assert is_binary(record["prior_state"])
+    assert record["prior_state"] =~ "[redacted]"
+    assert record["prior_state"] =~ "TRAILER torn write"
+
+    # torn bytes cannot tell a token from an equally shaped instance id, so every
+    # hex run of that shape is withheld
+    refute record["prior_state"] =~ lease["instance_id"]
+
+    refute record["prior_state"] =~ token
+    refute Jason.encode!(record) =~ token
+    refute File.read!(recovery_path(root)) =~ token
+  end
+
+  test "a survived corrupt record is reported without echoing the token", %{root: root} do
+    {:ok, lease} = RuntimeLease.claim(root, instance_id: foreign_instance_id())
+    token = lease["owner_token"]
+    path = RuntimeLease.authority_path(root)
+    torn = File.read!(path) <> "\nTRAILER torn write"
+
+    Process.put(@rm_hook, fn _path ->
+      File.write!(path, torn)
+      :ok
+    end)
+
+    assert {:error, {:lease_survived, :corrupt_state, evidence}} =
+             RuntimeLease.force_release(root, confirm: true, reason: "operator: probe", force_active: true)
+
+    refute evidence["raw"] =~ token
+    refute inspect(evidence) =~ token
+    refute File.read!(recovery_path(root)) =~ token
+    assert evidence["raw"] =~ "TRAILER torn write"
+  after
+    Process.delete(@rm_hook)
+  end
+
+  test "token forms that evade a plain field match never survive in evidence", %{root: root} do
+    {:ok, lease} = RuntimeLease.claim(root, instance_id: foreign_instance_id())
+    token = lease["owner_token"]
+    raw = File.read!(RuntimeLease.authority_path(root))
+
+    {token_index, _length} = :binary.match(raw, token)
+
+    variants = [
+      {"escaped_key", String.replace(raw, ~s("owner_token"), escaped_owner_token_key()) <> "\nTRAILER"},
+      {"multi_escape_key", String.replace(raw, ~s("owner_token"), multi_escape_owner_token_key()) <> "\nTRAILER"},
+      {"unquoted_value", String.replace(raw, ~s("owner_token": "#{token}"), "owner_token: #{token}") <> "\nTRAILER"},
+      {"uppercase_value", String.replace(raw, token, String.upcase(token)) <> "\nTRAILER"},
+      # a torn write that stops inside the token value, and one that stops inside
+      # the field name: a partial token is still a token prefix
+      {"truncated_value", binary_part(raw, 0, token_index + 31)},
+      {"truncated_key", String.replace(raw, ~s("owner_token"), ~s("owner_tok")) <> "\nTRAILER"}
+    ]
+
+    partial = binary_part(token, 0, 8)
+
+    for {label, content} <- variants do
+      write_raw_lease(root, content)
+
+      record =
+        case RuntimeLease.force_release(root, confirm: true, reason: "operator: probe") do
+          {:ok, record} ->
+            record
+
+          {:error, {:active_lease, _evidence}} ->
+            assert {:ok, record} =
+                     RuntimeLease.force_release(root, confirm: true, reason: "operator: probe", force_active: true),
+                   label
+
+            record
+        end
+
+      artifact = File.read!(recovery_path(root))
+
+      for leaked <- [token, String.upcase(token), partial] do
+        refute inspect(record) =~ leaked, label
+        refute artifact =~ leaked, label
+      end
+    end
+  end
+
+  # the escaped JSON spelling of the owner token field: "owner\u005ftoken"
+  defp escaped_owner_token_key do
+    <<34, 111, 119, 110, 101, 114, 92, 117, 48, 48, 53, 102, 116, 111, 107, 101, 110, 34>>
+  end
+
+  # the twice-escaped spelling of the same field: "owner\u005f\u0074oken"
+  defp multi_escape_owner_token_key do
+    <<34, 111, 119, 110, 101, 114, 92, 117, 48, 48, 53, 102, 92, 117, 48, 48, 55, 52, 111, 107, 101, 110, 34>>
+  end
+
+  test "token copies in fields outside the contract never survive in evidence", %{root: root} do
+    {:ok, lease} = RuntimeLease.claim(root, instance_id: foreign_instance_id())
+    token = lease["owner_token"]
+    base = raw_lease(root)
+
+    copies = [
+      {"verbatim", token},
+      {"uppercase", String.upcase(token)},
+      {"base64", Base.encode64(token)},
+      {"first_half", binary_part(token, 0, 16)},
+      {"second_half", binary_part(token, 16, 16)},
+      {"nested", [%{"inner" => token}]}
+    ]
+
+    for {label, copy} <- copies do
+      write_raw_lease(root, Jason.encode!(Map.put(base, "note", copy), pretty: true))
+
+      assert {:error, {:active_lease, _evidence}} =
+               RuntimeLease.force_release(root, confirm: true, reason: "operator: probe"),
+             label
+
+      assert {:ok, record} =
+               RuntimeLease.force_release(root, confirm: true, reason: "operator: probe", force_active: true),
+             label
+
+      # the projection reports the unexpected field by name only, never by value
+      assert record["prior_state"]["unexpected_fields"] == ["note"], label
+      assert record["prior_state"]["instance_id"] == foreign_instance_id(), label
+      refute inspect(record) =~ token, label
+      refute inspect(record) =~ String.upcase(token), label
+      refute File.read!(recovery_path(root)) =~ token, label
+      refute File.read!(recovery_path(root)) =~ String.upcase(token), label
+      assert {:error, :not_found} = RuntimeLease.observe(root), label
+    end
+  end
+
+  test "an ACTIVE lease claimed through a trailing-dot spelling keeps the guard", %{root: root} do
+    for {label, spelling} <- win32_trailing_dot_spellings(root) do
+      {:ok, _lease} = RuntimeLease.claim(spelling, instance_id: foreign_instance_id())
+      assert File.exists?(RuntimeLease.authority_path(root)), label
+      claimed = File.read!(RuntimeLease.authority_path(root))
+
+      # recovered through the native spelling and through the quirk one
+      for recovery_root <- [root, spelling] do
+        assert {:error, {:active_lease, evidence}} =
+                 RuntimeLease.force_release(recovery_root, confirm: true, reason: "operator: probe"),
+               label
+
+        assert evidence["class"] == "active", label
+        assert File.read!(RuntimeLease.authority_path(root)) == claimed, label
+      end
+
+      assert {:ok, _record} =
+               RuntimeLease.force_release(root, confirm: true, reason: "operator: probe", force_active: true),
+             label
+
+      assert {:error, :not_found} = RuntimeLease.observe(root), label
+    end
+  end
+
+  test "an ACTIVE lease whose stored root is a Win32 spelling quirk keeps the guard", %{root: root} do
+    for {label, stored_root} <- win32_quirk_stored_roots(root) do
+      write_raw_lease(root, valid_lease(stored_root))
+
+      assert {:error, {:lease_state_invalid, :root_mismatch}} = RuntimeLease.observe(root), label
+
+      assert {:error, {:active_lease, evidence}} =
+               RuntimeLease.force_release(root, confirm: true, reason: "operator: probe"),
+             label
+
+      assert evidence["class"] == "active", label
+      assert File.exists?(RuntimeLease.authority_path(root)), label
+
+      assert {:ok, _record} =
+               RuntimeLease.force_release(root, confirm: true, reason: "operator: probe", force_active: true),
+             label
+
+      assert {:error, :not_found} = RuntimeLease.observe(root), label
+    end
+  end
+
+  # Win32 resolves these to the same directory as the root while the path string
+  # — and therefore every comparison this module can make — still differs.
+  defp win32_trailing_dot_spellings(root) do
+    case :os.type() do
+      {:win32, _} -> [{"trailing_dot", root <> "."}]
+      _ -> []
+    end
+  end
+
+  defp win32_quirk_stored_roots(root) do
+    case :os.type() do
+      {:win32, _} ->
+        [
+          {"trailing_dot", root <> "."},
+          {"trailing_space", root <> " "},
+          # the extended-length path prefix, built from byte values so no literal
+          # backslash escaping is needed here; Erlang reads through it but cannot
+          # create through it
+          {"extended_prefix", <<92, 92, 63, 92>> <> String.replace(root, "/", <<92>>)}
+        ]
+
+      _ ->
+        []
     end
   end
 end

@@ -1,5 +1,231 @@
 # Symphony project state
 
+## PILOT-HARDEN-INT pilot safety integration — 2026-10-12
+
+Integration branch `pilot/pilot-harden-int`, worktree `C:/AI/symphony-workspaces/pilot-harden-int`,
+base `dbc83f2f3e5948bce19f1d2b7799ae2761458cf4` (PILOT-BOOT-F bootstrap gate candidate). Local
+candidate only: no push, merge into main, PR or deployment; the pilot was not started and no live
+pilot authorization is implied.
+
+### Verified inputs
+
+- F1 pilot-only dispatch guard: `c5e9d57208c78635f9ebdbd7b92fa13af2538559`, branch `pilot/guard-f1`,
+  worktree `C:/AI/symphony-workspaces/pilot-guard-f1` (clean).
+- F2 Windows path hardening: `f875912a1daaceab5000993b488584520264f8d5`, branch `hardening/pilot-guard-f2`,
+  worktree `C:/AI/symphony-workspaces/pilot-guard-f2` (clean).
+- F3 credential presence preflight: resolved reported `f14b6b3` to
+  `f14b6b30a65d7a650059e7b5fb014976ec73239e`, branch `pilot-auth-f/opencode-credential-preflight`,
+  worktree `C:/AI/symphony-workspaces/pilot-auth-f` (clean).
+- Each input is exactly one commit on top of `dbc83f2` (verified `git merge-base --is-ancestor`), and
+  the changed-file set of each matches its mandate with no unrelated changes. The Human Accepted M1
+  `cdbea16944b342f0fe7c11b4b6a8d40070903b80` remains an ancestor of `dbc83f2` — ancestry intact.
+
+### Integration method and conflict resolution
+
+Deterministic merge order F1 → F2 → F3, each as an explicit `--no-ff` merge so every original commit
+stays a reachable merge parent (identity preserved: `c5e9d57`, `f875912`, `f14b6b3` are parents of
+merge commits `06b3d6c`, `ef5a941`, `d004c9a` respectively). The predicted overlap in
+`elixir/lib/symphony_elixir/pilot_bootstrap.ex` (F1 alias/moduledoc/`PilotGuard.arm` vs F2 containment
+moduledoc and boundary rework) auto-merged under `ort` with no textual conflict. The auto-merge was
+verified semantically, not just textually: F1's `PilotGuard` alias, arming paragraph, and the
+`:ok = PilotGuard.arm(...)` call in `start/2` (armed after the hardened `:armed` preflight passes,
+before `ensure_all_started`) are all present, and F2's resolved-filesystem machinery
+(`resolve_boundary`/`resolve_path`/`walk`/link handling) is intact. Neither side's protections were
+discarded. Cumulative diff vs `dbc83f2` is exactly the union of the three inputs: 21 files,
++1788/−98 = F1 (+462/−3) + F2 (+657/−39) + F3 (+669/−56); every file touched by only one input is
+byte-identical to that input.
+
+### Variant B preserved
+
+`elixir/lib/symphony_elixir/retry_policy.ex` is byte-identical to the baseline (empty diff):
+`@max_attempts 10`, `@max_age_ms 2 * 60 * 60 * 1_000` (2-hour window), `@max_identical 3`. No token
+or cost budget, no single-attempt limit; operator-supervised execution assumptions unchanged.
+
+### Combined offline validation
+
+- `mix compile --warnings-as-errors`: pass.
+- Pilot suites (`pilot_bootstrap_test`, `pilot_bootstrap_windows_test`, `pilot_guard_test`):
+  45 tests, 0 failures.
+- OpenCode suites (credential preflight, dispatch, completion policy, event ordering, host
+  eligibility, integration smoke, offline acceptance, parser negative contract, parser session
+  integrity, terminal reason, opencode): 244 tests, 0 failures.
+- Retry/recovery/containment/harness suites (retry policy/envelope/store, parked/beam-death/wake
+  recovery, worker containment ×3, workspace root containment, harness authority/selection/isolation):
+  164 tests, 0 failures, 2 skipped.
+- `mix format --check-formatted`: pass. `mix specs.check`: pass.
+- Full suite once (`_int_full_tests.log`): 1504 tests, 56 failures, 12 skipped, 747.3 s.
+
+### Baseline failure-identity comparison
+
+Committed baseline (tracked `_cp0_baseline_tests.log`, 55 failures at ancestor `31529e5`) vs
+integration run (`_cmp_int_names.txt`): all 55 baseline failure identities reproduce with identical
+test names and modules; none disappeared or changed. One additional failure appeared in the
+integration full run only: `test a malformed chain with an extra entry stops on the first broken pair
+(SymphonyElixir.Delivery.DeliveryProofTest)`. Attribution as a scheduling/environment flake, not a
+regression: (a) the exact test and the whole 26-test file pass deterministically on the integration
+tree in isolation; (b) the `SymphonyElixir.Delivery` dependency graph (`Delivery.{Git,
+ArtifactManifest, Replay, Proof}`) has zero overlap with the six lib files the integration touches;
+(c) a control full-suite rerun on pristine `dbc83f2` (throwaway worktree, `_cmp_base_rerun_names.txt`)
+reproduced the identical 55-failure baseline set and did not reproduce this failure — the failure is
+order-dependent, not tree-dependent. Known inherited Windows-environment failures (e.g. the
+`Mix.Tasks.Workspace.BeforeRemoveTest` gh fake-binary group and the `/tmp` path-expansion config
+test) remain identical to baseline.
+
+### Combined safety invariants
+
+- Pilot startup requires the explicit reviewed manifest; nothing starts until the `:armed` gate
+  passes, and `--preflight-only` starts nothing and never arms (task calls `preflight/2`, not
+  `start/2`). Evidence: `pilot_bootstrap_test` suite.
+- The tracked default `WORKFLOW.md` cannot silently become the pilot workflow (identity checks
+  unchanged from PILOT-BOOT-F, now evaluated on resolved paths). Evidence: `pilot_bootstrap_test`.
+- Source SHA, workspace root and log root validated against resolved real paths. Evidence:
+  `pilot_bootstrap_test` + `pilot_bootstrap_windows_test`.
+- Junctions, directory/file symlinks, junction chains, ancestor junctions, link loops, device-path
+  aliases (forward and backslash) and noncanonical spellings cannot escape approved roots; in-bound
+  junctions and case/separator aliases keep passing. Evidence: `pilot_bootstrap_windows_test` (14 tests).
+- Armed pilot dispatches only explicitly authorized OpenCode issues; unlisted issues park instead of
+  falling back to Codex; invalid/disabled/unreadable OpenCode configuration parks instead of Codex
+  rescue; a durable pre-pilot Codex pin also parks. Evidence: `pilot_guard_test` (orchestrator-level
+  `refuse_codex_while_pilot_armed` rewrites every `{:dispatch, :codex, ...}` decision to a park).
+- Workflow reload cannot silently disarm the guard: the armed flag lives in the application
+  environment, set only by `PilotBootstrap.start/2`; dispatch-time code only reads it. Evidence:
+  `pilot_guard_test` "a workflow reload cannot disarm the guard or rescue an issue into Codex".
+- Missing, unmapped or empty provider credentials fail before worker launch — before any directory,
+  config, marker or process exists; presence is re-evaluated on every launch. Evidence:
+  `opencode_credential_preflight_test` (adapter-level `with` chain order).
+- Unexpected ambient endpoint/base-URL/host overrides fail closed; explicitly operator-supplied
+  `provider_auth` overrides pass; endpoint-shaped variables alone never satisfy presence. Evidence:
+  `opencode_credential_preflight_test`.
+- Credentials are not written to logs or launch artifacts: preflight is presence-only, never
+  authenticates, and error reasons/messages carry provider and variable names only — asserted
+  directly by "error reasons never contain credential values" and "failure messages name providers
+  and variables but never credential values". Limitation: this is enforced and tested for the
+  preflight/adapter surface, not an audit of every conceivable log statement in the codebase.
+- Durable harness pinning and termination containment remain intact (harness authority/isolation,
+  worker containment, recovery suites all green; F1 composes with pinning rather than replacing it).
+- Non-pilot behavior unchanged: guard reads as unarmed outside bootstrap arming (malformed record
+  fails open to unarmed routing, never silently armed), and non-pilot Codex dispatch/failover/rescue
+  tests pass unchanged.
+- Carried limitations (inherited from F2/F3 designs, restated): boundary resolution is a
+  validation-time control, not sandboxing — TOCTOU replacement of a path component after the check
+  and 8.3 short-name prefix matching remain possible; OS-level isolation is still the only absolute
+  boundary. Credential preflight proves presence only, never validity or non-expiry. The one
+  DeliveryProof flake above is not explained by, and is orthogonal to, this integration.
+
+### Pilot and protected state at closeout
+
+- Prepared pilot source checkout `C:/AI/symphony-workspaces/pilot-m1-opencode/source`: still detached
+  at the accepted M1 `cdbea16944b342f0fe7c11b4b6a8d40070903b80`, clean, not moved, not armed.
+- `C:/Users/micha/symphony-source` (`c90e2ad`, clean) and `C:/Users/micha/symphony-runtime`:
+  untouched. No Symphony runtime, OpenCode worker or BEAM process is running (verified); no tracker,
+  provider or network call was made; no real credential was read, written or copied (preflight tests
+  use synthetic values).
+- GO/NO-GO for independent review: GO. Prerequisites met — inputs verified with exact SHAs and
+  ancestry; integration is a clean union with verified conflict semantics; all focused suites,
+  compile, format and specs gates green; full-suite delta vs baseline is exactly one
+  attributed-and-orthogonal flake; Variant B unchanged; pilot not moved, armed or authorized.
+
+
+
+Branch `pilot/pilot-boot-f`, exact base `e65d1854351880b77bffad8fff4f755d8e9ee028` (the procedure
+documentation commit on top of the Human Accepted M1 candidate
+`cdbea16944b342f0fe7c11b4b6a8d40070903b80`). Isolated worktree
+`C:/AI/symphony-workspaces/m1-integration-assembly`. Implementation commit:
+`68344ee8eac8ada4eb9bd99e9e024d8127f94c51`. The accepted
+M1 commit is unchanged and remains the pilot provenance anchor. Local implementation candidate; no
+push, PR, merge or deployment, and the pilot is not started.
+
+- New fail-closed gate `SymphonyElixir.PilotBootstrap` and the `mix symphony.pilot_bootstrap` task. A pilot
+  manifest (pilot root, source root, expected source SHA, explicit workflow path, workspace root,
+  log root, approved repository target and source path) is required; nothing is started until the
+  gate passes, and `--preflight-only` starts nothing at all.
+- Boundary checks (both modes): manifest paths absolute and inside the pilot root; source HEAD equals
+  `expected_source_sha` with a clean tracked tree (so the legacy `elixir/WORKFLOW.md` copy step now fails);
+  the workflow is inside the pilot root, is not `elixir/WORKFLOW.md` and is not byte-identical to it; the
+  declared `workspace.root` equals the manifest workspace root and stays inside the pilot root; the log
+  root is inside the pilot root and outside protected checkouts; `worker.ssh_hosts` is empty,
+  `codex.worker_containment_enabled` is `true`, `agent.max_concurrent_agents` and `agent.max_turns` are `1`,
+  `discovery.enabled` is `false`; every existing routing target resolves to the approved source path.
+- Arming checks (`:armed` only): tracker project slug and required labels set; OpenCode enabled with
+  non-placeholder provider and model and non-empty tool and issue lists; exactly one routing target
+  equal to `approved_repo_target`; the labelled issue resolves while the unlabelled issue is refused as
+  `{:error, :missing_repository_target}`; every authorized issue selects OpenCode through the production
+  `HarnessSelection.select/2`.
+- `start/2` applies the workflow path and the log file to the application environment before starting the
+  client, so the disk log is `<logs_root>/log/symphony.log` inside the pilot directory and cannot fall
+  back to the default runtime location. A refusal returns before either is applied.
+- Deliberately unchanged: `RepositoryRouter.resolve/2` semantics (an empty `targets` map still returns
+  `{:ok, nil}` and still resolves to the default workspace - the gate, not the router, requires one
+  approved target), `RetryPolicy`, `HarnessSelection`, dispatch wiring, `CLI`, `Application` and the
+  deployed `WORKFLOW.md`. Every change is additive; no existing module was modified.
+- Validation: new pilot bootstrap suite 20 tests / 0 failures; focused suites `cli`, `log_file`,
+  `workspace_and_config`, `harness_selection`, `dispatch_router` and the new suite total 137 tests with one
+  failure, the pre-existing host failure `config resolves $VAR references for env-backed secret and path
+  values` (`Path.expand("/tmp/...")` vs the configured `/tmp/...`), reproduced with the new files removed.
+  `mix compile --warnings-as-errors`, `mix specs.check` and `mix format --check-formatted` pass. Evidence:
+  `C:/AI/reviews/pilot-boot-f/`.
+- Known residual: an armed pilot still reaches Codex for a labelled issue that is not listed in
+  `opencode.allowed_issues`, because no configuration switch disables the Codex harness. The gate reduces
+  this to "not discoverable by default" (repository target plus queue label plus a traceable
+  allowlist); eliminating it needs a pilot-only dispatch guard, recorded as a separate backlog item.
+
+## M1-WIRE-F2 OpenCode 1.18.28 Wire Fixture Provenance Remediation — 2026-10-11
+
+Base: datawarsaw/symphony reference commit `9ce11fd3a9db817d1930e372749fd13ce4b08951` (M1-D).
+Remediated candidate: `6459a2da4f1687bb346cb49737c317a20066c5d8` (branch `codex/m1-wire-f-authentic-fixtures`).
+Remediation branch: `codex/m1-wire-f2-provenance-remediation`, isolated checkout `C:/AI/worktrees/m1-wire-f2-remediation`.
+Scope: fixtures, manifest, fixture tests, provenance document and this record. Production modules are unchanged.
+
+- Upstream tag `v1.18.28` resolves to `22006d97652839999596a34a48ff6be7dbb40c6e` (confirmed with git ls-remote). Source anchors are in `docs/m1-opencode-wire-fixtures-provenance.md`.
+- No fixture is a captured CLI output. All values are synthetic. Labels are `cli-emission-shape` (3 fixtures), `schema-derived` (4), and `synthetic` (4, including two explicit-total fixtures). `live_capture_status` is `none`.
+- `tokens.total` was removed from the upstream-shaped and schema-derived fixtures. Explicit-total coverage, including zero, moved to synthetic fixtures.
+- The five expected-red gates keep their assertions. They are tagged as 3 `product_policy` (gap A1, A2, A3) and 2 `implementation_candidate` (gap A5 status and name). None is a demonstrated upstream defect.
+- Two upstream observations are open and outside the gates: a mid-turn `unknown` step-finish is treated as terminal by the Parser, and provider failures in JSON mode appear as step-finish events rather than error records.
+- Validation: protocol suite 14 passing; gap suite 5 expected red with unchanged received values. This is not a genuine wire-trace certification. Authorized live captures remain required.
+- Constraints maintained: no provider calls, no private session stores or auth files read, no production module changes, no merge, push, PR or deployment.
+## M1-P-F1 OpenCode parser safety candidate — 2026-10-11
+
+Branch `codex/m1-p-f1-parser-safety`, exact dispatch base
+`9ce11fd3a9db817d1930e372749fd13ce4b08951`, isolated worktree
+`C:/AI/symphony-workspaces/m1-p-f1-parser-safety`. Local implementation candidate;
+no provider calls, credential operations, push, PR, merge, integration or deployment.
+
+- JSONL non-objects and invalid traversed event fields fail closed before session
+  extraction, usage updates or callback event storage. Later valid records remain
+  readable but cannot turn a failed run into success.
+- Evidence reuses `{:malformed_json_line, line, %{reason: "invalid_event_shape: <field>"}}`.
+  Invalid objects retain a fixed line, not their raw payload. String records are
+  decoded before existing Redactor sanitization and its 4,096-byte UTF-8 bound.
+  Evidence line/detail are JSON-encodable; the tuple follows existing Failure conventions.
+- Arithmetic overflow is rejected transactionally using the prior state, with
+  field marker `usage`. This covers huge integer costs and accumulated float overflow.
+- Session-ID validation, usage deduplication, timeout policy, WorkerEvent and
+  dispatch wiring remain untouched, as do the other M1 task worktrees.
+
+Validation evidence lives under `C:/AI/reviews/m1-p-f1-*.log`:
+
+- New safety suite: baseline 34 tests / 33 failures; candidate 34 / 0.
+- Read-only negative candidate `a5378cc2660c4e86492c2a475d5f825da1659c78`:
+  baseline 21 / 11 failures; candidate 21 / 3. All eight shape-safety red tests
+  turn green. Remaining failures are two duplicate-accounting tests and one
+  foreign-session test, deliberately outside this task. Timeout assertions passed
+  in both measured runs; no timeout contract decision is inferred from that.
+- Expanded OpenCode mock suites passed 150 / 0 before the final arithmetic
+  correction; the correction is covered by the final 34-test safety suite.
+  The final existing adapter/config suite passes 77 / 0, matching the exact base.
+  An earlier run had three process-boundary timeouts with no JSONL events;
+  these did not recur in the expanded or final runs.
+- Compile with warnings as errors, specs.check, changed-file formatting and
+  git diff whitespace checks pass. Whole-project formatting fails on the same
+  three baseline files. Credo has identical baseline/candidate finding counts
+  (18 warnings, 60 refactoring, 82 readability, 7 design). Dialyzer has the same
+  34 baseline findings after normalizing shifted line numbers; no new finding.
+
+Residual limits: bounds apply per diagnostic record, not to total stream memory
+or evidence count. Full JSON parsing still precedes shape validation. Independent
+candidate review is pending; this state records implementation, not acceptance.
+Closeout and exact committed revision: `C:/AI/reviews/m1-p-f1-closeout.md`.
+
 ## MIC-167 implementation candidate
 
 Base: datawarsaw/symphony main, 54d9b9080262dcc328ed5aa68430583d1a1cdfe8.
@@ -201,3 +427,196 @@ Validated for the MIC-221 + MIC-224 integration (Windows, Elixir 1.19.5 / OTP 28
 - `git diff --check` and `git diff --cached --check` pass.
 
 Baseline comparison ran in a separate clone of the same repository bundle checked out at `c540a299`, with the same TEMP override and the same seed. The integration introduces no new failure on this host.
+
+## M1-C OpenCode configuration and routing gate candidate — 2026-10-10
+
+Branch `codex/m1-c-opencode-config-routing-gate`, base `c90e2ad71a70310e6d71b94777f6cbaca081b6c5` (the accepted
+baseline, equal to `origin/main`), worktree `C:/AI/symphony-workspaces/m1-c-opencode-config-routing-gate`.
+Implementation commit `371687c`. Implementation-only candidate; no push, PR, merge, deployment, or
+Linear write was performed, and the deployed runtime configuration is unchanged.
+
+- New optional `opencode` front-matter section in `Config.Schema`: `enabled` (default false), explicit
+  `provider` and `model` identity, a bounded `timeout_ms` (default 900000), an explicit
+  `allowed_tools` allowlist, and an optional `allowed_issues` pilot scope. The section carries no
+  command, credential, environment, or provider-fallback field.
+- Validation fails closed. While `enabled` is true, `provider` and `model` must be non-blank and
+  `allowed_tools` must be non-empty. Wildcard or unrestricted tool grants (`*`, `all`, `any`, `auto`,
+  `auto_approve`, `unrestricted`, case-insensitive) and blank allowlist entries are rejected whether
+  or not the section is enabled; a non-positive or non-numeric `timeout_ms` is rejected. An empty
+  `allowed_issues` list validates but authorizes no issue.
+- `HarnessSelection.select/2` is the pure policy: `{:opencode, :opencode_selected}` only when the section
+  is enabled, fully specified, and the issue identifier is listed; `{:codex, reason}` otherwise,
+  with reason in `:opencode_disabled`, `:opencode_incomplete`, `:issue_not_authorized`, or
+  `:invalid_opencode_config`. It reads only its two arguments, launches no process, writes no
+  state, and leaves dispatch, retry, and containment gates untouched.
+- Configuration and policy only. No dispatch integration was performed: AgentRunner,
+  Orchestrator, WorkerContainment, LaunchMarker, DispatchRouter, the OpenCode adapter branches,
+  `WORKFLOW.md`, and the deployed runtime configuration are untouched. OpenCode remains
+  unreachable until a separate later step wires the decision in.
+
+Validated on this host (Windows, Elixir 1.19.5 / OTP 28):
+
+- `mix compile --warnings-as-errors` passes.
+- `mix specs.check` passes and `mix format --check-formatted` (whole project) passes.
+- New focused suites: 27 tests, 0 failures; `mix test --cover` reports 100% line coverage for
+  `SymphonyElixir.HarnessSelection` and `SymphonyElixir.Config.Schema.OpenCode`.
+- Focused routing regression at seed 424242 (the two new suites plus dispatch_router_test,
+  worker_routing_test, fallback_routing_test, fallback_policy_test): 123 tests, 21 failures. The
+  pristine `c90e2ad` baseline on this host gives 96 tests with the identical 21 failing
+  FallbackRoutingTest names; no introduced failure.
+- Config regression at seed 424242 (workspace_and_config_test, core_test, extensions_test,
+  source_canonicality_test): 139 tests, 12 failures with a failure-name set identical to the
+  pristine baseline at the same seed (pre-existing CoreTest and WorkspaceAndConfigTest host and
+  sandbox failures).
+- `mix lint` (credo --strict) exits 30 on both candidate and pristine baseline with identical
+  finding counts (9 warnings, 37 refactoring, 76 readability, 4 design); no finding points at a
+  changed file. `git diff --check` is clean.
+
+The broad Windows test processes printed their complete ExUnit summaries and stayed open; they were
+interrupted after results were captured, so their process exits are not claimed as successful.
+Dispatch integration and independent exact-head review remain the next separate steps.
+
+## M1-C OpenCode configuration contract hardening — 2026-10-10
+
+Branch `codex/m1-c-opencode-config-routing-gate`, base `c90e2ad71a70310e6d71b94777f6cbaca081b6c5`, worktree
+`C:/AI/symphony-workspaces/m1-c-opencode-config-routing-gate`. Hardening commit `6a3c020` on top of the
+implementation candidate `371687c` / `2bdfefd`. Implementation-only candidate: no push, PR, merge, deployment, or
+Linear write, and the deployed runtime configuration is unchanged.
+
+- `Config.Schema.OpenCode.validate/1` re-checks a hand-built `%OpenCode{}` struct from its own fields, so a struct
+  can no longer bypass the unrestricted-tool, unknown-tool, or timeout validation for non-null values.
+  `HarnessSelection.select/2` routes maps and structs through it. (Correction recorded with the M1-C-F2 entry
+  below: an explicit `null` for `enabled` or `timeout_ms` still bypassed these checks at this commit — Ecto
+  records a nil parameter as a change and `validate_number/3` skips nil changes — and `select/2` matched only
+  `enabled: false`, so a null `enabled` still selected OpenCode without explicit consent. The blanket "no longer
+  bypass" claim above was inaccurate until the M1-C-F2 remediation closed it.)
+- `timeout_ms` gained a finite upper bound of `3600000` (one hour). The `900000` default remains the practical M1
+  pilot budget; the cap keeps one run inside the `codex.turn_timeout_ms` default so the pilot cannot outlive the
+  surrounding worker.
+- Tool names are validated against the OpenCode adapter contract. The accepted set is declared once, in
+  `OpenCode.known_tool_names/0`, rather than in a second free-standing allowlist; `unknown_tools/1` rejects anything
+  outside it (case-sensitive, matching the adapter's trim-only normalization), while wildcard and unrestricted
+  rejection stays case-insensitive and unchanged.
+- Harness selection no longer collapses every non-selected outcome onto `{:codex, reason}`. An invalid section that
+  still lists the issue returns `{:error, :invalid_opencode_config}`; an invalid section that does not list the issue
+  returns `{:codex, :invalid_opencode_config}`; absent or disabled sections keep `{:codex, :opencode_disabled}` and a
+  non-listed issue keeps `{:codex, :issue_not_authorized}`. An intended OpenCode pilot is therefore never silently
+  replaced by Codex. The policy stays pure: `select/2` is still the only public function, and it launches no process,
+  writes no state, and reads no runtime configuration.
+
+Compatibility dependency on the OpenCode adapter source:
+
+- The adapter candidate `5df80de` / `da78cbf` owns the accepted tool names in the private `@known_tools` of
+  `SymphonyElixir.OpenCode.Config` and rejects unknown names through its public `build/1`. This branch does not
+  contain that module, so `OpenCode.known_tool_names/0` mirrors its 15 names and is the single declared source here.
+- Integration resolves the dependency in one step: land the adapter branch (or its successor) and remove the adapter's
+  private list so `SymphonyElixir.OpenCode.Config` reads the contract from `OpenCode.known_tool_names/0`. The focused
+  contract test compiles only when `SymphonyElixir.OpenCode.Config` is loadable and then asserts that the adapter's
+  accepted tool map equals `OpenCode.known_tool_names/0` and that an unknown name is rejected, so the two sets cannot
+  drift silently once both exist.
+
+Validated on this host (Windows, Elixir 1.19.5 / OTP 28):
+
+- `mix compile --warnings-as-errors` passes (only the benign Phoenix LiveView `:eperm` `node_modules` symlink
+  warning).
+- `mix specs.check` passes; `mix format --check-formatted` (whole project) passes; `git diff --check` is clean.
+- Focused suites `opencode_config_test` + `harness_selection_test`: 35 tests, 0 failures at seed 424242.
+- `mix lint`: exit 30 with 9 warnings, 37 refactoring opportunities, 76 readability issues, and 4 design suggestions -
+  identical to the finding counts recorded for the previous candidate, and `mix credo --strict` on the four changed
+  files reports no issues.
+- Focused routing regression at seed 424242 (the two suites plus dispatch_router_test, worker_routing_test,
+  fallback_routing_test, fallback_policy_test): 131 tests, 21 failures, all `FallbackRoutingTest`. A pristine
+  `c90e2ad` worktree on this host at the same seed gives 96 tests with an identical failure-name set; no introduced
+  failure.
+- Config regression at seed 424242 (workspace_and_config_test, core_test, extensions_test, source_canonicality_test):
+  139 tests, 12 failures with failure names identical to the pristine `c90e2ad` worktree at the same seed
+  (pre-existing CoreTest and WorkspaceAndConfigTest host failures).
+- The broad Windows test processes printed their complete ExUnit summaries and stayed open; they were interrupted
+  after results were captured, so their process exits are not claimed as successful. The baseline comparison used a
+  temporary detached worktree at `c90e2ad` (`C:/AI/symphony-workspaces/_m1c-baseline-c90e2ad`), removed after use.
+
+Remaining work before dispatch: wire `HarnessSelection.select/2` into the dispatch path (AgentRunner, Orchestrator,
+DispatchRouter), land the OpenCode adapter branch and reconcile the tool contract, and complete independent exact-head
+review. `AgentRunner`, `Orchestrator`, `DispatchRouter`, `LaunchMarker`, the OpenCode adapter, `WORKFLOW.md`, and
+the deployed runtime configuration are untouched.
+
+## M1-C-F2 OpenCode config nil-bypass remediation — 2026-10-10
+
+Branch `codex/m1-c-opencode-config-routing-gate`, on top of `80028c4` (implementation `371687c` / `2bdfefd`,
+hardening `6a3c020`), worktree `C:/AI/symphony-workspaces/m1-c-opencode-config-routing-gate`. Bounded remediation of
+the independent-review M1-C-R2 HIGH finding: no push, PR, merge, deployment, or Linear write, and no dispatch wiring,
+AgentRunner, or OpenCode adapter change. No other worktree was modified.
+
+- Finding, reproduced at `80028c4`: an explicit `null` for `opencode.enabled` or `opencode.timeout_ms` validated
+  successfully in `Config.Schema.OpenCode.validate/1` for both plain maps and hand-built `%OpenCode{}` structs —
+  Ecto's `cast/4` records a nil parameter as a change while `validate_number/3` and `validate_change/3` skip nil
+  changes — and `HarnessSelection.select/2` matched only `enabled: false`, so a null `enabled` fell into the enabled
+  clause and returned `{:opencode, :opencode_selected}` for an allowlisted issue with no explicit opt-in, no
+  provider/model/tool identity check, and a null (unbounded) timeout likewise accepted.
+- Fix: `OpenCode.changeset/2` rejects an explicit null for the security-critical fields by inspecting the cast
+  changes directly — `enabled` with "must not be null: explicit true or false required" and `timeout_ms` with "must
+  not be null". `HarnessSelection.select/2` now selects OpenCode only on the literal `%OpenCode{enabled: true}`;
+  every other validated section keeps `{:codex, :opencode_disabled}`.
+- `Schema.parse/1` YAML null semantics are deliberately preserved: `drop_nil_values/1` strips nulls before the
+  OpenCode changeset runs, so a workflow-file null means "absent" and keeps the safe defaults (`enabled: false`,
+  `timeout_ms: 900000`), and nulls never lift the enabled-identity requirements (an `enabled: true` section with
+  null provider/model/tools still fails on all three). The direct-vs-parse distinction is documented in the
+  `OpenCode` moduledoc: a null that reaches `validate/1` from a map or struct is an error.
+- Fail-closed selection preserved and extended: an invalid section that still lists the issue returns
+  `{:error, :invalid_opencode_config}` — never a silent Codex substitution and never OpenCode authorization — and
+  the same invalid section without the issue keeps `{:codex, :invalid_opencode_config}`. Issue allowlisting, tool
+  validation, the 3600000 timeout cap, and the provider/model requirements are unchanged. The inaccurate
+  "no longer bypass" claim recorded by the previous hardening entry was corrected above.
+
+Validated on this host (Windows, Elixir 1.19.5 / OTP 28):
+
+- Focused suites `opencode_config_test` + `harness_selection_test`: 45 tests, 0 failures at seed 424242 (35 before
+  this change). The six new null-rejection tests fail at `80028c4` — verified by running the new test files against
+  stashed HEAD code (45 tests, 6 failures) — and pass after the fix. The four new preserved-behavior tests (absent
+  defaults, valid map/struct equivalence, and the two YAML-null parse tests) pass unchanged on both, as intended.
+- `mix compile --warnings-as-errors`, `mix specs.check`, and `mix format --check-formatted` (whole project) pass;
+  `mix credo --strict` on the four changed files reports no issues; `git diff --check` is clean.
+- Config regression at seed 424242 (workspace_and_config_test, core_test, extensions_test, source_canonicality_test):
+  139 tests, 12 failures, matching the recorded baseline failure set for this host (the `$VAR` expansion failure and
+  the pre-existing CoreTest MIC-164 `:epipe` / Git-Bash path-mangling failures).
+- Routing regression at seed 424242 (both focused suites plus dispatch_router_test, worker_routing_test,
+  fallback_routing_test, fallback_policy_test): 141 tests, 21 failures, all `FallbackRoutingTest` with the recorded
+  pre-existing `ISS-FB-*` KeyError signature — the recorded baseline is 131 tests with the identical 21 failures,
+  and the +10 are this change's new tests.
+- Broad Windows suites were run with output redirected to log files and exited on their own; logs are retained at
+  `C:/tmp/m1cf2-config-a.log`, `C:/tmp/m1cf2-config-b.log`, and `C:/tmp/m1cf2-routing.log`.
+
+Scope remains configuration and policy only: dispatch integration, the adapter branch, `WORKFLOW.md`, and the
+deployed runtime configuration are untouched, and OpenCode remains unreachable until dispatch wiring lands.
+## M1-API-F OpenCode provider classification candidate — 2026-10-11
+
+Local candidate on `codex/m1-api-f-provider-classification`, isolated worktree
+`C:/AI/symphony-workspaces/m1-api-f-provider-classification`, exact base
+`9ce11fd3a9db817d1930e372749fd13ce4b08951`. Pending independent review and integration;
+no push, PR, merge or deployment. This entry records candidate behavior, not deployed behavior.
+
+- OpenCode 1.18.28 schema-derived `APIError` fixtures use `data.statusCode` and boolean
+  `data.isRetryable`. Baseline reproduction classified 401/403/404/429/500/501/502/503/504/599
+  with neutral messages as `transient_worker_failure`.
+- Candidate: 401 -> `auth_unavailable`; 403/404 -> `persistent_worker_failure`;
+  consistent 429 -> `provider_rate_limit`, consistent 500–599 -> `provider_outage`, both
+  requiring explicit `isRetryable: true`. Missing, malformed, false or conflicting retry
+  metadata and missing/malformed/conflicting HTTP status fail closed as persistent;
+  valid 401 evidence has auth precedence over conflicting metadata.
+- `UnknownError` and `MessageAbortedError` remain persistent even with misleading messages
+  or extra provider metadata. Real `ProviderAuthError` is auth. Legacy `status`/`data.status`
+  without modern fields retain their existing mapping, including legacy `APIError`;
+  conflicting legacy API statuses fail closed. Malformed `data` no longer crashes failure info.
+- Shared FailureClass, retry scheduling, HarnessSelection, dispatch and adapter execution
+  are unchanged. Auth parks immediately; persistent cannot trigger fallback and permits only
+  the existing bounded retry envelope (three identical failures, ten attempts / two hours).
+  `isRetryable: false` cannot mean immediate no-retry without changing global policy.
+- Focused classification, legacy taxonomy, retry/fallback policy and retry-envelope regression:
+  100 tests, 0 failures, seed 424242. Compilation with `--warnings-as-errors`, public specs and
+  formatting of changed Elixir files pass. Full static gates have pre-existing failures;
+  evidence and baseline comparison are retained in
+  `C:/AI/reviews/m1-api-f-provider-classification`.
+- Evidence: nonsecret protocol audit
+  `C:/AI/reviews/m1-w-opencode-jsonl-protocol-audit/M1-W-OPENCODE-PROTOCOL-AUDIT.md`, section A5;
+  public `anomalyco/opencode` tag `v1.18.28`, `packages/schema/src/v1/session.ts`.
+  Fixtures are schema-derived, not captured stdout; no live providers or credential reads.

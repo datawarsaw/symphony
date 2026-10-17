@@ -1,0 +1,251 @@
+{
+  "version": "1.18.28",
+  "upstream_repository": "anomalyco/opencode",
+  "upstream_tag": "v1.18.28",
+  "upstream_commit_sha": "22006d97652839999596a34a48ff6be7dbb40c6e",
+  "upstream_verification": "Tag ref confirmed with git ls-remote. Cited files fetched at the commit and hashed with git hash-object; run.ts blob cccc2550179f87bb74763004910028f79ade60c9 matched the earlier record.",
+  "live_capture_status": "none",
+  "generated_at": "2026-10-11T00:00:00Z",
+  "label_definitions": {
+    "cli-emission-shape": "Envelope and event order follow emit() and upstream CLI tests at v1.18.28. Every value is synthetic. Not a captured CLI output.",
+    "schema-derived": "Field names and types follow the upstream Effect schemas at v1.18.28. Event combinations and values are synthetic; emitted presence of optional fields is not established.",
+    "synthetic": "Values or combinations that the v1.18.28 source paths searched do not produce, or intentionally invalid input. Used as contract inputs or negative controls."
+  },
+  "fixtures": [
+    {
+      "name": "single_turn_success.jsonl",
+      "label": "cli-emission-shape",
+      "tokens_total": "absent",
+      "description": "Single turn: step_start, text, step_finish with reason stop and cache read usage. Event order mirrors the upstream single-turn test. All values synthetic.",
+      "source_references": [
+        "packages/opencode/src/cli/cmd/run.ts lines 678-688 (emit: JSON envelope with type, timestamp, sessionID and data, followed by os EOL)",
+        "packages/opencode/src/cli/cmd/run.ts lines 745-754 (step_start, step_finish, text)",
+        "packages/opencode/test/cli/run/run-process.test.ts line 124 (step_start, text, step_finish)",
+        "packages/schema/src/v1/session.ts lines 242-252 (step-finish: reason Schema.String, tokens.total optional at line 247)"
+      ],
+      "wire_events": [
+        "step_start",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "event envelope shape",
+        "reason stop",
+        "tokens.cache.read",
+        "cost"
+      ],
+      "captured_from_live_cli": false
+    },
+    {
+      "name": "multi_step_tool_success.jsonl",
+      "label": "cli-emission-shape",
+      "tokens_total": "absent",
+      "description": "Two steps: tool_use with completed state, intermediate step_finish reason tool-calls, then a second step with text and terminal reason stop. Continuation order mirrors the upstream reasoning-and-tool test without the leading reasoning and text events. All values synthetic.",
+      "source_references": [
+        "packages/opencode/src/cli/cmd/run.ts line 725 (tool part with state status completed or error)",
+        "packages/opencode/src/cli/cmd/run.ts lines 745-754 (step_start, step_finish, text)",
+        "packages/opencode/test/cli/run/run-process.test.ts test '--format json preserves reasoning, tool, and continuation ordering' (sequence at lines 186-194)",
+        "packages/schema/src/v1/session.ts ToolStateError (status error, input, error string, time)"
+      ],
+      "wire_events": [
+        "step_start",
+        "tool_use",
+        "step_finish",
+        "step_start",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "intermediate reason tool-calls",
+        "terminal reason stop",
+        "tool state completed"
+      ],
+      "captured_from_live_cli": false
+    },
+    {
+      "name": "tool_error_recovery.jsonl",
+      "label": "schema-derived",
+      "tokens_total": "absent",
+      "description": "Tool error (ToolStateError shape with status error) followed by step_finish tool-calls, then a recovery step ending with reason stop. The recovery sequence does not appear in the upstream tests read; it is a policy-sensitive contract input. Values synthetic.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts ToolStateError (status error, input, error string, time)",
+        "packages/opencode/src/cli/cmd/run.ts line 725 (tool part with state status completed or error)",
+        "packages/schema/src/v1/session.ts lines 242-252 (step-finish: reason Schema.String, tokens.total optional at line 247)"
+      ],
+      "wire_events": [
+        "step_start",
+        "tool_use",
+        "step_finish",
+        "step_start",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "tool state error",
+        "intermediate reason tool-calls",
+        "terminal reason stop after recovery"
+      ],
+      "captured_from_live_cli": false
+    },
+    {
+      "name": "terminal_reason_other.jsonl",
+      "label": "synthetic",
+      "tokens_total": "absent",
+      "description": "Single turn whose step_finish reason is other. The value is not in the v1.18.28 FinishReason union and no source path searched produces it. Used only as a hypothetical input for product-policy gap A1.",
+      "source_references": [
+        "packages/llm/src/schema/ids.ts line 39 (FinishReason: stop, length, tool-calls, content-filter, error, unknown)",
+        "packages/opencode/src/session/llm/ai-sdk.ts lines 22-23 (values outside FinishReason map to unknown)",
+        "packages/schema/src/v1/session.ts lines 242-252 (step-finish: reason Schema.String, tokens.total optional at line 247)"
+      ],
+      "wire_events": [
+        "step_start",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "reason other (synthetic, not produced at v1.18.28)"
+      ],
+      "captured_from_live_cli": false
+    },
+    {
+      "name": "api_error_retryable_rate_limit.jsonl",
+      "label": "schema-derived",
+      "tokens_total": "not applicable",
+      "description": "Error record with the APIError shape: statusCode 429, isRetryable true, responseHeaders, responseBody and metadata. Field names come from the schema. The upstream parseStreamError test returns no statusCode, so the presence of statusCode in emitted records is not established. Values synthetic.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts lines 48-55 (APIError: statusCode optional, isRetryable boolean)",
+        "packages/schema/src/v1/session.ts lines 29-35 (named error shape: name plus data)",
+        "packages/opencode/src/cli/cmd/run.ts lines 788-789, 855, 872 (error record)",
+        "packages/opencode/test/provider/error.test.ts lines 5-22 (parseStreamError: type api_error, no statusCode)"
+      ],
+      "wire_events": [
+        "error"
+      ],
+      "wire_features": [
+        "error.name APIError",
+        "error.data.statusCode 429 (schema-optional)",
+        "error.data.isRetryable true"
+      ],
+      "captured_from_live_cli": false
+    },
+    {
+      "name": "api_error_non_retryable_forbidden.jsonl",
+      "label": "schema-derived",
+      "tokens_total": "not applicable",
+      "description": "Error record with the APIError shape: statusCode 403 and isRetryable false. Same schema basis and same caveat on the presence of statusCode as the 429 fixture. Values synthetic.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts lines 48-55 (APIError: statusCode optional, isRetryable boolean)",
+        "packages/schema/src/v1/session.ts lines 29-35 (named error shape: name plus data)",
+        "packages/opencode/src/cli/cmd/run.ts lines 788-789, 855, 872 (error record)"
+      ],
+      "wire_events": [
+        "error"
+      ],
+      "wire_features": [
+        "error.name APIError",
+        "error.data.statusCode 403 (schema-optional)",
+        "error.data.isRetryable false"
+      ],
+      "captured_from_live_cli": false
+    },
+    {
+      "name": "provider_auth_error.jsonl",
+      "label": "schema-derived",
+      "tokens_total": "not applicable",
+      "description": "Error record with the ProviderAuthError shape: providerID and message. Field names come from the schema; the emitted presence of this error is not established by the upstream tests read. Values synthetic.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts lines 38-41 (ProviderAuthError: providerID, message)",
+        "packages/schema/src/v1/session.ts lines 29-35 (named error shape: name plus data)",
+        "packages/opencode/src/cli/cmd/run.ts lines 788-789, 855, 872 (error record)"
+      ],
+      "wire_events": [
+        "error"
+      ],
+      "wire_features": [
+        "error.name ProviderAuthError",
+        "error.data.providerID",
+        "error.data.message"
+      ],
+      "captured_from_live_cli": false
+    },
+    {
+      "name": "reasoning_thinking_turn.jsonl",
+      "label": "cli-emission-shape",
+      "tokens_total": "absent",
+      "description": "Turn with the thinking flag: step_start, reasoning, text, step_finish. Reasoning is emitted only with time.end set and the thinking flag on. Reasoning token count is synthetic. Values synthetic.",
+      "source_references": [
+        "packages/opencode/src/cli/cmd/run.ts lines 766-767 (reasoning with time.end and --thinking)",
+        "packages/opencode/test/cli/run/run-process.test.ts test '--format json preserves reasoning, tool, and continuation ordering' (sequence at lines 186-194)",
+        "packages/schema/src/v1/session.ts lines 242-252 (step-finish: reason Schema.String, tokens.total optional at line 247)"
+      ],
+      "wire_events": [
+        "step_start",
+        "reasoning",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "part.type reasoning",
+        "reasoning.time",
+        "tokens.reasoning"
+      ],
+      "captured_from_live_cli": false
+    },
+    {
+      "name": "synthetic_malformed_control.jsonl",
+      "label": "synthetic",
+      "tokens_total": "synthetic value 100 retained",
+      "description": "Negative control: one non-JSON line between valid events, to check that the parser keeps malformed input as failure evidence.",
+      "source_references": [
+        "elixir/test/support/opencode_worker_fixture.exs (malformed mock mode)",
+        "elixir/lib/symphony_elixir/opencode/parser.ex (malformed_json_line handling)"
+      ],
+      "wire_events": [
+        "step_start",
+        "malformed_non_json_line",
+        "step_finish"
+      ],
+      "wire_features": [
+        "malformed JSON line evidence"
+      ],
+      "captured_from_live_cli": false
+    },
+    {
+      "name": "synthetic_explicit_total.jsonl",
+      "label": "synthetic",
+      "tokens_total": "explicit synthetic value 8643",
+      "description": "Schema-optional tokens.total present with a value chosen by the author (input 954, output 9, cache read 7680). Not an upstream-observed total. Tests what Symphony does with an explicit total.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts lines 242-252 (step-finish: reason Schema.String, tokens.total optional at line 247)",
+        "packages/llm/src/protocols/shared.ts lines 39-60 (provider-supplied total authoritative; input plus output fallback)"
+      ],
+      "wire_events": [
+        "step_start",
+        "text",
+        "step_finish"
+      ],
+      "wire_features": [
+        "tokens.total explicit (synthetic)",
+        "tokens.cache.read"
+      ],
+      "captured_from_live_cli": false
+    },
+    {
+      "name": "synthetic_explicit_total_zero.jsonl",
+      "label": "synthetic",
+      "tokens_total": "explicit synthetic value 0",
+      "description": "Schema-optional tokens.total with an explicit zero and all token components zero. Checks that an explicit zero parses as a valid terminal turn with zero usage.",
+      "source_references": [
+        "packages/schema/src/v1/session.ts lines 242-252 (step-finish: reason Schema.String, tokens.total optional at line 247)"
+      ],
+      "wire_events": [
+        "step_start",
+        "step_finish"
+      ],
+      "wire_features": [
+        "tokens.total explicit zero (synthetic)"
+      ],
+      "captured_from_live_cli": false
+    }
+  ]
+}

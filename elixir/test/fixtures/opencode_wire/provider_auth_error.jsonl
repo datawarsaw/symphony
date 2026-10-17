@@ -1,0 +1,1 @@
+{"type":"error","timestamp":1728570000500,"sessionID":"ses_01J9W18G01C2D3E4F5G6H7J8K9","error":{"name":"ProviderAuthError","data":{"providerID":"anthropic","message":"Invalid API key provided or credential revoked"}}}

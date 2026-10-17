@@ -74,11 +74,32 @@ SymphonyElixir.RuntimeLease.force_release(state_root,
 Recovery requires explicit confirmation (`confirm: true`) and a non-empty
 `reason`. A lease that still classifies `:active` is refused unless
 `force_active: true` is also passed — decide with the heartbeat evidence, since
-owner liveness cannot be positively proven from another BEAM. Recovery is
-serialized against claim/renew/release by the state-root op lock
+owner liveness cannot be positively proven from another BEAM. That refusal is
+bound to the physical root, not to one spelling of it: a lease claimed as
+`C:\state\symphony` is refused just the same when recovery is invoked with
+`C:/state/symphony`, another drive-letter case, a trailing separator, or a
+junction path, because lease reads compare roots with
+`RuntimeLease.roots_match?/2`. An unreadable or ambiguous record that still
+looks active is refused the same way, whatever root it names: domain separation
+cannot be proven from a spelling, because Windows resolves trailing dots and
+spaces, extended-length prefixes, and mapped drives to the same directory, and a
+relative stored path resolves against the reading BEAM's current directory. Only
+stale, releasable, or liveness-unknown state recovers without the override.
+
+Recovery is serialized against claim/renew/release by the state-root op lock
 (`authority.op-lock`), preserves the prior state to `authority.recovery.json`,
 and re-reads after removal: success is returned only when the lease is verifiably
-gone. A surviving lease (same, replacement, or corrupt) fails closed.
+gone. A surviving lease (same, replacement, or corrupt) fails closed. The
+artifact is durable evidence for humans, so it keeps every field that identifies
+the recovered lease (`state_root`, `instance_id`, `node`, `os_pid`,
+`hostname`, timestamps, `prior_class`) and drops the prior `owner_token`,
+marking it with `"owner_token_redacted": true`. The record is a projection onto
+those contract fields: a field outside the contract is reported by name only, so
+a hand-crafted record cannot smuggle a token copy into the artifact, and a
+verbatim copy of the token value inside the projection is replaced. When the
+prior state is unparseable bytes, the bytes are preserved with the token field
+and token-shaped hex runs cut out, so torn-state evidence survives without the
+token.
 
 Never delete `authority.json` by hand while a runtime may be alive: that makes
 the holder fail closed and stop the runtime (by design), and leaves the restart
@@ -93,6 +114,45 @@ Application stop terminates the supervisor tree first; the holder releases the
 lease only if it still belongs to this exact runtime instance (owner token
 match). A stale shutdown path can never delete a successor's lease, and release
 is idempotent.
+
+## Graceful runtime stop (`RuntimeShutdown`)
+
+The release path above needs a trigger an operator can actually reach. The
+foreground entry points (`mix symphony.pilot_bootstrap`, the `symphony` CLI)
+therefore wait via `SymphonyElixir.RuntimeShutdown.wait_for_shutdown/1`: they
+block on the runtime supervisor as before and additionally poll the durable
+stop request file `<state_root>/.symphony-state/runtime/stop.request`
+(`mix symphony.stop_request` writes an attributable one; the runtime log and
+`RuntimeLease.status/0` show the `instance_id` a request must name).
+
+A request is honored only when it is valid and names the exact runtime
+instance (`instance_id` is minted once per BEAM boot). Requests naming another
+instance — stale residue from an earlier run, a wrong target — are ignored,
+logged once, and never consumed; they can never stop a later runtime, and they
+never release anything. The guarded stop itself
+(`RuntimeShutdown.stop/1`, also callable in-BEAM) is:
+
+1. **Preconditions, fail-closed.** A live holder holds authority; the durable
+   lease file still names this instance (`holds_authority_for?/1`, re-read
+   from disk — a successor's lease refuses the stop); and the worker-drain
+   requirement holds: the Orchestrator snapshot reports no `running` workers.
+   A snapshot that cannot be obtained while the runtime supervisor is still up
+   is a refused stop — an unverifiable drain is not a drained drain.
+2. **Supervised termination.** The application is stopped: the supervision
+   tree terminates through supervision, and only then does the application
+   stop callback release the lease through the owner-token-checked
+   `RuntimeLease.release/2`. A lease that stopped belonging to this instance
+   between the preconditions and the release is refused and left intact.
+3. **Verified outcome.** The durable lease is re-read after the stop; success
+   is reported only when the lease is verifiably gone. A lease that survived
+   (a successor's, or recovery racing the stop) is reported as
+   `{:error, {:lease_not_released, evidence}}`, never smoothed over.
+
+A valid request is consumed before the guarded stop runs, so a refused stop
+(for example a worker still running) never re-triggers; the operator clears
+the blocker and re-requests. Stale and foreign leases are still released only
+by explicit operator recovery (`force_release/2`) — this path adds a clean
+normal stop, it does not replace recovery.
 
 ## Mutation-root pinning
 

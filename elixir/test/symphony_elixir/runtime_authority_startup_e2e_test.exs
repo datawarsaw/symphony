@@ -186,7 +186,123 @@ defmodule SymphonyElixir.RuntimeAuthorityStartupE2ETest do
     assert_receive {:DOWN, ^b_ref, :process, _pid, :normal}, 30_000
   end
 
+  @tag skip: @e2e_skip_reason
+  test "an exact-instance stop request stops the runtime gracefully and releases the lease without recovery" do
+    root = Path.join(System.tmp_dir!(), "mic-runtime-graceful-e2e-#{:erlang.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    boot = write_graceful_boot_script(root)
+
+    # The runtime boots, becomes authoritative, and waits like the foreground
+    # entry points do (supervisor monitor plus stop-request polling).
+    {a_task, a_ref} = start_runtime(boot, root)
+    a_lease = wait_for_lease(root, a_task, @boot_grace_ms)
+    assert a_lease["kind"] == "runtime-authority"
+
+    # A request naming another instance is ignored and preserved: the runtime
+    # keeps running and keeps its lease.
+    write_stop_request(root, "stale-instance-request", String.duplicate("f", 32))
+    Process.sleep(3_000)
+
+    assert nil == Task.yield(a_task, 0), "runtime exited on a foreign-instance stop request"
+
+    assert {:ok, evidence} = RuntimeLease.observe(root)
+    assert evidence["instance_id"] == a_lease["instance_id"]
+    assert raw_stop_request(root) =~ "stale-instance-request"
+
+    # The operator removes the stale residue explicitly (the runtime never
+    # touches it), then requests the stop for the real instance.
+    File.rm!(SymphonyElixir.RuntimeShutdown.stop_request_path(root))
+
+    # An exact-instance request is honored: supervised termination, released
+    # lease, exit 0 — no operator recovery, no stale residue.
+    assert {:ok, _body} =
+             SymphonyElixir.RuntimeShutdown.request(root, "e2e: run complete, drain proven", requested_by: "startup-e2e")
+
+    assert {:ok, {output, 0}} = Task.yield(a_task, 30_000)
+    assert_receive {:DOWN, ^a_ref, :process, _pid, :normal}, 5_000
+    assert output =~ "GRACEFUL_STOP_COMPLETE"
+
+    # The lease is verifiably gone: the next startup needs no runbook §8
+    # recovery.
+    assert {:error, :not_found} = RuntimeLease.observe(root)
+    refute File.exists?(SymphonyElixir.RuntimeShutdown.stop_request_path(root))
+  end
+
   # -- runtime process plumbing --
+
+  # Same boot as write_boot_script/1, but the runtime waits like the
+  # foreground entry points do: supervisor monitor plus exact-instance
+  # stop-request polling, then a clean exit.
+  defp write_graceful_boot_script(root) do
+    boot = Path.join(root, "runtime_graceful_boot.exs") |> Path.expand()
+
+    File.write!(boot, """
+    root = System.fetch_env!("SYMPHONY_E2E_ROOT")
+
+    Application.put_env(:phoenix, :json_library, Jason)
+
+    Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint,
+      adapter: Bandit.PhoenixAdapter,
+      url: [host: "localhost"],
+      render_errors: [formats: [html: SymphonyElixirWeb.ErrorHTML, json: SymphonyElixirWeb.ErrorJSON], layout: false],
+      pubsub_server: SymphonyElixir.PubSub,
+      live_view: [signing_salt: "symphony-live-view"],
+      secret_key_base: String.duplicate("s", 64),
+      check_origin: false,
+      server: false
+    )
+
+    Application.put_env(:symphony_elixir, :workflow_file_path, System.fetch_env!("SYMPHONY_E2E_WORKFLOW"))
+    Application.put_env(:symphony_elixir, :retry_store_root, root)
+    Application.put_env(:symphony_elixir, :server_port_override, 0)
+    Application.put_env(:symphony_elixir, :log_file, Path.join(root, "symphony.log"))
+    Application.put_env(:symphony_elixir, :runtime_lease_heartbeat_ms, 1_000)
+
+    case Application.ensure_all_started(:symphony_elixir) do
+      {:ok, _started} ->
+        IO.puts("GRACEFUL_BOOT_AUTHORITATIVE instance_id=\#{SymphonyElixir.RuntimeLease.instance_id()}")
+
+        case SymphonyElixir.RuntimeShutdown.wait_for_shutdown() do
+          :ok ->
+            IO.puts("GRACEFUL_STOP_COMPLETE")
+            System.halt(0)
+
+          {:error, reason} ->
+            IO.puts("GRACEFUL_STOP_FAILED \#{inspect(reason)}")
+            System.halt(1)
+        end
+
+      {:error, reason} ->
+        IO.puts("START_FAILED \#{inspect(reason)}")
+        System.halt(1)
+    end
+    """)
+
+    boot
+  end
+
+  defp write_stop_request(root, reason, instance_id) do
+    path = SymphonyElixir.RuntimeShutdown.stop_request_path(root)
+    File.mkdir_p!(Path.dirname(path))
+
+    payload = %{
+      "schema_version" => 1,
+      "kind" => "runtime-stop-request",
+      "instance_id" => instance_id,
+      "reason" => reason,
+      "requested_by" => "startup-e2e",
+      "requested_at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+    }
+
+    File.write!(path, Jason.encode!(payload, pretty: true))
+    path
+  end
+
+  defp raw_stop_request(root) do
+    File.read!(SymphonyElixir.RuntimeShutdown.stop_request_path(root))
+  end
 
   defp write_boot_script(root) do
     boot = Path.join(root, "runtime_boot.exs") |> Path.expand()

@@ -84,6 +84,7 @@ defmodule SymphonyElixir.TestSupport.ScratchProcess do
     - `:grace_ms` — jobrun `--grace-ms` override (e.g. 800 for fast hard-kill tests)
     - `:drain_wait_ms` — jobrun `--drain-wait-ms` override
     - `:scratch_args` — argv for scratch_proc (e.g. ~w(--id a --scratch ...))
+    - `:jobrun_args` — extra wrapper argv placed before `--` (test-only fault seams)
 
   Returns `%{port: port, receipt: receipt_path, os_pid: wrapper_pid}`.
   """
@@ -97,6 +98,7 @@ defmodule SymphonyElixir.TestSupport.ScratchProcess do
       [
         opts[:grace_ms] && ["--grace-ms", Integer.to_string(opts[:grace_ms])],
         opts[:drain_wait_ms] && ["--drain-wait-ms", Integer.to_string(opts[:drain_wait_ms])],
+        opts[:jobrun_args] || [],
         ["--receipt", receipt],
         ["--launch-id", id],
         ["--", scratch_exe()],

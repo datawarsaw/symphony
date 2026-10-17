@@ -12,8 +12,14 @@
 //   - child executable must be an absolute path; no PATH search happens here;
 //   - the Job has JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE and no breakaway flags,
 //     so breakaway is denied for every process in the tree;
-//   - the child is created suspended, assigned to the Job before its first
-//     instruction, then resumed, so no descendant can exist outside the Job;
+//   - the child is created suspended directly inside the Job through
+//     PROC_THREAD_ATTRIBUTE_JOB_LIST (STARTUPINFOEXW + EXTENDED_STARTUPINFO_PRESENT),
+//     so there is no assign-after-create window. This needs Windows 10 / Server
+//     2016 or later; on older hosts CreateProcess fails before any child exists
+//     (fail closed). After creation the wrapper verifies membership with
+//     IsProcessInJob and resumes the child only then. A failed or negative check
+//     terminates the suspended child directly, because TerminateJobObject does not
+//     reach processes that are not members of the Job;
 //   - stdin/stdout/stderr handles pass through untouched; this wrapper never
 //     writes to stdout (stderr carries failure diagnostics only), so the
 //     AppServer JSON-RPC stream stays clean;
@@ -58,6 +64,9 @@ static class JobRun
     const int JobObjectExtendedLimitInformation = 9;
     const int JobObjectBasicAccountingInformation = 1;
     const uint CREATE_SUSPENDED = 0x00000004;
+    const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    // ProcThreadAttributeValue(13, FALSE, TRUE, FALSE): the job-list input attribute.
+    const uint PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D;
     const int STARTF_USESTDHANDLES = 0x00000100;
     const uint FILE_TYPE_PIPE = 3;
     const uint JOB_TERMINATED_EXITCODE = 0xF291;
@@ -65,6 +74,9 @@ static class JobRun
     const long HARD_TERMINATE_DRAIN_MS = 10000;
 
     static string receiptPath;
+    // Test-only fault seam. The Elixir launcher never passes --test-fault; only the
+    // dedicated helper tests do, to reach failure windows that are otherwise unreachable.
+    static string testFault = "";
     static string launchId = "";
     // Test seam only. Production launches do not pass this flag. A set value
     // fails closed at the named preflight phase and never starts the child.
@@ -79,14 +91,24 @@ static class JobRun
     static extern bool QueryInformationJobObject(IntPtr hJob, int infoClass,
         out JOBOBJECT_BASIC_ACCOUNTING_INFORMATION lpInfo, int cbLen, out int lpReturnLength);
     [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+    static extern bool IsProcessInJob(IntPtr hProcess, IntPtr hJob, out bool result);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount,
+        int dwFlags, ref IntPtr lpSize);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute,
+        IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern void DeleteProcThreadAttributeList(IntPtr lpAttributeList);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern bool CreateProcessW(string lpApplicationName, string lpCommandLine,
         IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles,
         uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory,
-        ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
+        ref STARTUPINFOEX lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool CloseHandle(IntPtr hObject);
     [DllImport("kernel32.dll")]
@@ -173,6 +195,13 @@ static class JobRun
         public int dwProcessId, dwThreadId;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFOEX
+    {
+        public STARTUPINFO StartupInfo;
+        public IntPtr lpAttributeList;
+    }
+
     static int Main(string[] argsRaw)
     {
         long startedAtMs = (long)GetTickCount64();
@@ -186,6 +215,16 @@ static class JobRun
             if (a == "--grace-ms" && i + 1 < argsRaw.Length) { graceMs = ParseNonNegative(argsRaw[++i], graceMs); continue; }
             if (a == "--drain-wait-ms" && i + 1 < argsRaw.Length) { drainWaitMs = ParseNonNegative(argsRaw[++i], drainWaitMs); continue; }
             if (a == "--receipt" && i + 1 < argsRaw.Length) { receiptPath = argsRaw[++i]; continue; }
+            if (a == "--test-fault" && i + 1 < argsRaw.Length)
+            {
+                testFault = argsRaw[++i];
+                if (testFault != "not-in-job" && testFault != "hold-suspended")
+                {
+                    Console.Error.WriteLine("jobrun: unknown test fault: " + testFault);
+                    return EXIT_WRAPPER_ERROR;
+                }
+                continue;
+            }
             if (a == "--launch-id" && i + 1 < argsRaw.Length) { launchId = argsRaw[++i]; continue; }
             if (a == "--preflight-fault" && i + 1 < argsRaw.Length) { preflightFault = argsRaw[++i]; continue; }
             Console.Error.WriteLine("jobrun: unknown option: " + a);
@@ -238,35 +277,61 @@ static class JobRun
         // The child inherits this wrapper's stdio handles, environment and current
         // directory (lpEnvironment/lpCurrentDirectory are NULL). The Elixir port owns
         // the cd/env policy; nothing is re-derived or searched here.
-        var si = new STARTUPINFO();
-        si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = GetStdHandle(-10);
-        si.hStdOutput = GetStdHandle(-11);
-        si.hStdError = GetStdHandle(-12);
+        // Atomic containment: the child is created directly inside the Job through the
+        // job-list attribute, so it never exists, and never runs, outside the Job.
+        var si = new STARTUPINFOEX();
+        si.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = GetStdHandle(-10);
+        si.StartupInfo.hStdOutput = GetStdHandle(-11);
+        si.StartupInfo.hStdError = GetStdHandle(-12);
         var cmd = new StringBuilder(Quote(childExe));
         foreach (string a in rest) cmd.Append(' ').Append(Quote(a));
 
+        IntPtr attrList;
+        IntPtr jobBuf;
+        if (!BuildJobListAttribute(hJob, out attrList, out jobBuf))
+        {
+            Console.Error.WriteLine("jobrun: job attribute list setup failed err=" + Marshal.GetLastWin32Error());
+            WriteReceipt("WRAPPER_FAILURE", "assign_failed", false, -1, -1, 0, startedAtMs, -1, -1, -1);
+            CloseHandle(hJob);
+            return EXIT_WRAPPER_ERROR;
+        }
+        si.lpAttributeList = attrList;
+
         PROCESS_INFORMATION pi;
         bool ok = CreateProcessW(childExe, cmd.ToString(), IntPtr.Zero, IntPtr.Zero,
-            true, CREATE_SUSPENDED, IntPtr.Zero, null, ref si, out pi);
+            true, CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, null, ref si, out pi);
+        int createErr = ok ? 0 : Marshal.GetLastWin32Error();
+        FreeJobListAttribute(attrList, jobBuf);
         if (!ok)
         {
-            int err = Marshal.GetLastWin32Error();
-            Console.Error.WriteLine("jobrun: CreateProcess failed err=" + err + " exe=" + childExe);
+            // CreateProcess failure means no child exists, so nothing can escape containment.
+            Console.Error.WriteLine("jobrun: CreateProcess failed err=" + createErr + " exe=" + childExe);
             WriteReceipt("WRAPPER_FAILURE", "spawn_failed", false, -1, -1, 0, startedAtMs, -1, -1, -1);
             CloseHandle(hJob);
             return EXIT_WRAPPER_ERROR;
         }
-        if (!AssignProcessToJobObject(hJob, pi.hProcess))
+        // Membership is verified before the child may run. A failed or negative check
+        // terminates the suspended child directly: TerminateJobObject cannot reach a
+        // process that is not a member of the Job.
+        if (testFault == "not-in-job" || !IsContainedInJob(hJob, pi.hProcess))
         {
-            int err = Marshal.GetLastWin32Error();
-            Console.Error.WriteLine("jobrun: AssignProcessToJobObject failed err=" + err);
-            // KILL_ON_JOB_CLOSE never took effect for this child; fail closed.
-            TerminateJobObject(hJob, JOB_TERMINATED_EXITCODE);
-            WriteReceipt("WRAPPER_FAILURE", "assign_failed", false, -1, -1, 0, startedAtMs, -1, -1, -1);
-            CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(hJob);
+            Console.Error.WriteLine("jobrun: child not verified inside the job; terminating it");
+            TerminateProcess(pi.hProcess, JOB_TERMINATED_EXITCODE);
+            WaitForSingleObject(pi.hProcess, 5000);
+            WriteReceipt("WRAPPER_FAILURE", "assign_failed", false, -1, (long)pi.dwProcessId, 0, startedAtMs, -1, -1, -1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            CloseHandle(hJob);
             return EXIT_WRAPPER_ERROR;
+        }
+        if (testFault == "hold-suspended")
+        {
+            // Test-only window: a contained but suspended child exists and the wrapper is
+            // still running. Tests kill the wrapper here and expect the Job to take it down.
+            Console.Error.WriteLine("jobrun: test hold child_pid=" + pi.dwProcessId);
+            System.Threading.Thread.Sleep(60000);
         }
         ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
@@ -352,6 +417,54 @@ static class JobRun
         if (long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed) && parsed >= 0)
             return parsed;
         return fallback;
+    }
+
+    // PROC_THREAD_ATTRIBUTE_LIST carrying the single job handle. The job-list value is a
+    // pointer to an array of HANDLEs that must stay valid until CreateProcessW returns.
+    static bool BuildJobListAttribute(IntPtr hJob, out IntPtr attrList, out IntPtr jobBuf)
+    {
+        attrList = IntPtr.Zero;
+        jobBuf = IntPtr.Zero;
+        IntPtr size = IntPtr.Zero;
+        // Sizing call: fails with ERROR_INSUFFICIENT_BUFFER and reports the required size.
+        InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+        if (size == IntPtr.Zero) return false;
+        IntPtr list = Marshal.AllocHGlobal(size);
+        if (!InitializeProcThreadAttributeList(list, 1, 0, ref size))
+        {
+            Marshal.FreeHGlobal(list);
+            return false;
+        }
+        IntPtr buf = Marshal.AllocHGlobal(IntPtr.Size);
+        Marshal.WriteIntPtr(buf, hJob);
+        if (!UpdateProcThreadAttribute(list, 0, (IntPtr)(long)PROC_THREAD_ATTRIBUTE_JOB_LIST, buf,
+            (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
+        {
+            DeleteProcThreadAttributeList(list);
+            Marshal.FreeHGlobal(list);
+            Marshal.FreeHGlobal(buf);
+            return false;
+        }
+        attrList = list;
+        jobBuf = buf;
+        return true;
+    }
+
+    static void FreeJobListAttribute(IntPtr attrList, IntPtr jobBuf)
+    {
+        if (attrList != IntPtr.Zero)
+        {
+            DeleteProcThreadAttributeList(attrList);
+            Marshal.FreeHGlobal(attrList);
+        }
+        if (jobBuf != IntPtr.Zero) Marshal.FreeHGlobal(jobBuf);
+    }
+
+    static bool IsContainedInJob(IntPtr hJob, IntPtr hProcess)
+    {
+        bool inJob;
+        if (!IsProcessInJob(hProcess, hJob, out inJob)) return false;
+        return inJob;
     }
 
     // Positive tree-drain evidence: ActiveProcesses == 0 via job accounting.
