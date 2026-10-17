@@ -25,6 +25,11 @@
 //   - termination evidence is written to --receipt as one JSON object;
 //     --launch-id is echoed into the receipt so the runtime can bind receipt
 //     files to persisted worker identities;
+//   - when --receipt is set, the wrapper proves that directory before
+//     CreateProcessW: create it if needed, exclusively create a probe, flush
+//     it, and rename it inside that same directory. The probe is not a
+//     termination receipt. Any failure returns 254, starts no child, and
+//     publishes no receipt;
 //   - exit codes are transport only, never lifecycle semantics:
 //       child's exit code   root exited and the tree drained
 //       253                 the Job had to be terminated
@@ -40,6 +45,7 @@
 using System;
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -60,6 +66,9 @@ static class JobRun
 
     static string receiptPath;
     static string launchId = "";
+    // Test seam only. Production launches do not pass this flag. A set value
+    // fails closed at the named preflight phase and never starts the child.
+    static string preflightFault;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern IntPtr CreateJobObjectW(IntPtr lpJobAttributes, string lpName);
@@ -178,6 +187,7 @@ static class JobRun
             if (a == "--drain-wait-ms" && i + 1 < argsRaw.Length) { drainWaitMs = ParseNonNegative(argsRaw[++i], drainWaitMs); continue; }
             if (a == "--receipt" && i + 1 < argsRaw.Length) { receiptPath = argsRaw[++i]; continue; }
             if (a == "--launch-id" && i + 1 < argsRaw.Length) { launchId = argsRaw[++i]; continue; }
+            if (a == "--preflight-fault" && i + 1 < argsRaw.Length) { preflightFault = argsRaw[++i]; continue; }
             Console.Error.WriteLine("jobrun: unknown option: " + a);
             WriteReceipt("WRAPPER_FAILURE", "wrapper_failure", false, -1, -1, 0, startedAtMs, -1, -1, -1);
             return EXIT_WRAPPER_ERROR;
@@ -199,6 +209,11 @@ static class JobRun
             WriteReceipt("WRAPPER_FAILURE", "wrapper_failure", false, -1, -1, 0, startedAtMs, -1, -1, -1);
             return EXIT_WRAPPER_ERROR;
         }
+
+        // Capability check only. It is not a termination receipt, and failure
+        // must return before CreateJobObject / CreateProcessW.
+        if (!ReceiptDirectoryReady())
+            return EXIT_WRAPPER_ERROR;
 
         // Anonymous Job, KILL_ON_JOB_CLOSE only. Breakaway is impossible: neither
         // JOB_OBJECT_LIMIT_BREAKAWAY_OK nor JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK is set.
@@ -379,6 +394,7 @@ static class JobRun
     // One JSON object per launch. Written best-effort: a receipt write failure must
     // never mask the real transport exit code, and a missing/unparseable receipt is
     // treated as TERMINATION_UNCONFIRMED (fail closed) by the runtime.
+    // Not called for preflight failure: that path must not synthesize a receipt.
     static void WriteReceipt(string terminalReason, string terminationMode, bool treeDrained,
         int childExitCode, long rootPid, long rootCreationFT, long startedAtMs, long requestedAtMs,
         long rootExitedAtMs, long drainedAtMs)
@@ -416,6 +432,139 @@ static class JobRun
         {
             Console.Error.WriteLine("jobrun: receipt write failed: " + ex.Message);
         }
+    }
+
+    // Proves the configured receipt directory can accept the same publication
+    // primitive WriteReceipt uses: a same-directory rename of a flushed file.
+    // Probe names and payload are deliberately not a launch receipt. Only the
+    // probe files created by this call are removed. Failure publishes nothing.
+    static bool ReceiptDirectoryReady()
+    {
+        if (receiptPath == null && string.IsNullOrEmpty(preflightFault))
+            return true;
+
+        string phase = "resolve";
+        string tempPath = null;
+        string publishedPath = null;
+        bool moved = false;
+        Exception primary = null;
+
+        try
+        {
+            if (!string.IsNullOrEmpty(preflightFault) && !KnownPreflightFault(preflightFault))
+                throw new InvalidOperationException("unknown preflight fault");
+            if (string.IsNullOrEmpty(receiptPath))
+                throw new IOException("receipt path is not configured");
+
+            string full = Path.GetFullPath(receiptPath);
+            string dir = Path.GetDirectoryName(full);
+            string file = Path.GetFileName(full);
+            if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(file))
+                throw new IOException("receipt path is not a file in a directory");
+
+            phase = "directory_create";
+            Directory.CreateDirectory(dir);
+
+            phase = "file_create";
+            string token = Guid.NewGuid().ToString("N");
+            tempPath = Path.Combine(dir, "jobrun-preflight-" + token + ".tmp");
+            publishedPath = Path.Combine(dir, "jobrun-preflight-" + token + ".probe");
+            ThrowInjected("file_create");
+
+            using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                phase = "write";
+                byte[] payload = Encoding.ASCII.GetBytes("jobrun-preflight-probe");
+                stream.Write(payload, 0, payload.Length);
+                phase = "flush";
+                stream.Flush(true);
+            }
+
+            phase = "rename";
+            ThrowInjected("rename");
+            File.Move(tempPath, publishedPath);
+            moved = true;
+        }
+        catch (Exception ex)
+        {
+            primary = ex;
+        }
+
+        Exception cleanup = null;
+        try
+        {
+            if (primary == null)
+                ThrowInjected("cleanup");
+            if (moved)
+            {
+                if (publishedPath != null && File.Exists(publishedPath))
+                    File.Delete(publishedPath);
+            }
+            else if (tempPath != null && File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+        }
+        catch (Exception ex)
+        {
+            cleanup = ex;
+        }
+
+        if (primary != null)
+        {
+            ReportPreflight("failed", phase, primary);
+            if (cleanup != null)
+                ReportPreflight("cleanup failed", "cleanup", cleanup);
+            return false;
+        }
+
+        if (cleanup != null)
+        {
+            ReportPreflight("failed", "cleanup", cleanup);
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool KnownPreflightFault(string fault)
+    {
+        return fault == "file_create" || fault == "rename" || fault == "cleanup";
+    }
+
+    static void ThrowInjected(string phase)
+    {
+        if (!string.IsNullOrEmpty(preflightFault) && string.Equals(preflightFault, phase, StringComparison.Ordinal))
+            throw new IOException("injected preflight fault phase=" + phase);
+    }
+
+    static void ReportPreflight(string kind, string phase, Exception ex)
+    {
+        Console.Error.WriteLine("jobrun: receipt preflight " + kind + FormatPreflight(phase, ex));
+    }
+
+    static string FormatPreflight(string phase, Exception ex)
+    {
+        int hr = HResultOf(ex);
+        string win32 = "";
+        unchecked
+        {
+            if ((hr & (int)0xFFFF0000) == (int)0x80070000)
+                win32 = " win32=" + (hr & 0xFFFF).ToString(CultureInfo.InvariantCulture);
+        }
+        return " phase=" + phase
+            + " error=" + ex.GetType().Name
+            + " hresult=0x" + hr.ToString("X8", CultureInfo.InvariantCulture)
+            + win32
+            + " message=" + ex.Message;
+    }
+
+    static int HResultOf(Exception ex)
+    {
+        PropertyInfo property = typeof(Exception).GetProperty("HResult",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        object value = property.GetValue(ex, null);
+        return value is int ? (int)value : 0;
     }
 
     static string IsoUtc(long tickMs)

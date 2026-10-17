@@ -474,23 +474,7 @@ defmodule SymphonyElixir.WorkerContainment do
   defp confirm_from_receipt(identity) do
     case parse_receipt(identity["receipt_path"]) do
       {:ok, receipt} ->
-        case classify_receipt(receipt) do
-          :TERMINATED_CONFIRMED ->
-            %{
-              status: :TERMINATED_CONFIRMED,
-              receipt: receipt,
-              exit_code: receipt["child_exit_code"],
-              reason: receipt["terminal_reason"]
-            }
-
-          :TERMINATION_UNCONFIRMED ->
-            %{
-              status: :TERMINATION_UNCONFIRMED,
-              receipt: receipt,
-              exit_code: receipt["child_exit_code"],
-              reason: :receipt_not_proven
-            }
-        end
+        confirm_bound_receipt(identity, receipt)
 
       {:error, reason} ->
         %{status: :TERMINATION_UNCONFIRMED, receipt: nil, exit_code: nil, reason: reason}
@@ -555,10 +539,47 @@ defmodule SymphonyElixir.WorkerContainment do
   def classify_receipt(_other), do: :TERMINATION_UNCONFIRMED
 
   @doc """
+  Identity-bound confirmation of an already parsed receipt.
+
+  `classify_receipt/1` only classifies receipt evidence. Every production
+  confirmation must also prove a nonempty embedded `launch_id` that is exactly
+  the expected launch identity. A mismatch, an empty id, or a missing identity
+  is `TERMINATION_UNCONFIRMED` and must not authorize cleanup or reuse.
+  """
+  @spec confirm_bound_receipt(map() | nil, map()) :: confirmation()
+  def confirm_bound_receipt(identity, receipt) when is_map(receipt) do
+    if launch_identity_confirmed?(identity, receipt) do
+      %{
+        status: :TERMINATED_CONFIRMED,
+        receipt: receipt,
+        exit_code: receipt["child_exit_code"],
+        reason: receipt["terminal_reason"]
+      }
+    else
+      %{
+        status: :TERMINATION_UNCONFIRMED,
+        receipt: receipt,
+        exit_code: receipt["child_exit_code"],
+        reason: :receipt_not_proven
+      }
+    end
+  end
+
+  # Same identity contract the WorkerFence uses: nonempty expected launch id,
+  # exact embedded equality, and a receipt classification of confirmed death.
+  defp launch_identity_confirmed?(%{"launch_id" => launch_id}, %{"launch_id" => receipt_launch_id} = receipt)
+       when is_binary(launch_id) and launch_id != "" and is_binary(receipt_launch_id) and
+              receipt_launch_id != "" do
+    receipt_launch_id == launch_id and classify_receipt(receipt) == :TERMINATED_CONFIRMED
+  end
+
+  defp launch_identity_confirmed?(_identity, _receipt), do: false
+
+  @doc """
   Receipt-backed verification of a persisted worker identity, used by the
   WorkerFence during restart reconciliation. The receipt file must live inside
   the managed receipt directory, parse as a valid receipt, prove the drain, and
-  carry the identity's launch id. Anything else is UNKNOWN (fail closed).
+  carry the identity's nonempty launch id. Anything else is UNKNOWN (fail closed).
   """
   @spec verify_identity_receipt(term()) :: SymphonyElixir.WorkerFence.verdict()
   def verify_identity_receipt(%{"receipt_path" => path, "launch_id" => launch_id} = identity)
@@ -566,7 +587,7 @@ defmodule SymphonyElixir.WorkerContainment do
     if receipt_under_managed_dir?(identity) do
       case parse_receipt(path) do
         {:ok, receipt} ->
-          if receipt["launch_id"] == launch_id and classify_receipt(receipt) == :TERMINATED_CONFIRMED do
+          if launch_identity_confirmed?(identity, receipt) do
             {:ok, :dead}
           else
             {:error, :unknown}

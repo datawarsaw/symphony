@@ -3790,25 +3790,26 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  # Reuses WorkerContainment's own receipt parser and classifier — the same
-  # evidence path the natural shutdown confirmation uses; no second
-  # termination classifier exists.
+  # Reuses WorkerContainment's identity-bound confirmation — the same contract
+  # natural shutdown uses. A readable receipt that is not bound to this launch
+  # is TERMINATION_UNCONFIRMED; an unreadable receipt keeps the poll open.
   defp managed_receipt_confirmation(nil),
     do: %{status: :TERMINATION_UNCONFIRMED, receipt: nil, exit_code: nil, reason: :no_worker_identity}
 
   defp managed_receipt_confirmation(identity) do
     case WorkerContainment.parse_receipt(Map.get(identity, "receipt_path")) do
       {:ok, receipt} ->
-        %{
-          status: WorkerContainment.classify_receipt(receipt),
-          receipt: receipt,
-          exit_code: receipt["child_exit_code"],
-          reason: receipt["terminal_reason"]
-        }
+        WorkerContainment.confirm_bound_receipt(identity, receipt)
 
       {:error, _reason} ->
         nil
     end
+  end
+
+  @doc false
+  @spec managed_receipt_confirmation_for_test(term()) :: map() | nil
+  def managed_receipt_confirmation_for_test(identity) do
+    managed_receipt_confirmation(identity)
   end
 
   defp control_evidence_deadline do
