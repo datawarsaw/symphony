@@ -26,7 +26,8 @@ defmodule SymphonyElixir.LaunchMarker do
   - Written by `AppServer.start_session` BEFORE `Port.open` — no worker may
     become active unless its fenceable identity is already recoverable after
     a BEAM restart.
-  - Replaced by every subsequent launch of the same issue.
+  - Replaced by a subsequent launch only after the predecessor's termination
+    is authoritative; unreadable or unresolved generations cannot be overwritten.
   - Cleared only after termination evidence is durable and accepted by the
     same fence logic (`TERMINATED_CONFIRMED` receipts), so the marker can
     never vanish while a worker may still be alive.
@@ -61,6 +62,31 @@ defmodule SymphonyElixir.LaunchMarker do
   # Mirrors WorkerContainment.reuse_gate/2's verdict shape: the single
   # allowed/blocked idiom across reuse and cleanup decisions.
   @type gate_verdict :: :allowed | {:blocked, atom()}
+
+  @doc "Serializes issue preparation, launch identity mutation and destructive cleanup in this runtime."
+  @spec with_issue_lock(term(), keyword(), (-> result)) :: result when result: var
+  def with_issue_lock(issue_id, opts, action) when is_function(action, 0) do
+    resource = {__MODULE__, Path.expand(root(opts)), RetryStore.safe_issue_id(to_string(issue_id))}
+    key = {__MODULE__, :held, resource}
+
+    if Process.get(key) do
+      action.()
+    else
+      :global.trans(
+        {resource, self()},
+        fn ->
+          Process.put(key, true)
+
+          try do
+            action.()
+          after
+            Process.delete(key)
+          end
+        end,
+        [node()]
+      )
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Storage
@@ -111,7 +137,16 @@ defmodule SymphonyElixir.LaunchMarker do
   """
   @spec record(map(), keyword()) :: :ok | {:error, term()}
   def record(identity, opts \\ []) do
-    do_record(identity, opts)
+    with_issue_lock(identity["issue_id"], opts, fn ->
+      case reuse_gate(identity["issue_id"], opts) do
+        :allowed ->
+          do_record(identity, opts)
+
+        {:blocked, reason} ->
+          Logger.error("Launch marker reuse refused issue_id=#{identity["issue_id"]} reason=#{reason}")
+          {:error, {:previous_launch_unresolved, reason}}
+      end
+    end)
   end
 
   defp do_record(
@@ -155,7 +190,8 @@ defmodule SymphonyElixir.LaunchMarker do
   """
   @spec record_wrapper_identity(map() | nil, keyword()) :: :ok
   def record_wrapper_identity(identity, opts \\ []) do
-    do_record_wrapper_identity(identity, opts)
+    issue_id = if is_map(identity), do: identity["issue_id"]
+    with_issue_lock(issue_id, opts, fn -> do_record_wrapper_identity(identity, opts) end)
   end
 
   defp do_record_wrapper_identity(
@@ -190,9 +226,22 @@ defmodule SymphonyElixir.LaunchMarker do
     case File.read(marker_path(issue_id, opts)) do
       {:ok, raw} ->
         case Jason.decode(raw) do
-          {:ok, %{"schema_version" => @schema_version} = marker} -> {:ok, marker}
-          {:ok, _other} -> {:error, :corrupt}
-          {:error, _} -> {:error, :corrupt}
+          {:ok,
+           %{
+             "schema_version" => @schema_version,
+             "issue_id" => ^issue_id,
+             "launch_id" => launch_id,
+             "workspace" => workspace,
+             "worker_identity" => %{"issue_id" => ^issue_id, "launch_id" => identity_launch, "workspace" => identity_workspace}
+           } = marker}
+          when is_binary(launch_id) and launch_id != "" and launch_id == identity_launch and workspace == identity_workspace ->
+            {:ok, marker}
+
+          {:ok, _other} ->
+            {:error, :corrupt}
+
+          {:error, _} ->
+            {:error, :corrupt}
         end
 
       {:error, :enoent} ->
@@ -228,7 +277,8 @@ defmodule SymphonyElixir.LaunchMarker do
   """
   @spec clear(term(), keyword()) :: :ok
   def clear(target, opts \\ []) do
-    do_clear(target, opts)
+    issue_id = if is_map(target), do: target["issue_id"], else: target
+    with_issue_lock(issue_id, opts, fn -> do_clear(target, opts) end)
   end
 
   defp do_clear(issue_id, opts) when is_binary(issue_id) and issue_id != "" do
@@ -236,7 +286,13 @@ defmodule SymphonyElixir.LaunchMarker do
     :ok
   end
 
-  defp do_clear(%{"issue_id" => issue_id}, opts), do: do_clear(issue_id, opts)
+  defp do_clear(%{"issue_id" => issue_id, "launch_id" => launch_id}, opts) do
+    case read(issue_id, opts) do
+      {:ok, %{"launch_id" => ^launch_id}} -> do_clear(issue_id, opts)
+      _ -> :ok
+    end
+  end
+
   defp do_clear(_other, _opts), do: :ok
 
   # ---------------------------------------------------------------------------

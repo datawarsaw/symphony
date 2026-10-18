@@ -120,12 +120,97 @@ Configuration's new root takes effect exactly at the next runtime start: a
 fresh runtime resolves it, leases it, and mutates it — while the previous
 runtime (if still alive) keeps mutating only the root it still owns. Two
 runtimes therefore can never mutate one root concurrently: same root is
-rejected at startup, different roots are isolated domains.
+rejected at startup. Different roots isolate filesystem mutation only; they
+do not isolate a shared tracker queue. See the queue ownership gate below.
 
 Fail-closed: `authority_root/0` returns `{:error, :no_runtime_authority}`
 before the lease is claimed, after a normal release, and after authority loss —
 the pinned root can never outlive the authority that justifies it, and retry
-paths without a resolvable record root skip their mutation instead of guessing.
+paths without a resolvable record root stop dispatch instead of guessing.
+
+### Queue ownership gate
+
+The supported current rollout is one Windows workstation, one active Symphony
+runtime, and one tracker queue (tracker service/account/team/project together
+with its active-state and routing selection). There must be exactly one runtime
+owner for every issue that selection can admit. Overlapping selections count as
+the same queue for this rule, even if their project filters differ.
+
+`RuntimeLease` enforces exclusivity for a canonical local filesystem root only.
+Two roots can both claim valid leases while targeting the same Linear queue.
+It is not a global queue lease. A process scan, a second file in an arbitrary
+local directory, or matching configuration text cannot establish exclusivity
+across other hosts, users, roots, and independently configured installations.
+No shared queue-claim authority is available in this implementation; adding a
+local check would not reliably enforce the required invariant.
+
+Before any instrumented launch, the operator must identify the queue selection
+and its single runtime owner, inventory all managed installations/launchers for
+that queue, and establish that every competing runtime is stopped and disabled
+for the launch interval. A root change requires stopping the previous owner
+before starting its successor. This is an operational gate, not an automated
+exclusivity claim. **STOP** if the inventory or ownership is incomplete, another
+owner is active, or a host cannot be accounted for. **GO for consideration of a
+separately authorized launch** only with a recorded single-owner inventory and
+the other safety/acceptance gates satisfied. This source candidate grants no
+launch or Human Acceptance authority. Multi-host or unattended multi-root use
+of an overlapping queue is unsupported pending shared queue authority.
+
+### Issue generation and durable retry state
+
+Within the owning runtime, dispatch, AgentRunner preparation/session lifetime,
+marker writes/refreshes/clears and destructive cleanup use the same reentrant
+per-store/per-issue lock. The filesystem lease supplies the single-runtime
+assumption. A cleanup watcher captures its original marker and identity; it
+waits for that identity's receipt and compares the generation again inside the
+critical section that includes deletion. It never follows the current marker
+to a successor. Dispatch consumes a proven predecessor marker under that lock
+before classifying or preparing a successor; missing or changed generations
+reject a late cleanup. Cleanup never deletes retry records. Failed deletion
+retains the marker. Corrupt marker bindings block cleanup and reuse.
+
+Every dispatch durably records a parked `dispatch_inflight` intent before a
+worker can start. Each retry timer records a parked `retry_poll_inflight` intent
+before tracker revalidation. Only that in-memory poll operation can advance its
+own intent; restart leaves it parked. Successful scheduling replaces the intent
+with a durable retry record. This preserves a blocking record if a later
+parking write fails. Unreadable/corrupt records or failed enumeration latch a
+dispatch STOP for the runtime without replacing questionable evidence. A
+persistence error is logged explicitly and retained on the parked entry; it
+is not successful persistence. Restoring storage alone does not release a
+durable park. Inflight parks may use explicit fence recovery only with positive
+termination evidence; an interrupted dispatch resolves its launch identity from
+the validated issue marker. Missing identity/proof requires investigation.
+
+Watchdog stalls, worker failures, task-spawn failures and retry-poll failures
+use `RetryPolicy`. Original failure time, counters, route, host and workspace
+metadata survive scheduling/recovery. Recovery checks age and attempt limits
+before creating a retry timer. A successful continuation has zero failure
+attempts; its scheduling record does not start a failure budget. A watchdog
+backoff timer grants no launch authority: the durable launch fence must still
+confirm termination before dispatch can prepare or start a replacement.
+
+### Windows partial startup limitation
+
+After `CreateProcessW(CREATE_SUSPENDED)`, assignment failure explicitly terminates
+the unassigned child using its retained process handle and waits for Windows to
+signal termination before releasing the child/thread/job handles. Failed
+`ResumeThread` uses the same direct termination path. These failures publish only
+`WRAPPER_FAILURE` with `tree_drained:false`; failure of termination/wait retains
+the handles and cannot publish successful containment. The test-only assignment
+and resume fault option is absent from a production build.
+
+Abrupt wrapper death between suspended creation and Job Object assignment is
+still a residual window. The child cannot execute its user code while suspended,
+but may remain as an unassigned suspended process. The already-persisted launch
+marker has no valid drained receipt and blocks replacement/reuse/cleanup. Atomic
+assignment via a `STARTUPINFOEX` job-list attribute would require a separate
+process-creation interop/capability change and crash-window validation; it is not
+claimed by this two-step implementation. The bounded operational mitigation is
+to keep the affected issue stopped, identify the exact suspended child using
+launch/OS evidence, and require independent termination proof before recovery.
+Do not infer termination from wrapper death or remove its marker to unblock it.
+Wrapper-crash injection in this window is UNVERIFIED in this candidate.
 
 ### Detached cleanup watcher guard
 

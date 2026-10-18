@@ -777,7 +777,10 @@ defmodule SymphonyElixir.FallbackRoutingTest do
 
   describe "restart recovery" do
     defp write_raw_record!(root, record) do
-      :ok = RetryStore.write_record(root, record)
+      # Historical/corrupt-state fixture: deliberately bypass the production
+      # writer, which now rejects malformed records before persistence.
+      File.mkdir_p!(RetryStore.retries_dir(root))
+      File.write!(RetryStore.record_path(root, record["issue_id"]), Jason.encode!(record))
       record
     end
 
@@ -855,14 +858,15 @@ defmodule SymphonyElixir.FallbackRoutingTest do
       end
     end
 
-    test "an invalid route value fails closed with claim and no timer", %{root: root} do
+    test "an invalid route value stops all dispatch with no timer and preserves the record", %{root: root} do
       record = base_record(root, "ISS-FB-REC-SIDEWAYS", []) |> Map.put("route", "sideways")
       write_raw_record!(root, record)
 
       recovered = Orchestrator.recover_retry_records_for_test(fresh_state())
 
       try do
-        assert MapSet.member?(recovered.claimed, "ISS-FB-REC-SIDEWAYS")
+        assert recovered.retry_state_error
+        assert File.read!(RetryStore.record_path(root, "ISS-FB-REC-SIDEWAYS")) == Jason.encode!(record)
         assert recovered.retry_attempts == %{}
         assert Orchestrator.parked_for_test(recovered) == %{}
         refute Map.has_key?(Orchestrator.retry_history_for_test(recovered), "ISS-FB-REC-SIDEWAYS")
@@ -871,14 +875,15 @@ defmodule SymphonyElixir.FallbackRoutingTest do
       end
     end
 
-    test "an invalid primary_failure_count fails closed with claim and no timer", %{root: root} do
+    test "an invalid primary_failure_count stops all dispatch with no timer and preserves the record", %{root: root} do
       record = base_record(root, "ISS-FB-REC-BADCOUNT", []) |> Map.put("primary_failure_count", "two")
       write_raw_record!(root, record)
 
       recovered = Orchestrator.recover_retry_records_for_test(fresh_state())
 
       try do
-        assert MapSet.member?(recovered.claimed, "ISS-FB-REC-BADCOUNT")
+        assert recovered.retry_state_error
+        assert File.read!(RetryStore.record_path(root, "ISS-FB-REC-BADCOUNT")) == Jason.encode!(record)
         assert recovered.retry_attempts == %{}
       after
         cancel_timers(recovered)

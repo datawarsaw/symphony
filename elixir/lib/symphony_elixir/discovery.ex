@@ -63,10 +63,8 @@ defmodule SymphonyElixir.Discovery do
          true <- is_nil(Keyword.get(opts, :worker_host)),
          {:ok, input} <- snapshot(issue),
          {:ok, workspace} <- workspace(input, mutation_root(opts)),
-         {:ok, evidence} <- cached_or_execute(issue, workspace, input, recipient, opts),
-         :ok <- publish_retained(issue, input, opts) do
-      if is_pid(recipient), do: send(recipient, {:discovery_completed, issue.id, evidence.status})
-      :ok
+         {:ok, evidence} <- cached_or_execute(issue, workspace, input, recipient, opts) do
+      finish_run(issue, input, evidence, recipient, opts)
     else
       false -> {:error, :discovery_lane_unavailable}
       error -> error
@@ -76,19 +74,30 @@ defmodule SymphonyElixir.Discovery do
   @spec execute(String.t(), (map(), String.t() -> term()), keyword()) :: map()
   def execute(input, run, opts \\ []) when is_binary(input) and is_function(run, 2) do
     sleep = Keyword.get(opts, :sleep, &Process.sleep/1)
-    result = run.(Session.primary(), input)
+    primary_result = run.(Session.primary(), input)
 
-    result =
-      if technical(result) == :rate_limit do
+    cond do
+      termination_unconfirmed?(primary_result) ->
+        evidence(primary_result, Session.primary(), :primary, nil)
+
+      technical(primary_result) == :rate_limit ->
         sleep.(1_000)
-        run.(Session.primary(), input)
-      else
-        result
-      end
+        retry_result = run.(Session.primary(), input)
+        execute_after_primary(input, run, retry_result)
 
+      true ->
+        execute_after_primary(input, run, primary_result)
+    end
+  end
+
+  defp execute_after_primary(input, run, result) do
     case technical(result) do
-      nil -> evidence(result, Session.primary(), :primary, nil)
-      reason -> evidence(run.(Session.fallback(), input), Session.fallback(), :fallback, reason)
+      nil ->
+        evidence(result, Session.primary(), :primary, nil)
+
+      reason ->
+        fallback_result = run.(Session.fallback(), input)
+        evidence(fallback_result, Session.fallback(), :fallback, reason)
     end
   end
 
@@ -153,6 +162,22 @@ defmodule SymphonyElixir.Discovery do
     evidence = evidence |> bind_issue(issue) |> Map.put(:duration_ms, System.monotonic_time(:millisecond) - started)
     evidence = Map.put(evidence, :completed_at, DateTime.to_iso8601(DateTime.utc_now()))
     persist(issue.id, input, evidence, mutation_root(opts))
+  end
+
+  # A retained technical failure is forensic evidence, never a completed
+  # Discovery result. Returning it as an error makes AgentRunner raise through
+  # its normal failure envelope, so the scheduler can retry or park it. In
+  # particular, no READY publication or `:discovery_completed` message can
+  # make an exhausted provider attempt look lifecycle-complete.
+  defp finish_run(_issue, _input, %{status: "TECHNICAL_FAILURE"} = evidence, _recipient, _opts) do
+    {:error, {:discovery_technical_failure, Map.get(evidence, :failure)}}
+  end
+
+  defp finish_run(issue, input, evidence, recipient, opts) do
+    with :ok <- publish_retained(issue, input, opts) do
+      if is_pid(recipient), do: send(recipient, {:discovery_completed, issue.id, evidence.status})
+      :ok
+    end
   end
 
   defp publish_retained(issue, input, opts) do
@@ -281,6 +306,7 @@ defmodule SymphonyElixir.Discovery do
       captured = Process.get(key)
 
       case {result, captured.failure} do
+        {{:error, {:worker_termination_unconfirmed, _}} = error, _} -> error
         {_, failure} when not is_nil(failure) -> {:error, failure}
         {{:ok, _}, nil} -> {:ok, captured.output |> Enum.reverse() |> Enum.join("\n")}
         {error, nil} -> error
@@ -315,6 +341,14 @@ defmodule SymphonyElixir.Discovery do
   defp technical({:error, error}), do: Session.technical_failure(error)
   defp technical(_), do: nil
 
+  # `AppServer.run/4` returns this only after its `after` block has stopped the
+  # port and published the same confirmation to the lifecycle owner. It is not
+  # a provider failure eligible for a local retry or fallback: the launch
+  # marker must remain the authority until a receipt proves this exact tree
+  # drained.
+  defp termination_unconfirmed?({:error, {:worker_termination_unconfirmed, %{status: :TERMINATION_UNCONFIRMED}}}), do: true
+  defp termination_unconfirmed?(_), do: false
+
   defp evidence(result, route, lane, reason) do
     base = Map.merge(route, %{lane: lane, fallback_reason: reason})
 
@@ -324,6 +358,9 @@ defmodule SymphonyElixir.Discovery do
           {:ok, parsed} -> Map.merge(base, %{status: parsed.verdict, output: text})
           _ -> Map.merge(base, %{status: "INVALID", output: text})
         end
+
+      {:error, {:worker_termination_unconfirmed, _confirmation}} ->
+        Map.merge(base, %{status: "TECHNICAL_FAILURE", failure: :worker_termination_unconfirmed, output: nil})
 
       {:error, error} ->
         Map.merge(base, %{status: "TECHNICAL_FAILURE", failure: Session.technical_failure(error), output: nil})
@@ -370,7 +407,7 @@ defmodule SymphonyElixir.Discovery do
          {:ok, %{"input_sha256" => hash, "status" => status, "output" => output} = fields} <- Jason.decode(body),
          true <- hash == digest(input),
          {:ok, stat} <- File.stat(path, time: :posix) do
-      metadata = Map.new([:provider, :model, :reasoning, :lane, :fallback_reason, :duration_ms, :completed_at], &{&1, fields[Atom.to_string(&1)]})
+      metadata = Map.new([:provider, :model, :reasoning, :lane, :fallback_reason, :failure, :duration_ms, :completed_at], &{&1, fields[Atom.to_string(&1)]})
       completed_at = metadata.completed_at || DateTime.to_iso8601(DateTime.from_unix!(stat.mtime))
       {:ok, Map.merge(metadata, %{status: status, output: output, completed_at: completed_at})}
     else

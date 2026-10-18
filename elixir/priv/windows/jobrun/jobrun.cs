@@ -14,6 +14,9 @@
 //     so breakaway is denied for every process in the tree;
 //   - the child is created suspended, assigned to the Job before its first
 //     instruction, then resumed, so no descendant can exist outside the Job;
+//     wrapper death in the narrow CreateProcessW-to-assignment interval remains
+//     a bounded Windows API limitation; removing it requires an explicit
+//     PROC_THREAD_ATTRIBUTE_JOB_LIST design, not a best-effort fallback;
 //   - stdin/stdout/stderr handles pass through untouched; this wrapper never
 //     writes to stdout (stderr carries failure diagnostics only), so the
 //     AppServer JSON-RPC stream stays clean;
@@ -62,6 +65,7 @@ static class JobRun
     const uint FILE_TYPE_PIPE = 3;
     const uint JOB_TERMINATED_EXITCODE = 0xF291;
     const uint WAIT_OBJECT_0 = 0;
+    const uint INFINITE = 0xFFFFFFFF;
     const long HARD_TERMINATE_DRAIN_MS = 10000;
 
     static string receiptPath;
@@ -69,6 +73,11 @@ static class JobRun
     // Test seam only. Production launches do not pass this flag. A set value
     // fails closed at the named preflight phase and never starts the child.
     static string preflightFault;
+#if JOBRUN_TEST
+    // Compiled only into the private Windows test helper. Production jobrun
+    // has neither this option nor a partial-start fault branch.
+    static string partialStartFault;
+#endif
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern IntPtr CreateJobObjectW(IntPtr lpJobAttributes, string lpName);
@@ -89,8 +98,10 @@ static class JobRun
         ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool CloseHandle(IntPtr hObject);
-    [DllImport("kernel32.dll")]
+    [DllImport("kernel32.dll", SetLastError = true)]
     static extern uint ResumeThread(IntPtr hThread);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -188,6 +199,9 @@ static class JobRun
             if (a == "--receipt" && i + 1 < argsRaw.Length) { receiptPath = argsRaw[++i]; continue; }
             if (a == "--launch-id" && i + 1 < argsRaw.Length) { launchId = argsRaw[++i]; continue; }
             if (a == "--preflight-fault" && i + 1 < argsRaw.Length) { preflightFault = argsRaw[++i]; continue; }
+#if JOBRUN_TEST
+            if (a == "--test-partial-start-fault" && i + 1 < argsRaw.Length) { partialStartFault = argsRaw[++i]; continue; }
+#endif
             Console.Error.WriteLine("jobrun: unknown option: " + a);
             WriteReceipt("WRAPPER_FAILURE", "wrapper_failure", false, -1, -1, 0, startedAtMs, -1, -1, -1);
             return EXIT_WRAPPER_ERROR;
@@ -258,17 +272,30 @@ static class JobRun
             CloseHandle(hJob);
             return EXIT_WRAPPER_ERROR;
         }
-        if (!AssignProcessToJobObject(hJob, pi.hProcess))
+        bool injectAssignFailure = TestPartialStartFault("assign");
+        if (injectAssignFailure || !AssignProcessToJobObject(hJob, pi.hProcess))
         {
-            int err = Marshal.GetLastWin32Error();
+            int err = injectAssignFailure ? 0 : Marshal.GetLastWin32Error();
             Console.Error.WriteLine("jobrun: AssignProcessToJobObject failed err=" + err);
-            // KILL_ON_JOB_CLOSE never took effect for this child; fail closed.
-            TerminateJobObject(hJob, JOB_TERMINATED_EXITCODE);
-            WriteReceipt("WRAPPER_FAILURE", "assign_failed", false, -1, -1, 0, startedAtMs, -1, -1, -1);
+            // KILL_ON_JOB_CLOSE never took effect for this suspended child.
+            // Keep both child handles until direct termination is observed.
+            TerminateChildAndWait(pi.hProcess, "assign_failed");
+            WriteReceipt("WRAPPER_FAILURE", "assign_failed", false, -1, pi.dwProcessId, 0, startedAtMs, -1, -1, -1);
             CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(hJob);
             return EXIT_WRAPPER_ERROR;
         }
-        ResumeThread(pi.hThread);
+        bool injectResumeFailure = TestPartialStartFault("resume");
+        if (injectResumeFailure || ResumeThread(pi.hThread) == 0xFFFFFFFF)
+        {
+            int err = injectResumeFailure ? 0 : Marshal.GetLastWin32Error();
+            Console.Error.WriteLine("jobrun: ResumeThread failed err=" + err);
+            // Assignment succeeded, but the child has not run. Directly end
+            // the known root and retain its handles until Windows signals it.
+            TerminateChildAndWait(pi.hProcess, "resume_failed");
+            WriteReceipt("WRAPPER_FAILURE", "resume_failed", false, -1, pi.dwProcessId, 0, startedAtMs, -1, -1, -1);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread); CloseHandle(hJob);
+            return EXIT_WRAPPER_ERROR;
+        }
         CloseHandle(pi.hThread);
         IntPtr hChild = pi.hProcess;
 
@@ -389,6 +416,34 @@ static class JobRun
     {
         if (hChild != IntPtr.Zero) CloseHandle(hChild);
         CloseHandle(hJob);
+    }
+
+    // A child created suspended is not necessarily in the Job yet. A bounded
+    // timeout would allow this failure path to release its only process handle
+    // without proof of death, so wait indefinitely after the direct request.
+    // This can only block a failed wrapper launch; it cannot publish success.
+    static void TerminateChildAndWait(IntPtr hChild, string phase)
+    {
+        if (!TerminateProcess(hChild, JOB_TERMINATED_EXITCODE))
+            Console.Error.WriteLine("jobrun: TerminateProcess " + phase + " failed err=" + Marshal.GetLastWin32Error());
+
+        while (true)
+        {
+            uint wait = WaitForSingleObject(hChild, INFINITE);
+            if (wait == WAIT_OBJECT_0)
+                return;
+            Console.Error.WriteLine("jobrun: child termination wait " + phase + " failed result=" + wait);
+            System.Threading.Thread.Sleep(20);
+        }
+    }
+
+    static bool TestPartialStartFault(string phase)
+    {
+#if JOBRUN_TEST
+        return string.Equals(partialStartFault, phase, StringComparison.Ordinal);
+#else
+        return false;
+#endif
     }
 
     // One JSON object per launch. Written best-effort: a receipt write failure must

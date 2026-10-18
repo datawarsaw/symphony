@@ -132,6 +132,79 @@ defmodule SymphonyElixir.DiscoveryTest do
     assert result.lane == :primary
   end
 
+  test "unconfirmed primary termination blocks the bounded retry and fallback" do
+    parent = self()
+    confirmation = %{status: :TERMINATION_UNCONFIRMED, receipt: nil, reason: :missing_receipt}
+
+    result =
+      Discovery.execute("frozen", fn route, _ ->
+        send(parent, {:provider_started, route})
+        {:error, {:worker_termination_unconfirmed, confirmation}}
+      end)
+
+    assert result.status == "TECHNICAL_FAILURE"
+    assert result.failure == :worker_termination_unconfirmed
+    assert result.lane == :primary
+    assert_receive {:provider_started, route}
+    assert route == Session.primary()
+    refute_receive {:provider_started, _}
+  end
+
+  test "unconfirmed fallback termination finishes with no further provider launch" do
+    parent = self()
+
+    evidence =
+      Discovery.execute("frozen", fn route, _ ->
+        send(parent, {:fallback_probe, route})
+
+        if route == Session.primary(),
+          do: {:error, :turn_timeout},
+          else: {:error, {:worker_termination_unconfirmed, %{status: :TERMINATION_UNCONFIRMED}}}
+      end)
+
+    assert evidence.status == "TECHNICAL_FAILURE"
+    assert evidence.failure == :worker_termination_unconfirmed
+    assert evidence.lane == :fallback
+    assert_receive {:fallback_probe, primary}
+    assert primary == Session.primary()
+    assert_receive {:fallback_probe, fallback}
+    assert fallback == Session.fallback()
+    refute_receive {:fallback_probe, _}
+  end
+
+  test "unconfirmed termination after a rate-limit retry blocks fallback" do
+    parent = self()
+    confirmation = %{status: :TERMINATION_UNCONFIRMED, receipt: nil, reason: :receipt_mismatch}
+    key = make_ref()
+    Process.put(key, 0)
+
+    result =
+      Discovery.execute(
+        "frozen",
+        fn route, _ ->
+          send(parent, {:provider_started, route})
+          count = Process.get(key)
+          Process.put(key, count + 1)
+
+          if count == 0,
+            do: {:error, %{"httpStatusCode" => 429}},
+            else: {:error, {:worker_termination_unconfirmed, confirmation}}
+        end,
+        sleep: fn 1_000 -> :ok end
+      )
+
+    assert result.status == "TECHNICAL_FAILURE"
+    assert result.failure == :worker_termination_unconfirmed
+
+    assert Enum.map(receive_provider_starts(2), & &1.model) == [
+             Session.primary().model,
+             Session.primary().model
+           ]
+
+    refute_receive {:provider_started, _}
+    Process.delete(key)
+  end
+
   test "only structured technical failures qualify" do
     for error <- [%{"httpStatusCode" => 401}, %{"code" => "model_not_found"}, %{"code" => "insufficient_quota"}, %{"httpStatusCode" => 503}, :turn_timeout, {:port_exit, 1}] do
       assert Session.technical_failure(error)
@@ -148,6 +221,15 @@ defmodule SymphonyElixir.DiscoveryTest do
       end)
 
     assert result.lane == :primary
+  end
+
+  defp receive_provider_starts(0), do: []
+
+  defp receive_provider_starts(count) do
+    for _ <- 1..count do
+      assert_receive {:provider_started, route}
+      route
+    end
   end
 
   test "bounded leading narration before the brief heading is accepted" do

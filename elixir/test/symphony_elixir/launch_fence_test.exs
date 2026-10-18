@@ -289,12 +289,22 @@ defmodule SymphonyElixir.LaunchFenceTest do
       assert blocked_state.parked[issue.id].stop_reason == :worker_launch_unproven
       assert File.read!(Path.join(workspace, "workpad.md")) == "dual-execution workpad\n"
 
-      # The old tree drains and its receipt lands; the same decision path now
-      # admits exactly one replacement worker.
+      # A durable park survives restart even after the old tree drains.
+      # Explicit operator recovery is required before the replacement.
       write_receipt!(identity)
 
       {:ok, sup2} = start_test_task_supervisor("dual-execution-confirmed")
-      confirmed_state = Orchestrator.dispatch_issue_for_test(runtime_state(sup2), issue)
+      restarted = Orchestrator.recover_retry_records_for_test(runtime_state(sup2))
+      assert restarted.parked[issue.id].stop_reason == :recovered_parked
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      request = %{action: :recover_parked, issue_id: issue.id, attempt_id: :current, requested_by: :test_operator}
+
+      assert {:reply, {:ok, %{outcome: :recovery_scheduled}}, recovered} =
+               Orchestrator.handle_call({:control_request, request}, {self(), make_ref()}, restarted)
+
+      retry = Map.fetch!(recovered.retry_attempts, issue.id)
+      Process.cancel_timer(retry.timer_ref)
+      confirmed_state = Orchestrator.dispatch_issue_for_test(recovered, issue)
 
       assert Map.has_key?(confirmed_state.running, issue.id)
       wait_until(fn -> Task.Supervisor.children(sup2) != [] end, 5_000)

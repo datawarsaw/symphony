@@ -64,6 +64,8 @@ defmodule SymphonyElixir.Orchestrator do
       retry_attempts: %{},
       parked: %{},
       retry_history: %{},
+      retry_state_error: nil,
+      retry_poll_inflight: MapSet.new(),
       resumed_issues: MapSet.new(),
       orphaned_workspaces: [],
       startup_reconciled: false,
@@ -113,14 +115,13 @@ defmodule SymphonyElixir.Orchestrator do
           codex_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup(state)
-
         # MIC-10: the wake ledger must be attached before any wake-producing
         # startup path runs — reconciliation mismatches and retry-record fence
         # verdicts below observe wakes, and a nil ledger silently drops them.
         state = recover_wake_ledger(state)
         state = run_startup_reconciliation(state)
         state = recover_retry_records(state)
+        if is_nil(state.retry_state_error), do: run_terminal_workspace_cleanup(state)
         state = schedule_tick(state, 0)
 
         {:ok, state}
@@ -360,7 +361,9 @@ defmodule SymphonyElixir.Orchestrator do
         delay_type: :continuation,
         worker_host: Map.get(running_entry, :worker_host),
         workspace_path: Map.get(running_entry, :workspace_path),
-        workspace_root: Map.get(running_entry, :workspace_root)
+        workspace_root: Map.get(running_entry, :workspace_root),
+        worker_identity: Map.get(running_entry, :worker_identity),
+        termination_expectation: Map.get(running_entry, :termination_expectation)
       })
     end
   end
@@ -383,10 +386,16 @@ defmodule SymphonyElixir.Orchestrator do
     block_issue_from_entry(state, issue_id, running_entry, error)
   end
 
-  defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
+  defp retry_agent_down(state, issue_id, running_entry, session_id, reason, opts \\ []) do
     {decision, class, history, state} = note_failure(state, issue_id, reason)
     {decision, history, state} = apply_fallback_decision(state, issue_id, class, history, decision, running_entry)
-    error = "agent exited: #{inspect(reason)}"
+
+    error =
+      case reason do
+        {:watchdog_stall, elapsed_ms} -> "stalled for #{elapsed_ms}ms without codex activity"
+        _ -> "agent exited: #{inspect(reason)}"
+      end
+
     Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)} failure_class=#{FailureClass.to_name(class)}")
 
     metadata = %{
@@ -427,7 +436,17 @@ defmodule SymphonyElixir.Orchestrator do
         # (NOT_APPLICABLE/NEVER_STARTED) or fails closed
         # (MANAGED_CONFIRMATION_REQUIRED), independently of evidence the
         # shutdown path may have failed to emit.
-        case WorkerContainment.reuse_gate(Map.get(running_entry, :worker_termination), Map.get(running_entry, :termination_expectation)) do
+        gate =
+          if Keyword.get(opts, :defer_launch_gate?, false) do
+            # A watchdog stop drains asynchronously. A backoff timer grants
+            # no launch authority: do_dispatch_issue rechecks the durable
+            # marker before preparation and parks if proof is still absent.
+            :allowed
+          else
+            WorkerContainment.reuse_gate(Map.get(running_entry, :worker_termination), Map.get(running_entry, :termination_expectation))
+          end
+
+        case gate do
           :allowed ->
             next_attempt = next_retry_attempt_from_running(running_entry)
             schedule_issue_retry(state, issue_id, next_attempt, metadata)
@@ -1006,17 +1025,15 @@ defmodule SymphonyElixir.Orchestrator do
       else
         Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
 
-        next_attempt = next_retry_attempt_from_running(running_entry)
-
         state = observe_wake(state, :worker_stale, issue_id, evidence: "stall:#{elapsed_ms}", attempt_id: session_id)
-
-        state
-        |> terminate_running_issue(issue_id, false)
-        |> schedule_issue_retry(issue_id, next_attempt, %{
-          identifier: identifier,
-          issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
-        })
+        state = terminate_running_issue(state, issue_id, false)
+        # A watchdog kill is a failed attempt in the same durable envelope.
+        # Re-read authoritative evidence after stopping; stale in-memory
+        # confirmation must never authorize a second worker.
+        identity = Map.get(running_entry, :worker_identity) || LaunchMarker.stored_identity(issue_id, launch_marker_opts(state))
+        entry = Map.put(running_entry, :worker_identity, identity)
+        entry = if is_map(identity), do: Map.put(entry, :termination_expectation, :MANAGED_CONFIRMATION_REQUIRED), else: entry
+        retry_agent_down(state, issue_id, entry, session_id, {:watchdog_stall, elapsed_ms}, defer_launch_gate?: true)
       end
     else
       state
@@ -1331,6 +1348,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+    LaunchMarker.with_issue_lock(issue.id, launch_marker_opts(state), fn ->
+      case trusted_retry_dispatch(state, issue.id) do
+        :ok -> do_dispatch_trusted_issue(state, issue, attempt, preferred_worker_host)
+        {:error, reason} -> block_retry_state(state, issue.id, reason)
+      end
+    end)
+  end
+
+  defp do_dispatch_trusted_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -1348,7 +1374,20 @@ defmodule SymphonyElixir.Orchestrator do
         # restart itself.
         case LaunchMarker.reuse_gate(issue.id, launch_marker_opts(state)) do
           :allowed ->
-            classify_candidate_and_spawn(state, issue, attempt, recipient, worker_host)
+            # Invalidate any detached cleanup for the preceding, proven
+            # generation before classification/preparation of its successor.
+            LaunchMarker.clear(issue.id, launch_marker_opts(state))
+
+            case LaunchMarker.read(issue.id, launch_marker_opts(state)) do
+              {:error, :not_found} ->
+                case persist_dispatch_intent(state, issue) do
+                  :ok -> classify_candidate_and_spawn(state, issue, attempt, recipient, worker_host)
+                  {:error, reason} -> block_retry_state(state, issue.id, reason)
+                end
+
+              _ ->
+                block_dispatch_on_unproven_launch(state, issue, :launch_marker_clear_failed)
+            end
 
           {:blocked, reason} ->
             block_dispatch_on_unproven_launch(state, issue, reason)
@@ -1501,16 +1540,9 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
-        next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
-
         state = %{state | resumed_issues: MapSet.delete(state.resumed_issues, issue.id)}
-
-        schedule_issue_retry(state, issue.id, next_attempt, %{
-          identifier: issue.identifier,
-          issue_url: issue.url,
-          error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
-        })
+        entry = %{identifier: issue.identifier, issue: issue, worker_host: worker_host, retry_attempt: attempt, termination_expectation: :NEVER_STARTED}
+        retry_agent_down(state, issue.id, entry, "never-started", {:task_spawn_failed, reason})
     end
   end
 
@@ -1591,6 +1623,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
+    history = Map.get(state.retry_history, issue_id, %{})
+
+    metadata =
+      Map.merge(
+        %{
+          failure_class: FailureClass.to_name(Map.get(history, :last_failure_class, :transient_worker_failure)),
+          attempt_count: Map.get(history, :attempt_count, 0),
+          identical_failure_count: max(1, Map.get(history, :identical_failure_count, 1)),
+          first_failure_at: Map.get(history, :first_failure_at_dt)
+        },
+        metadata
+      )
+
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
     delay_ms = retry_delay(next_attempt, metadata)
@@ -1616,7 +1661,16 @@ defmodule SymphonyElixir.Orchestrator do
       metadata[:primary_failure_count] || Map.get(previous_retry, :primary_failure_count) ||
         history_primary_failure_count(Map.get(state.retry_history, issue_id)) || 0
 
-    metadata = Map.merge(metadata, %{route: route, primary_failure_count: primary_failure_count})
+    metadata =
+      Map.merge(metadata, %{
+        route: route,
+        primary_failure_count: primary_failure_count,
+        worker_host: worker_host,
+        workspace_path: workspace_path,
+        workspace_root: workspace_root,
+        worker_identity: metadata[:worker_identity] || previous_retry[:worker_identity],
+        termination_expectation: metadata[:termination_expectation] || previous_retry[:termination_expectation]
+      })
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1642,13 +1696,17 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: workspace_path,
             workspace_root: workspace_root,
+            worker_identity: metadata[:worker_identity] || previous_retry[:worker_identity],
+            termination_expectation: metadata[:termination_expectation] || previous_retry[:termination_expectation],
             route: route,
             primary_failure_count: primary_failure_count
           })
     }
 
-    persist_failure_retry_record(new_state, issue_id, next_attempt, delay_ms, metadata)
-    new_state
+    case persist_failure_retry_record(new_state, issue_id, next_attempt, delay_ms, metadata) do
+      :ok -> new_state
+      {:error, reason} -> block_retry_state(new_state, issue_id, {:retry_persistence_failed, reason})
+    end
   end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
@@ -1661,6 +1719,8 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
           workspace_root: Map.get(retry_entry, :workspace_root),
+          worker_identity: Map.get(retry_entry, :worker_identity),
+          termination_expectation: Map.get(retry_entry, :termination_expectation),
           route: Map.get(retry_entry, :route, :primary),
           primary_failure_count: Map.get(retry_entry, :primary_failure_count, 0)
         }
@@ -1673,6 +1733,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
+    case persist_retry_poll_intent(state, issue_id, metadata) do
+      :ok ->
+        state = %{state | retry_poll_inflight: MapSet.put(state.retry_poll_inflight, issue_id)}
+        {:noreply, next} = fetch_retry_issue(state, issue_id, attempt, metadata)
+        {:noreply, %{next | retry_poll_inflight: MapSet.delete(next.retry_poll_inflight, issue_id)}}
+
+      {:error, reason} ->
+        {:noreply, block_retry_state(state, issue_id, reason)}
+    end
+  end
+
+  defp fetch_retry_issue(state, issue_id, attempt, metadata) do
     case Tracker.fetch_issues_by_ids([issue_id]) do
       {:ok, issues} ->
         issues
@@ -1718,6 +1790,10 @@ defmodule SymphonyElixir.Orchestrator do
         reschedule_metadata =
           Map.merge(metadata, %{
             error: "retry poll failed: #{inspect(reason)}",
+            failure_class: FailureClass.to_name(class),
+            attempt_count: history.attempt_count,
+            identical_failure_count: history.identical_failure_count,
+            first_failure_at: history.first_failure_at_dt,
             route: Map.get(history, :route, :primary),
             primary_failure_count: Map.get(history, :primary_failure_count, 0)
           })
@@ -1829,96 +1905,88 @@ defmodule SymphonyElixir.Orchestrator do
   # drifted fence could never be trusted: the marker and the deletion boundary
   # must live in the same mutation domain the runtime owns.
   defp fenced_workspace_cleanup(issue_or_identifier, metadata, issue_id, root_opts) do
-    case LaunchMarker.cleanup_gate(issue_id, root_opts) do
-      :allowed ->
-        if cleanup_authority_held?(root_opts) do
-          LaunchMarker.clear(issue_id, root_opts)
-          cleanup_issue_workspace(root_opts, issue_or_identifier, metadata)
-        else
-          cleanup_authority_lost(issue_id)
-        end
+    LaunchMarker.with_issue_lock(issue_id, root_opts, fn ->
+      case LaunchMarker.read(issue_id, root_opts) do
+        {:error, :not_found} ->
+          if cleanup_authority_held?(root_opts), do: cleanup_issue_workspace(root_opts, issue_or_identifier, metadata)
 
-      {:blocked, :worker_termination_unproven} ->
-        spawn_fenced_cleanup_wait(issue_or_identifier, metadata, issue_id, root_opts)
+        {:ok, marker} ->
+          case WorkerFence.confirm_termination_receipt(marker["worker_identity"]) do
+            {:ok, :dead} -> cleanup_generation(issue_or_identifier, metadata, issue_id, marker, root_opts)
+            _ -> spawn_generation_cleanup_wait(issue_or_identifier, metadata, issue_id, marker, root_opts)
+          end
 
-      {:blocked, reason} ->
-        Logger.error(
-          "Destructive workspace cleanup failed closed for issue_id=#{inspect(issue_id)}: worker launch not " <>
-            "proven terminated reason=#{inspect(reason)}; preserving workspace"
-        )
-
-        :ok
-    end
+        {:error, reason} ->
+          Logger.error("Cleanup blocked issue_id=#{issue_id}: marker #{inspect(reason)}")
+      end
+    end)
   end
 
-  # Bounded detached drain wait: polls the marker's fence verdict (positive
-  # receipt proof only) and cleans only on {:ok, :dead}. Never touches
-  # orchestrator state — by the time this runs the issue has already left the
-  # lifecycle maps; the watcher only settles the workspace itself. It carries
-  # the precomputed root opts instead: the pinned roots are immutable for the
-  # runtime lifetime, so capturing them here keeps the detached cleanup in
-  # exactly the mutation domain the fence decided about, with no live-config
-  # resolution after the wait.
-  #
-  # Authority loss fails closed: before deleting anything the watcher re-proves
-  # — from the durable lease file, not the holder's heartbeat-lagged memory —
-  # that this runtime instance still owns the pinned root. A watcher that
-  # outlives an authority transfer (operator force_release plus a successor's
-  # acquisition) must never clear a marker or delete a workspace the successor
-  # now owns; the workspace is preserved for whoever holds the root.
+  defp cleanup_generation(issue_or_identifier, metadata, issue_id, marker, root_opts) do
+    LaunchMarker.with_issue_lock(issue_id, root_opts, fn ->
+      # Validation and deletion share the lock with dispatch, AgentRunner's
+      # preparation/session and every marker mutation. Absence is stale too:
+      # another cleanup or dispatch already consumed this generation.
+      with true <- cleanup_authority_held?(root_opts),
+           {:ok, current} <- LaunchMarker.read(issue_id, root_opts),
+           true <- current["launch_id"] == marker["launch_id"],
+           {:ok, :dead} <- WorkerFence.confirm_termination_receipt(marker["worker_identity"]),
+           nil <- workspace_gate_preserved?(metadata),
+           result <- cleanup_issue_workspace(root_opts, issue_or_identifier, metadata),
+           true <- result == :ok or match?({:ok, _}, result) do
+        LaunchMarker.clear(marker["worker_identity"], root_opts)
+      else
+        reason -> Logger.warning("Stale or unauthorized cleanup rejected issue_id=#{issue_id} reason=#{inspect(reason)}")
+      end
+    end)
+  end
+
   defp spawn_fenced_cleanup_wait(issue_or_identifier, metadata, issue_id, root_opts) do
+    LaunchMarker.with_issue_lock(issue_id, root_opts, fn ->
+      case LaunchMarker.read(issue_id, root_opts) do
+        {:ok, marker} -> spawn_generation_cleanup_wait(issue_or_identifier, metadata, issue_id, marker, root_opts)
+        _ -> :ok
+      end
+    end)
+  end
+
+  defp spawn_generation_cleanup_wait(issue_or_identifier, metadata, issue_id, marker, root_opts) do
     spawn(fn ->
       deadline = System.monotonic_time(:millisecond) + fenced_cleanup_evidence_budget_ms()
 
-      case await_drain_proof(issue_id, deadline, root_opts) do
-        {:ok, :dead} ->
-          if cleanup_authority_held?(root_opts) do
-            LaunchMarker.clear(issue_id, root_opts)
-            cleanup_issue_workspace(root_opts, issue_or_identifier, metadata)
-          else
-            cleanup_authority_lost(issue_id)
-          end
-
-        _verdict ->
-          Logger.error(
-            "Destructive workspace cleanup failed closed for issue_id=#{inspect(issue_id)}: worker drain not " <>
-              "proven within the evidence budget; preserving workspace"
-          )
+      case await_drain_proof(marker["worker_identity"], deadline) do
+        {:ok, :dead} -> cleanup_generation(issue_or_identifier, metadata, issue_id, marker, root_opts)
+        _ -> Logger.error("Cleanup drain unproven issue_id=#{issue_id}; preserving workspace and marker")
       end
     end)
 
     :ok
   end
 
-  # Test seam mirroring the other *_for_test wrappers: drives the same detached
-  # drain watcher the fenced cleanup path spawns, with explicit root opts, so
-  # pinning and authority-loss behavior are observable without a full
-  # orchestrator lifecycle.
   @doc false
   @spec spawn_fenced_cleanup_wait_for_test(term(), map(), String.t(), keyword()) :: :ok
   def spawn_fenced_cleanup_wait_for_test(issue_or_identifier, metadata, issue_id, root_opts) do
     spawn_fenced_cleanup_wait(issue_or_identifier, metadata, issue_id, root_opts)
   end
 
-  defp await_drain_proof(issue_id, deadline, root_opts) do
-    cond do
-      verdict = proven_drain_verdict(issue_id, root_opts) ->
-        verdict
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        {:error, :unknown}
-
-      true ->
-        Process.sleep(@fenced_cleanup_evidence_poll_ms)
-        await_drain_proof(issue_id, deadline, root_opts)
-    end
+  @doc false
+  @spec cleanup_generation_for_test(term(), map(), String.t(), map(), keyword()) :: term()
+  def cleanup_generation_for_test(issue, metadata, issue_id, marker, root_opts) do
+    cleanup_generation(issue, metadata, issue_id, marker, root_opts)
   end
 
-  defp proven_drain_verdict(issue_id, root_opts) do
-    case LaunchMarker.fence_verdict(issue_id, root_opts) do
-      {:ok, :dead} = verdict -> verdict
-      {:error, :alive} = verdict -> verdict
-      _unproven -> nil
+  defp await_drain_proof(identity, deadline) do
+    case WorkerFence.confirm_termination_receipt(identity) do
+      {:ok, :dead} = verdict ->
+        verdict
+
+      _ ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :unknown}
+        else
+          Process.sleep(@fenced_cleanup_evidence_poll_ms)
+          await_drain_proof(identity, deadline)
+        end
     end
   end
 
@@ -1931,15 +1999,6 @@ defmodule SymphonyElixir.Orchestrator do
       root when is_binary(root) and root != "" -> RuntimeLease.holds_authority_for?(root)
       _ -> true
     end
-  end
-
-  defp cleanup_authority_lost(issue_id) do
-    Logger.error(
-      "Destructive workspace cleanup failed closed for issue_id=#{inspect(issue_id)}: this runtime no longer " <>
-        "provably holds authority over its pinned root; preserving workspace and marker"
-    )
-
-    :ok
   end
 
   # Same budget shape as the CONTROL evidence watcher (grace + hard-terminate
@@ -2307,6 +2366,10 @@ defmodule SymphonyElixir.Orchestrator do
   def recover_retry_records_for_test(%State{} = state), do: recover_retry_records(state)
 
   @doc false
+  @spec persist_retry_poll_intent_for_test(State.t(), String.t(), map()) :: :ok | {:error, term()}
+  def persist_retry_poll_intent_for_test(state, issue_id, metadata), do: persist_retry_poll_intent(state, issue_id, metadata)
+
+  @doc false
   @spec handle_failure_for_test(term(), String.t(), map(), String.t(), term()) :: term()
   def handle_failure_for_test(%State{} = state, issue_id, running_entry, session_id, reason) do
     retry_agent_down(state, issue_id, running_entry, session_id, reason)
@@ -2331,10 +2394,13 @@ defmodule SymphonyElixir.Orchestrator do
     now_ms = System.monotonic_time(:millisecond)
     now_dt = DateTime.utc_now()
 
+    prior = Map.get(state.retry_history, issue_id)
+    prior = if is_map(prior) and Map.get(prior, :attempt_count) == 0, do: nil, else: prior
+
     {decision, history} =
       case RetryPolicy.evaluate(%{
              failure_class: class,
-             history: Map.get(state.retry_history, issue_id),
+             history: prior,
              now_ms: now_ms
            }) do
         {:retry, history} -> {:retry, history}
@@ -2351,9 +2417,11 @@ defmodule SymphonyElixir.Orchestrator do
     # pre-fold projection is still carried through verbatim — update_history/3
     # rebuilds the map without the route keys, and dropping them here would
     # silently un-latch a fallback route.
+    previous_history = prior || %{}
+
     history =
       history
-      |> Map.put_new(:first_failure_at_dt, DateTime.to_iso8601(now_dt))
+      |> Map.put(:first_failure_at_dt, Map.get(previous_history, :first_failure_at_dt) || DateTime.to_iso8601(now_dt))
       |> Map.put(:last_failure_at_dt, DateTime.to_iso8601(now_dt))
 
     route_state_before = route_state_from_history(Map.get(state.retry_history, issue_id))
@@ -2432,9 +2500,16 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     state = cancel_retry_timer(state, issue_id)
-    write_retry_record_best_effort(state, issue_id, entry, "parked")
+    state = %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
 
-    %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
+    case write_retry_record(state, issue_id, entry, "parked") do
+      :ok ->
+        state
+
+      {:error, reason} ->
+        entry = Map.put(entry, :persistence_error, reason)
+        block_retry_state(%{state | parked: Map.put(state.parked, issue_id, entry)}, issue_id, {:parking_persistence_failed, reason})
+    end
   end
 
   @spec cancel_retry_timer(term(), String.t()) :: term()
@@ -2447,7 +2522,7 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
   end
 
-  @spec persist_failure_retry_record(State.t(), String.t(), integer() | nil, integer(), map()) :: :ok
+  @spec persist_failure_retry_record(State.t(), String.t(), integer() | nil, integer(), map()) :: :ok | {:error, term()}
   defp persist_failure_retry_record(%State{} = state, issue_id, attempt, delay_ms, metadata) do
     if is_binary(metadata[:failure_class]) do
       now_dt = DateTime.utc_now()
@@ -2473,26 +2548,24 @@ defmodule SymphonyElixir.Orchestrator do
         next_retry_in_ms: delay_ms
       }
 
-      write_retry_record_best_effort(state, issue_id, entry, "retrying")
+      write_retry_record(state, issue_id, entry, "retrying")
     else
       :ok
     end
   end
 
-  @spec write_retry_record_best_effort(State.t(), String.t(), map(), String.t()) :: :ok
-  defp write_retry_record_best_effort(%State{} = state, issue_id, entry, status) do
+  @spec write_retry_record(State.t() | String.t(), String.t(), map(), String.t()) :: :ok | {:error, term()}
+  defp write_retry_record(%State{} = state, issue_id, entry, status) do
     case retry_store_root(state) do
       {:ok, root} ->
-        write_retry_record_best_effort(root, issue_id, entry, status)
+        write_retry_record(root, issue_id, entry, status)
 
       {:error, reason} ->
-        Logger.warning("Skipping retry record write issue_id=#{issue_id}; no durable record root: #{inspect(reason)}")
-        :ok
+        {:error, reason}
     end
   end
 
-  @spec write_retry_record_best_effort(String.t(), String.t(), map(), String.t()) :: :ok
-  defp write_retry_record_best_effort(root, issue_id, entry, status) when is_binary(root) do
+  defp write_retry_record(root, issue_id, entry, status) when is_binary(root) do
     record =
       RetryStore.build_record(%{
         issue_id: issue_id,
@@ -2534,13 +2607,7 @@ defmodule SymphonyElixir.Orchestrator do
         reason -> Map.put(record, "stop_reason", reason)
       end
 
-    try do
-      RetryStore.write_record(root, record)
-    rescue
-      _ -> :ok
-    catch
-      _, _ -> :ok
-    end
+    RetryStore.write_record(root, record)
   end
 
   @spec next_retry_at_iso(map()) :: String.t() | nil
@@ -2598,11 +2665,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp recover_retry_records(%State{} = state) do
     case retry_store_root(state) do
       {:ok, root} ->
-        Enum.reduce(RetryStore.list_records(root), state, &recover_retry_list_record(&2, &1, root))
+        case RetryStore.list_records(root) do
+          {:ok, records} -> Enum.reduce(records, state, &recover_retry_list_record(&2, &1, root))
+          {:error, reason} -> block_retry_state(state, nil, reason)
+        end
 
       {:error, reason} ->
-        Logger.warning("Skipping retry record recovery; no durable record root: #{inspect(reason)}")
-        state
+        block_retry_state(state, nil, reason)
     end
   end
 
@@ -2612,8 +2681,122 @@ defmodule SymphonyElixir.Orchestrator do
         recover_retry_record(state, record, root)
 
       {:error, reason} ->
-        Logger.warning("Ignoring corrupt retry record file_id=#{file_id}: #{inspect(reason)}; preserving workspaces")
-        state
+        # An unreadable record may not reveal its true issue id. Stop all
+        # dispatch rather than matching a lossy filename to tracker ids.
+        block_retry_state(state, nil, {:untrusted_retry_record, file_id, reason})
+    end
+  end
+
+  # Latched for this runtime: loss of required durable state cannot be cured
+  # by a poll or a config reload. Preserve evidence and require a clean restart
+  # after the underlying storage/record has been reviewed.
+  defp block_retry_state(state, issue_id, reason) do
+    Logger.error("Retry state unavailable; dispatch STOP issue_id=#{inspect(issue_id)} reason=#{inspect(reason)}")
+    state = if is_binary(issue_id), do: cancel_retry_timer(state, issue_id), else: state
+    claimed = if is_binary(issue_id), do: MapSet.put(state.claimed, issue_id), else: state.claimed
+    %{state | retry_state_error: reason, claimed: claimed}
+  end
+
+  defp trusted_retry_dispatch(%State{retry_state_error: reason}, _issue_id) when not is_nil(reason),
+    do: {:error, reason}
+
+  defp trusted_retry_dispatch(state, issue_id) do
+    with {:ok, root} <- retry_store_root(state),
+         {:ok, records} <- RetryStore.list_records(root),
+         false <- Enum.any?(records, fn {_id, result} -> match?({:error, _}, result) end) do
+      case RetryStore.read_record(root, issue_id) do
+        {:error, :not_found} ->
+          :ok
+
+        {:ok, %{"status" => "parked", "stop_reason" => "retry_poll_inflight"}} ->
+          if MapSet.member?(state.retry_poll_inflight, issue_id) do
+            {:ok, record} = RetryStore.read_record(root, issue_id)
+            retry_record_dispatch_gate(record)
+          else
+            {:error, {:durable_issue_parked, issue_id}}
+          end
+
+        {:ok, %{"status" => "parked"}} ->
+          {:error, {:durable_issue_parked, issue_id}}
+
+        {:ok, record} ->
+          retry_record_dispatch_gate(record)
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      true -> {:error, :untrusted_retry_records}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp retry_record_dispatch_gate(record) do
+    with {:ok, class} <- FailureClass.from_name(record["failure_class"]),
+         {:ok, first} <- parse_record_time(record["first_failure_at"]) do
+      count = record["attempt_count"]
+
+      stop =
+        cond do
+          count == 0 -> :ok
+          RetryPolicy.park_immediately?(class) -> {:stop, :auth_unavailable}
+          true -> RetryPolicy.stop_reason(count, max(0, DateTime.diff(DateTime.utc_now(), first, :millisecond)), record["identical_failure_count"])
+        end
+
+      case stop do
+        :ok -> :ok
+        reason -> {:error, {:retry_envelope_blocked, reason}}
+      end
+    else
+      reason -> {:error, {:retry_envelope_blocked, reason}}
+    end
+  end
+
+  defp persist_dispatch_intent(state, issue) do
+    with {:ok, root} <- retry_store_root(state) do
+      record =
+        case RetryStore.read_record(root, issue.id) do
+          {:ok, record} ->
+            record
+
+          {:error, :not_found} ->
+            RetryStore.build_record(%{issue_id: issue.id, identifier: issue.identifier, status: "parked", failure_class: "TRANSIENT_WORKER_FAILURE", attempt_count: 0, workspace_root: root})
+        end
+
+      record = record |> Map.put("status", "parked") |> Map.put("stop_reason", "dispatch_inflight")
+      RetryStore.write_record(root, record)
+    end
+  end
+
+  defp persist_retry_poll_intent(state, issue_id, metadata) do
+    with nil <- state.retry_state_error,
+         {:ok, root} <- retry_store_root(state) do
+      case RetryStore.read_record(root, issue_id) do
+        {:ok, %{"status" => "retrying"} = record} ->
+          RetryStore.write_record(root, record |> Map.put("status", "parked") |> Map.put("stop_reason", "retry_poll_inflight"))
+
+        {:error, :not_found} ->
+          record =
+            RetryStore.build_record(%{
+              issue_id: issue_id,
+              identifier: metadata[:identifier] || issue_id,
+              status: "parked",
+              failure_class: "TRANSIENT_WORKER_FAILURE",
+              attempt_count: 0,
+              workspace_root: root
+            })
+
+          RetryStore.write_record(root, Map.put(record, "stop_reason", "retry_poll_inflight"))
+
+        {:ok, _} ->
+          {:error, :durable_issue_parked}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:error, reason} -> {:error, reason}
+      reason -> {:error, reason}
     end
   end
 
@@ -2636,7 +2819,7 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         issue_id = Map.get(record, "issue_id")
         Logger.warning("Ambiguous retry record #{inspect(issue_id)}; failing closed with claim and no timer")
-        if is_binary(issue_id), do: %{state | claimed: MapSet.put(state.claimed, issue_id)}, else: state
+        block_retry_state(state, issue_id, {:ambiguous_retry_record, issue_id})
     end
   end
 
@@ -2690,6 +2873,7 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_root: Map.get(record, "workspace_root", root),
       route: route,
       primary_failure_count: primary_failure_count,
+      worker_identity: Map.get(record, "worker_identity"),
       termination_expectation: expectation_from_record(Map.get(record, "termination_expectation"))
     }
 
@@ -2701,8 +2885,18 @@ defmodule SymphonyElixir.Orchestrator do
         %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
 
       "retrying" ->
-        case recover_fence_verdict(Map.get(record, "termination_expectation"), Map.get(record, "worker_identity")) do
-          {:ok, :dead} ->
+        stop =
+          cond do
+            count == 0 -> :ok
+            RetryPolicy.park_immediately?(class) -> {:stop, :auth_unavailable}
+            true -> RetryPolicy.stop_reason(count, age_ms, identical)
+          end
+
+        case {stop, recover_fence_verdict(Map.get(record, "termination_expectation"), Map.get(record, "worker_identity"))} do
+          {{:stop, reason}, _} ->
+            park_issue(state, issue_id, base_entry, Map.put(base_entry, :stop_reason, reason))
+
+          {:ok, {:ok, :dead}} ->
             metadata = %{
               identifier: base_entry.identifier,
               issue_url: nil,
@@ -2724,14 +2918,14 @@ defmodule SymphonyElixir.Orchestrator do
             state = %{state | claimed: MapSet.put(state.claimed, issue_id)}
             schedule_issue_retry(state, issue_id, count + 1, metadata)
 
-          {:error, :alive} ->
+          {:ok, {:error, :alive}} ->
             Logger.warning("Retry record worker still alive for issue_id=#{issue_id}; failing closed with claim and no timer")
 
             state = observe_wake(state, :worker_termination_unconfirmed, issue_id, evidence: "fence_alive")
             entry = Map.merge(base_entry, %{stop_reason: :fence_alive, parked_at: DateTime.to_iso8601(now_dt)})
             %{state | parked: Map.put(state.parked, issue_id, entry), claimed: MapSet.put(state.claimed, issue_id)}
 
-          {:error, :unknown} ->
+          {:ok, {:error, :unknown}} ->
             Logger.warning("Retry record has no provable worker identity for issue_id=#{issue_id}; failing closed to PARKED with claim and no timer")
 
             state = observe_wake(state, :worker_termination_unconfirmed, issue_id, evidence: "fence_unknown")
@@ -3331,7 +3525,9 @@ defmodule SymphonyElixir.Orchestrator do
           error: "relaunched by operator control (control_id=#{prior_receipt.control_id})",
           worker_host: Map.get(evidence, :worker_host),
           workspace_path: Map.get(evidence, :workspace_path),
-          workspace_root: Map.get(evidence, :workspace_root)
+          workspace_root: Map.get(evidence, :workspace_root),
+          worker_identity: Map.get(evidence, :worker_identity),
+          termination_expectation: Map.get(evidence, :termination_expectation)
         }
 
         # Narrow hold release for operator relaunch: unlike release_issue_claim/2
@@ -3341,17 +3537,18 @@ defmodule SymphonyElixir.Orchestrator do
         state = schedule_issue_retry(state, request.issue_id, next_attempt, metadata)
         # The envelope resolved the replacement attempt (nil delegates to the
         # existing retry schedule); the receipt reports what was scheduled.
-        replacement = state.retry_attempts |> Map.get(request.issue_id) |> Map.get(:attempt)
+        replacement = get_in(state.retry_attempts, [request.issue_id, :attempt])
 
         {receipt, state} =
           record_control(
             state,
             request,
-            :relaunch_scheduled,
+            if(is_integer(replacement), do: :relaunch_scheduled, else: :rejected_no_terminated_attempt),
             %{
               prior_terminate_control_id: prior_receipt.control_id,
               resolved_attempt_id: current_attempt,
               replacement_retry_attempt: replacement,
+              persistence_error: state.retry_state_error,
               reuse_gate: :allowed
             },
             attempt_id: current_attempt
@@ -3384,8 +3581,12 @@ defmodule SymphonyElixir.Orchestrator do
   # Elapsed time is never consulted: only positive evidence changes the
   # verdict.
 
-  @fence_park_reasons ["worker_termination_unconfirmed", "fence_unknown", "fence_alive"]
+  @fence_park_reasons ["worker_termination_unconfirmed", "worker_launch_unproven", "fence_unknown", "fence_alive", "dispatch_inflight", "retry_poll_inflight"]
   @policy_park_reasons ["max_attempts", "max_age", "max_identical", "auth_unavailable"]
+
+  defp control_recover_parked(%State{retry_state_error: reason} = state, request) when not is_nil(reason) do
+    deny_recovery(state, request, :rejected_corrupt_evidence, %{reason: :retry_state_untrusted, retry_state_error: reason}, nil)
+  end
 
   defp control_recover_parked(state, request) do
     issue_id = request.issue_id
@@ -3467,10 +3668,24 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp control_recover_fence_check(state, request, entry, record, park_reason, attempt_id) do
+    # An interrupted dispatch intent predates its worker identity. Only the
+    # independently validated issue marker can supply that launch after restart.
+    record =
+      if park_reason == "dispatch_inflight" do
+        case LaunchMarker.read(request.issue_id, launch_marker_opts(state)) do
+          {:ok, marker} -> Map.put(record, "worker_identity", marker["worker_identity"]) |> Map.put("termination_expectation", "MANAGED_CONFIRMATION_REQUIRED")
+          _ -> record
+        end
+      else
+        record
+      end
+
     expectation = Map.get(record, "termination_expectation")
     identity = Map.get(record, "worker_identity")
+    gate = LaunchMarker.reuse_gate(request.issue_id, launch_marker_opts(state))
+    verdict = if gate == :allowed, do: recover_fence_verdict(expectation, identity), else: {:error, :unknown}
 
-    case recover_fence_verdict(expectation, identity) do
+    case verdict do
       {:ok, :dead} ->
         control_recover_tracker_check(state, request, entry, record, park_reason, attempt_id)
 
@@ -3547,34 +3762,48 @@ defmodule SymphonyElixir.Orchestrator do
             {receipt, state} =
               record_control(state, request, :recovered_terminal, evidence, attempt_id: attempt_id)
 
-            cleanup_issue_workspace(cleanup_workspace_opts(state), issue, recovery_workspace_metadata(entry, record))
+            fenced_workspace_cleanup(issue, recovery_workspace_metadata(entry, record), issue_id, cleanup_workspace_opts(state))
             state = release_issue_claim(state, issue_id)
 
             {{:ok, receipt}, state}
 
           retry_candidate_issue?(issue, terminal_states) ->
-            evidence = recovery_evidence(record, park_reason, issue.state, :redispatch_scheduled)
-
-            {receipt, state} =
-              record_control(state, request, :recovery_scheduled, evidence, attempt_id: attempt_id)
-
-            # Smallest safe transition: release the parked hold, resolve the
-            # pending park wake, and let the existing retry envelope — with its
-            # preserved failure history, route state, and tracker revalidation
-            # at timer fire — redispatch through the normal scheduler. No
-            # worker is launched from the recovery command, and the issue stays
-            # claimed until the retry dispatches so the poller cannot race it.
-            state = handle_wake_release(state, issue_id)
-            state = %{state | parked: Map.delete(state.parked, issue_id)}
-            state = schedule_issue_retry(state, issue_id, recovery_next_attempt(record), recovery_retry_metadata(record, issue_id, receipt))
-
-            {{:ok, receipt}, state}
+            case retry_record_dispatch_gate(record) do
+              :ok -> schedule_recovered_issue(state, request, entry, record, park_reason, attempt_id, issue)
+              {:error, reason} -> deny_recovery(state, request, :rejected_not_fence_parked, %{category: :policy_park, retry_envelope: reason, park_stop_reason: park_reason}, attempt_id)
+            end
 
           true ->
             # The issue left every active tracker state without becoming
             # terminal: the existing rule releases the claim.
             recovery_release(state, request, issue_id, record, park_reason, :recovered_issue_inactive, attempt_id, issue.state)
         end
+    end
+  end
+
+  defp schedule_recovered_issue(state, request, entry, record, park_reason, attempt_id, issue) do
+    issue_id = issue.id
+    evidence = recovery_evidence(record, park_reason, issue.state, :redispatch_scheduled)
+
+    {receipt, state} =
+      record_control(state, request, :recovery_scheduled, evidence, attempt_id: attempt_id)
+
+    # Smallest safe transition: release the parked hold, resolve the
+    # pending park wake, and let the existing retry envelope — with its
+    # preserved failure history, route state, and tracker revalidation
+    # at timer fire — redispatch through the normal scheduler. No
+    # worker is launched from the recovery command, and the issue stays
+    # claimed until the retry dispatches so the poller cannot race it.
+    state = handle_wake_release(state, issue_id)
+    state = %{state | parked: Map.delete(state.parked, issue_id)}
+    state = schedule_issue_retry(state, issue_id, recovery_next_attempt(record), recovery_retry_metadata(record, issue_id, receipt))
+
+    if Map.has_key?(state.retry_attempts, issue_id) do
+      {{:ok, receipt}, state}
+    else
+      failed = %{receipt | outcome: :rejected_corrupt_evidence, evidence: Map.put(receipt.evidence, :persistence_error, state.retry_state_error)}
+      state = %{replace_control_receipt(state, failed) | parked: Map.put(state.parked, issue_id, entry)}
+      {{:ok, failed}, state}
     end
   end
 

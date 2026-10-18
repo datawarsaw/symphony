@@ -101,6 +101,119 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     Enum.map_join([python, "-u", "-c", "import sys; sys.stdin.readline(); sys.exit(3)"], " ", &shell_quote/1)
   end
 
+  @tag skip: @fence_skip
+  test "real provider failure cannot mask an unconfirmed stop or overwrite its original launch", %{issue: issue} do
+    reset_fence_env!()
+    root = Path.dirname(Workflow.workflow_file_path())
+    log = Path.join(root, "unconfirmed-launches.jsonl")
+    helper = mismatched_receipt_helper!(root)
+    previous = Application.get_env(:symphony_elixir, :jobrun_helper_path)
+    Application.put_env(:symphony_elixir, :jobrun_helper_path, helper)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:symphony_elixir, :jobrun_helper_path),
+        else: Application.put_env(:symphony_elixir, :jobrun_helper_path, previous)
+    end)
+
+    point_codex_command_at(discovery_command(issue) <> " fail-all " <> shell_quote(log))
+
+    assert {:error, {:discovery_technical_failure, :worker_termination_unconfirmed}} =
+             Discovery.run(issue, self(), sleep: fn _ -> :ok end)
+
+    assert [started] = File.read!(log) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    assert started["model"] == "OpenDesign/deepseek-v4.1-flash"
+    assert {:ok, marker} = LaunchMarker.read(issue.id)
+    original = File.read!(LaunchMarker.marker_path(issue.id))
+    assert {:error, :unknown} = WorkerFence.confirm_termination_receipt(marker["worker_identity"])
+    assert retained_receipt(issue)["status"] == "TECHNICAL_FAILURE"
+    refute_receive {:discovery_completed, _, _}
+    assert {:error, {:discovery_technical_failure, _}} = Discovery.run(issue, self())
+    assert File.read!(LaunchMarker.marker_path(issue.id)) == original
+    assert length(String.split(File.read!(log), "\n", trim: true)) == 1
+  end
+
+  @tag skip: @fence_skip
+  test "both real providers fail with confirmed drain and enter the Orchestrator retry envelope", %{issue: issue} do
+    reset_fence_env!()
+    fence_launch_helper!()
+    root = Path.dirname(Workflow.workflow_file_path())
+    log = Path.join(root, "failed-providers.jsonl")
+    point_codex_command_at(discovery_command(issue) <> " fail-all " <> shell_quote(log))
+    owner = self()
+    task = Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn -> AgentRunner.run(issue, owner, sleep: fn _ -> :ok end) end)
+
+    state = %Orchestrator.State{
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      running: %{
+        issue.id => %{
+          pid: task.pid,
+          ref: task.ref,
+          issue: issue,
+          identifier: issue.identifier,
+          started_at: DateTime.utc_now(),
+          termination_expectation: :MANAGED_CONFIRMATION_REQUIRED,
+          last_codex_message: nil,
+          last_codex_event: nil,
+          last_codex_timestamp: nil,
+          session_id: nil,
+          codex_app_server_pid: nil,
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          codex_last_reported_input_tokens: 0,
+          codex_last_reported_output_tokens: 0,
+          codex_last_reported_total_tokens: 0,
+          turn_count: 0
+        }
+      }
+    }
+
+    state = await_agent_down(state, task.ref)
+    assert state.completed == MapSet.new()
+    assert state.blocked == %{}
+    assert state.parked == %{}
+    assert state.retry_history[issue.id].attempt_count == 1
+    retry = Map.fetch!(state.retry_attempts, issue.id)
+    Process.cancel_timer(retry.timer_ref)
+    assert {:ok, record} = RetryStore.read_record(Application.fetch_env!(:symphony_elixir, :retry_store_root), issue.id)
+    assert record["status"] == "retrying"
+    assert {:ok, :dead} = WorkerFence.confirm_termination_receipt(record["worker_identity"])
+    launches = File.read!(log) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    assert Enum.map(launches, & &1["model"]) == ["OpenDesign/deepseek-v4.1-flash", "OpenDesign/deepseek-v4.1-flash", "google-antigravity/gemini-3.8-flash"]
+    refute_receive {:discovery_completed, _, _}
+  end
+
+  defp await_agent_down(state, ref) do
+    receive do
+      {:DOWN, ^ref, :process, _, reason} = message ->
+        refute reason == :normal
+        {:noreply, next} = Orchestrator.handle_info(message, state)
+        next
+
+      message ->
+        {:noreply, next} = Orchestrator.handle_info(message, state)
+        await_agent_down(next, ref)
+    after
+      15_000 -> flunk("offline AgentRunner did not finish")
+    end
+  end
+
+  # A private fixture build corrupts only its receipt binding. It retains the
+  # production Job Object containment code and never changes the shared helper.
+  defp mismatched_receipt_helper!(root) do
+    source = Path.join(root, "mismatched-jobrun.cs")
+    exe = Path.join(root, "mismatched-jobrun.exe")
+    code = File.read!(Path.expand("priv/windows/jobrun/jobrun.cs"))
+    assert code =~ ~s|AppendField(sb, "launch_id", launchId, false);|
+    File.write!(source, String.replace(code, ~s|AppendField(sb, "launch_id", launchId, false);|, ~s|AppendField(sb, "launch_id", "fixture-mismatched-launch", false);|))
+    csc = Path.join([System.fetch_env!("WINDIR"), "Microsoft.NET/Framework64/v4.0.30319/csc.exe"])
+    {output, status} = System.cmd(csc, ["/nologo", "/out:" <> String.replace(exe, "/", "\\"), String.replace(source, "/", "\\")], stderr_to_stdout: true)
+    assert status == 0, output
+    File.write!(exe <> ".sha256", digest(File.read!(exe)))
+    exe
+  end
+
   test "snapshot is stable across the Discovery to Todo state change and includes only task context", %{issue: issue} do
     assert {:ok, input} = Discovery.snapshot(issue)
     assert {:ok, ^input} = Discovery.snapshot(%{issue | state: "Todo"})
@@ -121,12 +234,13 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     refute handed_off.description =~ "DISCOVERY BRIEF"
   end
 
-  test "persisted TECHNICAL_FAILURE is forensic evidence, never a terminal cache hit", %{issue: issue} do
+  test "persisted TECHNICAL_FAILURE is forensic evidence and re-enters the scheduler failure path", %{issue: issue} do
     # The provider peer dies mid-handshake, so the first poll records an infra failure.
     point_codex_command_at(technical_failure_command())
 
-    assert :ok = Discovery.run(issue, self())
-    assert_receive {:discovery_completed, "discovery-issue", "TECHNICAL_FAILURE"}, 5_000
+    assert {:error, {:discovery_technical_failure, failure}} = Discovery.run(issue, self())
+    assert failure in [nil, "infrastructure", :infrastructure]
+    refute_receive {:discovery_completed, "discovery-issue", _}
     assert retained_receipt(issue)["status"] == "TECHNICAL_FAILURE"
 
     # The provider recovers between polls while the frozen input stays unchanged, so a
@@ -244,8 +358,8 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     # launched at all dies before the initialize write and surfaces as an :epipe.
     point_codex_command_at(technical_failure_command())
 
-    assert :ok = Discovery.run(issue, self())
-    assert_receive {:discovery_completed, "discovery-issue", "TECHNICAL_FAILURE"}, 5_000
+    assert {:error, {:discovery_technical_failure, _}} = Discovery.run(issue, self())
+    refute_receive {:discovery_completed, "discovery-issue", _}
     refute_received {:discovery_completed, "discovery-issue", "READY"}
     assert File.read!(old_path) == old_bytes
   end
@@ -260,12 +374,12 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     # initialize write rather than as a classified infrastructure failure.
     point_codex_command_at(technical_failure_command())
 
-    assert :ok = Discovery.run(issue, self(), publication_graphql: graphql)
+    assert {:error, {:discovery_technical_failure, _}} = Discovery.run(issue, self(), publication_graphql: graphql)
     refute_received {:discovery_completed, "discovery-issue", "READY"}
 
-    # The current route really re-executed and recorded its own failure: a lane that
-    # crashed or short-circuited would satisfy the negative assertion vacuously.
-    assert_receive {:discovery_completed, "discovery-issue", "TECHNICAL_FAILURE"}, 5_000
+    # The current route really re-executed and recorded its own failure, then
+    # returned it to the scheduler instead of reporting Discovery completion.
+    refute_receive {:discovery_completed, "discovery-issue", _}
     assert retained_receipt(issue)["status"] == "TECHNICAL_FAILURE"
 
     assert Agent.get(peer, & &1.calls) == []
@@ -344,7 +458,7 @@ defmodule SymphonyElixir.DiscoveryIntegrationTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     assert Config.settings!().tracker.active_states == ["Todo", "In Progress"]
     assert {:ok, ^issue} = Discovery.implementation_issue(issue)
-    assert_raise RuntimeError, ~r/discovery_lane_unavailable/, fn -> AgentRunner.run(issue, self()) end
+    assert_raise AgentRunner.FailureError, ~r/discovery_lane_unavailable/, fn -> AgentRunner.run(issue, self()) end
   end
 
   test "uncached lane uses a real protocol process and denies attempted lifecycle tool calls", %{issue: issue} do

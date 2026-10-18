@@ -39,7 +39,7 @@ while True:
         if log:
             with open(log, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"model": model, "input": message["params"]["input"][0]["text"]}) + "\n")
-        if mode == "rate-limit" and model == "OpenDesign/deepseek-v4.1-flash":
+        if mode == "fail-all" or (mode == "rate-limit" and model == "OpenDesign/deepseek-v4.1-flash"):
             send({"method": "item/completed", "params": {"item": {"type": "agentMessage", "phase": "final_answer", "text": "partial primary output"}}})
             send({"method": "turn/completed", "params": {"turn": {"status": "failed", "error": {"codexErrorInfo": "rateLimitExceeded"}}}})
             continue

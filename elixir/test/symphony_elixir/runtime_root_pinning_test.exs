@@ -203,7 +203,7 @@ defmodule SymphonyElixir.RuntimeRootPinningTest do
     end)
 
     # B never became a mutation target
-    assert [] = RetryStore.list_records(root_b)
+    assert {:ok, []} = RetryStore.list_records(root_b)
   end
 
   test "retry mutation without env seam and without pin fails closed", %{root_a: root_a} do
@@ -325,7 +325,7 @@ defmodule SymphonyElixir.RuntimeRootPinningTest do
 
     # nothing from R1 ever landed under B
     refute File.exists?(Path.join(root_b, Workspace.workspace_key(issue)))
-    assert [] = RetryStore.list_records(root_b)
+    assert {:ok, []} = RetryStore.list_records(root_b)
 
     # R2 boots against B and acquires it WHILE R1 still holds A:
     # two live authorities over two different roots — never over one root.

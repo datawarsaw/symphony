@@ -22,6 +22,13 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
+Runtime safety and the required one-runtime-per-queue operational STOP/GO gate
+are described in [runtime authority](docs/runtime_authority.md). Distinct local
+workspace roots do not establish exclusive ownership of a shared tracker queue.
+Corrupt durable retry state stops dispatch; unconfirmed worker termination
+preserves its launch marker and workspace. Discovery provider exhaustion enters
+the bounded retry policy rather than reporting lifecycle completion.
+
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those

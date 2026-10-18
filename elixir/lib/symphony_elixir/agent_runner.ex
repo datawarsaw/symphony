@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Discovery, PromptBuilder, RepositoryRouter, Steering, Tracker, WorkerContainment, Workspace}
+  alias SymphonyElixir.{Config, Discovery, LaunchMarker, PromptBuilder, RepositoryRouter, Steering, Tracker, WorkerContainment, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -59,27 +59,31 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
-    # The orchestrator owns host retries so one worker lifetime never hops machines.
-    worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
+    LaunchMarker.with_issue_lock(issue.id, [root: Keyword.get(opts, :authority_root)], fn ->
+      # The orchestrator owns host retries so one worker lifetime never hops machines.
+      # The generation lock spans the full task, including its stop confirmation,
+      # so an earlier cleanup watcher cannot interleave with a later launch.
+      worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
-    Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+      Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
-      :ok ->
-        :ok
+      case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+        :ok ->
+          :ok
 
-      {:error, reason} ->
-        publish_launch_never_started(codex_update_recipient, issue, worker_host)
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        info = AppServer.failure_info({:error, reason})
-        class = classify_failure(reason, info)
+        {:error, reason} ->
+          publish_launch_never_started(codex_update_recipient, issue, worker_host)
+          Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
+          info = AppServer.failure_info({:error, reason})
+          class = classify_failure(reason, info)
 
-        raise FailureError,
-          message: "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}",
-          failure_class: class,
-          failure_info: info,
-          reason: reason
-    end
+          raise FailureError,
+            message: "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}",
+            failure_class: class,
+            failure_info: info,
+            reason: reason
+      end
+    end)
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do

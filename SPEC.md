@@ -743,6 +743,22 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 
+Current local safety profile:
+
+- Required durable retry state is recovered before destructive startup cleanup or dispatch.
+  Missing state differs from corrupt/unreadable state; the latter stops dispatch and preserves evidence.
+- Dispatch and retry-poll operations persist blocking intent before risky work. Failed parking
+  persistence must be explicit, and restart must retain the previous blocking intent.
+- Watchdog stalls and technical failures share the bounded `RetryPolicy` envelope. Original
+  failure time and counters survive restart; exhausted age/attempt budgets cannot schedule retry.
+- Managed provider sessions require authoritative predecessor tree termination before another
+  session starts. Exhausted Discovery providers produce technical lifecycle failure, not completion.
+- Cleanup authority is bound to one launch generation and serialized with preparation, dispatch
+  and marker creation. Stale generations cannot clear a successor's marker or workspace.
+- One runtime must own every overlapping tracker queue selection. A local filesystem lease
+  establishes exclusivity only for its own root; cross-root queue ownership requires the
+  documented operational STOP/GO gate.
+
 ## 8. Polling, Scheduling, and Reconciliation
 
 ### 8.1 Poll Loop

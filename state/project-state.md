@@ -1,5 +1,42 @@
 # Symphony project state
 
+## Safety and lifecycle remediation candidate — 2026-10-17
+
+Canonical source: `C:/Users/micha/symphony-source`, branch `main`, baseline
+`dcd1f7eaa3a9e10e8ab9454319e0fda43bee463b`. This entry describes an uncommitted
+source candidate, not accepted or deployed behavior.
+
+- Discovery propagates uncertain termination through AppServer and suppresses
+  every subsequent provider session; exhausted providers enter the existing
+  failure envelope rather than reporting lifecycle completion.
+- Per-issue generation locking joins dispatch, preparation/session lifetime,
+  marker mutation and cleanup. Stale cleanup cannot consume a successor.
+- Windows assignment/resume failure directly terminates the retained child
+  handle and waits; failure receipts stay conservative. The abrupt wrapper-death
+  window before assignment remains a documented, unverified residual.
+- Durable dispatch/retry-poll intent survives a later failed parking write.
+  Untrusted retry state stops dispatch and CONTROL recovery; watchdog stalls,
+  task-spawn and retry-poll failures share RetryPolicy and preserve original time.
+- Current rollout requires one runtime per overlapping tracker queue selection.
+  A filesystem root lease does not enforce cross-root/global queue exclusivity;
+  the operational STOP/GO gate is in `elixir/docs/runtime_authority.md`.
+
+Focused final validation: 112 tests, 0 failures. Scheduler/recovery set:
+105 tests, 0 failures. Deterministic generation/root/lifecycle integration: 34/0.
+Final broad cross-component set: 165 tests, 1 measured baseline :epipe failure.
+Native protocol regressions and broader host limitations
+are recorded with exact commands in `docs/safety-lifecycle-remediation-20261017.md`.
+The fallback suite retains exactly the 21 failing names measured on the pristine
+baseline; the Windows transport suites are not globally green. Independent
+read-only review found no remaining confirmed P0/P1 in the changed supported
+scope; its confirmed CONTROL persistence-status P2 was corrected and retested.
+
+No commit, push, PR, deployment, production runtime start, Linear mutation or
+MIC-309 recovery occurred. Human Acceptance is not granted. Candidate review
+and separate launch authorization remain required.
+
+Detailed candidate/evidence: `docs/safety-lifecycle-remediation-20261017.md`.
+
 ## MIC-167 implementation candidate
 
 Base: datawarsaw/symphony main, 54d9b9080262dcc328ed5aa68430583d1a1cdfe8.

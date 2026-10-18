@@ -14,6 +14,17 @@ The skill and its sibling `references/discovery-contract.md` must be readable on
 
 The fixed routes are `OpenDesign/deepseek-v4.1-flash` with medium reasoning, followed only on technical failure by `google-antigravity/gemini-3.8-flash` with medium reasoning. The existing gateway owns provider authentication. The returned app-server model must match the requested route. Successful verdicts and malformed successful output never cause fallback. A structured rate-limit failure gets one retry after one second, then technical fallback; other recognized availability/authentication/quota/transport failures go directly to fallback. The fallback gets the exact original input bytes in a fresh session. Outputs from attempts are never combined.
 
+Every subsequent session additionally requires authoritative termination of
+the preceding managed worker tree. `AppServer.run` and partial session startup
+return `worker_termination_unconfirmed` when stop confirmation is unavailable;
+Discovery then starts zero further primary/fallback sessions. Missing,
+unreadable or mismatched receipts preserve the original launch marker and
+workspace. Exhausted providers retain `TECHNICAL_FAILURE` evidence and return
+a lifecycle error to AgentRunner and the existing scheduler retry envelope.
+They emit no `discovery_completed` result or READY publication. A retry can
+launch only after the same durable termination gate passes; otherwise the
+issue remains safely parked. Human Acceptance remains a separate human action.
+
 ## Read-only boundary
 
 Discovery branches before implementation workspace preparation and hooks. The host creates an empty scratch directory under the configured workspace root; the worker inspects the routed repository from this scratch directory. It never runs in the source checkout. No implementation before/after hooks run in this lane. SSH Discovery sessions are currently rejected explicitly; existing implementation SSH behavior is unchanged.

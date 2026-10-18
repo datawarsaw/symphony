@@ -15,7 +15,7 @@ defmodule SymphonyElixir.RuntimeAuthorityV3Test do
   stay on A, and B must never be touched.
   """
 
-  alias SymphonyElixir.{Control, Discovery, LaunchMarker, Orchestrator, RetryPolicy, RetryStore, RuntimeLease, WorkerContainment, WorkerFence, Workspace}
+  alias SymphonyElixir.{Control, Discovery, LaunchMarker, Orchestrator, RetryStore, RuntimeLease, WorkerContainment, WorkerFence, Workspace}
 
   @discovery_ready File.read!(Path.expand("../fixtures/discovery-ready.txt", __DIR__))
   alias SymphonyElixir.Tracker.Issue
@@ -437,9 +437,16 @@ defmodule SymphonyElixir.RuntimeAuthorityV3Test do
     assert {:ok, %{outcome: :recovery_scheduled}} =
              Control.request(:recover_parked, %{issue_id: issue.id}, server: pid)
 
+    # Freeze the lifecycle owner at this boundary. Drive the captured retry
+    # message through the real callback after withdrawing the receipt, so
+    # fixture/process scheduling cannot race the assertion's causal ordering.
+    :ok = :sys.suspend(pid)
+    on_exit(fn -> if Process.alive?(pid), do: :sys.resume(pid) end)
     state_after = :sys.get_state(pid)
     refute Map.has_key?(state_after.parked, issue.id)
     assert map_size(state_after.retry_attempts) == 1
+    retry = Map.fetch!(state_after.retry_attempts, issue.id)
+    Process.cancel_timer(retry.timer_ref)
 
     # the receipt is removed again BEFORE the retry timer fires: the retry
     # must dispatch through the PINNED gate — reading A's marker with its
@@ -451,10 +458,11 @@ defmodule SymphonyElixir.RuntimeAuthorityV3Test do
     # probe: with the receipt gone, the pinned gate must refuse a dispatch now
     assert {:blocked, :worker_termination_unproven} = LaunchMarker.reuse_gate(issue.id, root: canonical_a)
 
-    delay_ms = RetryPolicy.backoff_delay(2, 300_000, nil)
-    deadline = System.monotonic_time(:millisecond) + delay_ms + 15_000
+    assert {:noreply, retried} =
+             Orchestrator.handle_info({:retry_issue, issue.id, retry.retry_token}, state_after)
 
-    retried = wait_for_repark(pid, issue.id, deadline)
+    :sys.replace_state(pid, fn _ -> retried end)
+    :ok = :sys.resume(pid)
 
     # the pinned gate re-parked the issue; the workspace at A is preserved
     assert retried.parked[issue.id].stop_reason == :worker_launch_unproven
@@ -762,24 +770,6 @@ defmodule SymphonyElixir.RuntimeAuthorityV3Test do
   defp unique_name(label), do: Module.concat(__MODULE__, "#{label}#{System.unique_integer([:positive])}")
 
   defp digest(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
-
-  defp wait_for_repark(pid, issue_id, deadline) do
-    state = :sys.get_state(pid, 60_000)
-
-    if map_size(state.parked) == 1 and state.parked[issue_id][:stop_reason] == :worker_launch_unproven do
-      state
-    else
-      if System.monotonic_time(:millisecond) >= deadline do
-        flunk(
-          "retry never re-entered the pinned gate; state: " <>
-            inspect(%{parked: state.parked, retry_attempts: Map.new(state.retry_attempts, fn {k, v} -> {k, Map.delete(v, :timer_ref)} end), claimed: MapSet.to_list(state.claimed)})
-        )
-      end
-
-      Process.sleep(100)
-      wait_for_repark(pid, issue_id, deadline)
-    end
-  end
 
   defp wait_until(timeout, _fun) when timeout <= 0, do: flunk("condition not met in time")
 

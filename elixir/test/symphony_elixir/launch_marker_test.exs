@@ -78,9 +78,12 @@ defmodule SymphonyElixir.LaunchMarkerTest do
                String.downcase(Path.expand(root))
     end
 
-    test "record replaces the previous launch's marker for the same issue" do
+    test "record replaces the previous launch only after confirmed termination", %{receipts: receipts} do
       assert :ok = LaunchMarker.record(new_identity("issue-replace"), identifier: "MT-2")
       assert {:ok, first} = LaunchMarker.read("issue-replace")
+      assert {:error, {:previous_launch_unresolved, _}} = LaunchMarker.record(new_identity("issue-replace"))
+      assert {:ok, ^first} = LaunchMarker.read("issue-replace")
+      write_receipt(receipts, first["launch_id"])
 
       assert :ok = LaunchMarker.record(new_identity("issue-replace"), identifier: "MT-2")
       assert {:ok, second} = LaunchMarker.read("issue-replace")
@@ -120,7 +123,7 @@ defmodule SymphonyElixir.LaunchMarkerTest do
       assert :ok = LaunchMarker.clear(nil)
     end
 
-    test "record_wrapper_identity refreshes the stored identity for the same launch only" do
+    test "record_wrapper_identity refreshes the stored identity for the same launch only", %{receipts: receipts} do
       identity = new_identity("issue-wrapper")
       assert :ok = LaunchMarker.record(identity, identifier: "MT-4")
 
@@ -130,6 +133,7 @@ defmodule SymphonyElixir.LaunchMarkerTest do
       assert stored["wrapper_pid"] == "4242"
 
       # A stale refresh (older launch id) never overwrites a newer marker.
+      write_receipt(receipts, identity["launch_id"])
       assert :ok = LaunchMarker.record(new_identity("issue-wrapper"), identifier: "MT-4")
       assert :ok = LaunchMarker.record_wrapper_identity(identity)
       assert {:ok, %{"launch_id" => current, "worker_identity" => stored2}} = LaunchMarker.read("issue-wrapper")

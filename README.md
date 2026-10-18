@@ -1,5 +1,9 @@
 # Symphony
 
+The current local rollout requires one runtime owner per tracker queue, including
+overlapping selections across workspace roots. Filesystem leases alone do not
+establish queue exclusivity. See the [runtime authority and launch gates](elixir/docs/runtime_authority.md).
+
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 

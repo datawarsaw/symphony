@@ -48,12 +48,31 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
     with {:ok, session} <- start_session(workspace, opts) do
+      termination_key = {__MODULE__, :run_termination_confirmation, make_ref()}
+
       try do
-        run_turn(session, prompt, issue, opts)
+        result =
+          try do
+            run_turn(session, prompt, issue, opts)
+          after
+            confirmation = stop_session(session)
+            publish_session_termination(Keyword.get(opts, :worker_termination_publisher), session, confirmation)
+            maybe_warn_unconfirmed(issue, confirmation)
+            Process.put(termination_key, confirmation)
+          end
+
+        case Process.get(termination_key) do
+          %{status: :TERMINATION_UNCONFIRMED} = confirmation ->
+            # A turn result says nothing about the worker tree after its port is
+            # closed. The caller must see this stop failure before it can start
+            # another provider session against the same issue workspace.
+            {:error, {:worker_termination_unconfirmed, confirmation}}
+
+          _confirmation ->
+            result
+        end
       after
-        confirmation = stop_session(session)
-        publish_session_termination(Keyword.get(opts, :worker_termination_publisher), session, confirmation)
-        maybe_warn_unconfirmed(issue, confirmation)
+        Process.delete(termination_key)
       end
     end
   end
@@ -124,7 +143,10 @@ defmodule SymphonyElixir.Codex.AppServer do
             termination_expectation: WorkerContainment.termination_expectation(worker_host)
           })
 
-          {:error, reason}
+          case confirmation do
+            %{status: :TERMINATION_UNCONFIRMED} -> {:error, {:worker_termination_unconfirmed, confirmation}}
+            _ -> {:error, reason}
+          end
       end
     else
       {:error, reason} ->

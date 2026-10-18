@@ -79,21 +79,20 @@ defmodule SymphonyElixir.DiscoveryLaunchFenceTest do
 
     log =
       capture_log(fn ->
-        assert :ok = Discovery.run(issue, self(), authority_root: pinned)
-        assert_receive {:discovery_completed, issue_id, "TECHNICAL_FAILURE"}
-        assert issue_id == issue.id
+        assert {:error, {:discovery_technical_failure, _}} = Discovery.run(issue, self(), authority_root: pinned)
+        issue_id = issue.id
+        refute_receive {:discovery_completed, ^issue_id, _}
       end)
 
     # Keyed: the marker writer saw the real issue id, so Discovery threaded the
     # issue into the session options instead of leaving it nil.
-    assert log =~ "Launch marker write failed issue_id=#{issue.id}"
+    assert log =~ "Launch marker reuse refused issue_id=#{issue.id}"
     refute log =~ "proceeding unfenced"
 
     # The writer staged the marker beside exactly the issue-keyed path it was
     # renaming onto, and the refusal came from that collision.
-    assert [tmp] = Enum.filter(File.ls!(launches), &String.ends_with?(&1, ".tmp"))
-    assert tmp =~ ~r/^#{Regex.escape(key)}\.json\.\d+\.tmp$/
-    assert log =~ "illegal operation on a directory"
+    assert [] = Enum.filter(File.ls!(launches), &String.ends_with?(&1, ".tmp"))
+    assert log =~ "launch_marker_unreadable"
 
     # Fail closed: no marker was durably installed and the launch never became
     # materially active, because the write that gates activation is what failed.
@@ -129,9 +128,9 @@ defmodule SymphonyElixir.DiscoveryLaunchFenceTest do
 
     key = RetryStore.safe_issue_id(issue.id)
 
-    assert :ok = Discovery.run(issue, self(), authority_root: pinned)
-    assert_receive {:discovery_completed, issue_id, "TECHNICAL_FAILURE"}
-    assert issue_id == issue.id
+    assert {:error, {:discovery_technical_failure, _}} = Discovery.run(issue, self(), authority_root: pinned)
+    issue_id = issue.id
+    refute_receive {:discovery_completed, ^issue_id, _}
 
     # The store directory exists because the keyed marker write created it, and
     # it is empty because the clear that followed the refusal removed exactly
